@@ -1,4 +1,7 @@
-flask
+fastapi
 gunicorn
+uvicorn
 requests
 cryptography
+lxml
+signxml
