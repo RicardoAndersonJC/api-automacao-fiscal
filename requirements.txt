@@ -1,7 +1,8 @@
 fastapi
 gunicorn
-uvicorn
+uvicorn[standard]
 requests
 cryptography
 lxml
 signxml
+python-multipart
