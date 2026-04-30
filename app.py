@@ -805,3 +805,141 @@ async def baixar_zip(payload: dict[str, Any]):
         media_type="application/zip",
         headers={"Content-Disposition": 'attachment; filename="nfe_entrada.zip"'},
     )
+
+
+# ============================================================================
+# NEW: Endpoint que retorna os XMLs como conteúdo base64 (em vez de paths
+# locais), para integração com Supabase Edge Functions / Lovable Cloud.
+# Mesma lógica de processamento; só muda a forma de devolver os arquivos.
+# ============================================================================
+
+@app.post("/baixar-nfe-json")
+async def baixar_nfe_json(
+    ambiente: str = Form("producao"),
+    senha: str = Form(...),
+    cnpj: str = Form(...),
+    cuf: str = Form("27"),
+    competencia: str = Form(...),
+    max_lotes: int = Form(10),
+    somente_completas: str = Form("true"),
+    manifestar_ciencia: str = Form("false"),
+    certificado: UploadFile = File(...),
+):
+    """
+    Igual ao /baixar-nfe, porém retorna os XMLs já lidos como base64 dentro
+    do JSON, para que o cliente (edge function) possa subi-los ao Storage
+    sem precisar acessar o disco local da API.
+
+    Resposta:
+    {
+      "success": bool,
+      "cStat": str, "xMotivo": str,
+      "ult_nsu_inicial", "ult_nsu_final", "max_nsu",
+      "lotes_consultados", "docs_recebidos",
+      "resumos", "completos", "eventos",
+      "manifestados", "erros_manifestacao", "ignorados_competencia",
+      "salvos": int,
+      "arquivos": [
+         {
+           "nome": "<chave>_<categoria>.xml",
+           "categoria": "completo" | "resumo" | "evento" | "outro",
+           "chave": "<44 dígitos>" | null,
+           "competencia": "YYYY-MM" | null,
+           "tamanho_bytes": int,
+           "xml_base64": "<base64 do XML utf-8>"
+         }, ...
+      ],
+      "manifestacoes": [...], "documentos": [...]
+    }
+    """
+    cert_path = None
+    try:
+        cert_path = os.path.join(
+            tempfile.gettempdir(),
+            certificado.filename or "certificado_nfe_tmp.pfx",
+        )
+        with open(cert_path, "wb") as f:
+            f.write(await certificado.read())
+
+        resultado = processar_consulta(
+            ambiente=ambiente,
+            caminho_pfx=cert_path,
+            senha=senha,
+            cnpj=cnpj,
+            cuf=cuf,
+            max_lotes=int(max_lotes),
+            competencia=competencia,
+            somente_completas=garantir_bool(somente_completas),
+            manifestar_ciencia=garantir_bool(manifestar_ciencia),
+        )
+
+        # Substitui a lista de paths por uma lista enriquecida com base64.
+        arquivos_base64 = []
+        for caminho in resultado.get("arquivos", []) or []:
+            try:
+                if not caminho or not os.path.exists(caminho):
+                    continue
+                with open(caminho, "rb") as f:
+                    raw = f.read()
+                nome = os.path.basename(caminho)
+
+                # Categoria heurística pelo sufixo do nome
+                # (salvar_documento usa "{chave}_{categoria}.xml")
+                categoria = "outro"
+                m = re.match(r"^(\d{44})_(\w+)\.xml$", nome, re.IGNORECASE)
+                chave = None
+                if m:
+                    chave = m.group(1)
+                    categoria = m.group(2).lower()
+
+                # Tenta extrair competência do XML
+                competencia_doc = None
+                try:
+                    xml_text = raw.decode("utf-8", errors="ignore")
+                    schema_guess = "procNFe" if categoria == "completo" else (
+                        "resNFe" if categoria == "resumo" else (
+                            "procEventoNFe" if categoria == "evento" else ""
+                        )
+                    )
+                    res = resumir_documento(xml_text, schema_guess)
+                    competencia_doc = extrair_competencia_de_data(res.get("dh_emi"))
+                    if not chave:
+                        chave = res.get("chave")
+                except Exception:
+                    pass
+
+                arquivos_base64.append({
+                    "nome": nome,
+                    "categoria": categoria,
+                    "chave": chave,
+                    "competencia": competencia_doc or competencia,
+                    "tamanho_bytes": len(raw),
+                    "xml_base64": base64.b64encode(raw).decode("ascii"),
+                })
+            except Exception as exc:
+                # Não derruba a resposta inteira por causa de 1 arquivo
+                arquivos_base64.append({
+                    "nome": os.path.basename(caminho or ""),
+                    "categoria": "erro",
+                    "chave": None,
+                    "competencia": None,
+                    "tamanho_bytes": 0,
+                    "xml_base64": "",
+                    "erro": str(exc),
+                })
+
+        resultado["arquivos"] = arquivos_base64
+        resultado["salvos"] = len(arquivos_base64)
+        return JSONResponse(resultado)
+    except Exception as exc:
+        return JSONResponse(
+            {"success": False, "error": str(exc)},
+            status_code=500,
+        )
+    finally:
+        try:
+            if cert_path and os.path.exists(cert_path):
+                os.remove(cert_path)
+        except Exception:
+            pass
+
