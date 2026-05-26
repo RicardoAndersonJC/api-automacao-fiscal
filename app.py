@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import gzip
 import io
 import json
@@ -60,21 +60,21 @@ def limpar_cnpj(cnpj: str) -> str:
 def garantir_cnpj(cnpj: str) -> str:
     cnpj_limpo = limpar_cnpj(cnpj)
     if len(cnpj_limpo) != 14:
-        raise ValueError(f"CNPJ inválido: {cnpj}")
+        raise ValueError(f"CNPJ invÃ¡lido: {cnpj}")
     return cnpj_limpo
 
 
 def garantir_competencia(comp: str) -> str:
     comp = (comp or "").strip()
     if not re.fullmatch(r"\d{4}-\d{2}", comp):
-        raise ValueError("Competência inválida. Use YYYY-MM.")
+        raise ValueError("CompetÃªncia invÃ¡lida. Use YYYY-MM.")
     return comp
 
 
 def garantir_ambiente(ambiente: str) -> str:
     ambiente = (ambiente or "").strip().lower()
     if ambiente not in ENDPOINT_DIST:
-        raise ValueError("Ambiente inválido. Use homologacao ou producao.")
+        raise ValueError("Ambiente invÃ¡lido. Use homologacao ou producao.")
     return ambiente
 
 
@@ -214,7 +214,7 @@ def extrair_ret_dist(xml_soap: str) -> ET.Element:
         if elem.text and "<retDistDFeInt" in elem.text:
             return ET.fromstring(elem.text.strip())
 
-    raise RuntimeError("Não foi possível localizar retDistDFeInt no retorno SOAP.")
+    raise RuntimeError("NÃ£o foi possÃ­vel localizar retDistDFeInt no retorno SOAP.")
 
 
 def resumir_documento(xml_doc: str, schema: str) -> dict[str, Any]:
@@ -312,7 +312,7 @@ def extrair_certificado(caminho_pfx: str, senha: str) -> tuple[str, str, bytes, 
     )
 
     if private_key is None or certificate is None:
-        raise ValueError("Não foi possível extrair certificado e chave do PFX.")
+        raise ValueError("NÃ£o foi possÃ­vel extrair certificado e chave do PFX.")
 
     cert_pem = certificate.public_bytes(serialization.Encoding.PEM)
     if additional_certificates:
@@ -338,11 +338,11 @@ def assinar_xml(xml_str: str, cert_pem: bytes, key_pem: bytes) -> str:
     root = etree.fromstring(xml_str.encode("utf-8"))
     inf_evento = root.find(f".//{{{NFE_NS}}}infEvento")
     if inf_evento is None:
-        raise ValueError("infEvento não encontrado para assinatura.")
+        raise ValueError("infEvento nÃ£o encontrado para assinatura.")
 
     evento = inf_evento.getparent()
     if evento is None:
-        raise ValueError("evento não encontrado para assinatura.")
+        raise ValueError("evento nÃ£o encontrado para assinatura.")
 
     signer = XMLSigner(
         method=methods.enveloped,
@@ -448,6 +448,7 @@ def processar_consulta(
     competencia: str,
     somente_completas: bool,
     manifestar_ciencia: bool,
+    start_nsu: str | None = None,
 ) -> dict[str, Any]:
     ambiente = garantir_ambiente(ambiente)
     cnpj = garantir_cnpj(cnpj)
@@ -457,7 +458,7 @@ def processar_consulta(
     key_path = None
     session = None
 
-    ult_nsu_inicial = carregar_nsu(cnpj, ambiente)
+    ult_nsu_inicial = str(start_nsu).zfill(15) if start_nsu else carregar_nsu(cnpj, ambiente)
     ult_nsu_atual = ult_nsu_inicial
     manifestadas = carregar_manifestadas(cnpj, ambiente)
 
@@ -552,7 +553,7 @@ def processar_consulta(
                             "chave": chave,
                             "competencia": comp_doc,
                             "acao": "ignorado",
-                            "motivo": "Competência diferente da selecionada",
+                            "motivo": "CompetÃªncia diferente da selecionada",
                         }
                     )
                     continue
@@ -609,7 +610,7 @@ def processar_consulta(
                         "chave": chave,
                         "competencia": comp_doc,
                         "acao": "ignorado" if somente_completas else "salvo",
-                        "motivo": None if not somente_completas else "Não é XML completo",
+                        "motivo": None if not somente_completas else "NÃ£o Ã© XML completo",
                     }
                 )
 
@@ -756,6 +757,7 @@ async def baixar_nfe(
     max_lotes: int = Form(10),
     somente_completas: str = Form("true"),
     manifestar_ciencia: str = Form("false"),
+    start_nsu: str | None = Form(None),
     certificado: UploadFile = File(...),
 ):
     cert_path = None
@@ -774,6 +776,7 @@ async def baixar_nfe(
             competencia=competencia,
             somente_completas=garantir_bool(somente_completas),
             manifestar_ciencia=garantir_bool(manifestar_ciencia),
+            start_nsu=start_nsu,
         )
         return JSONResponse(resultado)
     except Exception as exc:
@@ -792,7 +795,7 @@ async def baixar_zip(payload: dict[str, Any]):
     arquivos_validos = [os.path.abspath(str(path)) for path in arquivos if os.path.exists(str(path))]
 
     if not arquivos_validos:
-        return JSONResponse({"success": False, "error": "Nenhum arquivo válido para compactar."}, status_code=400)
+        return JSONResponse({"success": False, "error": "Nenhum arquivo vÃ¡lido para compactar."}, status_code=400)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -808,9 +811,9 @@ async def baixar_zip(payload: dict[str, Any]):
 
 
 # ============================================================================
-# NEW: Endpoint que retorna os XMLs como conteúdo base64 (em vez de paths
-# locais), para integração com Supabase Edge Functions / Lovable Cloud.
-# Mesma lógica de processamento; só muda a forma de devolver os arquivos.
+# NEW: Endpoint que retorna os XMLs como conteÃºdo base64 (em vez de paths
+# locais), para integraÃ§Ã£o com Supabase Edge Functions / Lovable Cloud.
+# Mesma lÃ³gica de processamento; sÃ³ muda a forma de devolver os arquivos.
 # ============================================================================
 
 @app.post("/baixar-nfe-json")
@@ -823,10 +826,11 @@ async def baixar_nfe_json(
     max_lotes: int = Form(10),
     somente_completas: str = Form("true"),
     manifestar_ciencia: str = Form("false"),
+    start_nsu: str | None = Form(None),
     certificado: UploadFile = File(...),
 ):
     """
-    Igual ao /baixar-nfe, porém retorna os XMLs já lidos como base64 dentro
+    Igual ao /baixar-nfe, porÃ©m retorna os XMLs jÃ¡ lidos como base64 dentro
     do JSON, para que o cliente (edge function) possa subi-los ao Storage
     sem precisar acessar o disco local da API.
 
@@ -843,7 +847,7 @@ async def baixar_nfe_json(
          {
            "nome": "<chave>_<categoria>.xml",
            "categoria": "completo" | "resumo" | "evento" | "outro",
-           "chave": "<44 dígitos>" | null,
+           "chave": "<44 dÃ­gitos>" | null,
            "competencia": "YYYY-MM" | null,
            "tamanho_bytes": int,
            "xml_base64": "<base64 do XML utf-8>"
@@ -871,6 +875,7 @@ async def baixar_nfe_json(
             competencia=competencia,
             somente_completas=garantir_bool(somente_completas),
             manifestar_ciencia=garantir_bool(manifestar_ciencia),
+            start_nsu=start_nsu,
         )
 
         # Substitui a lista de paths por uma lista enriquecida com base64.
@@ -883,7 +888,7 @@ async def baixar_nfe_json(
                     raw = f.read()
                 nome = os.path.basename(caminho)
 
-                # Categoria heurística pelo sufixo do nome
+                # Categoria heurÃ­stica pelo sufixo do nome
                 # (salvar_documento usa "{chave}_{categoria}.xml")
                 categoria = "outro"
                 m = re.match(r"^(\d{44})_(\w+)\.xml$", nome, re.IGNORECASE)
@@ -892,7 +897,7 @@ async def baixar_nfe_json(
                     chave = m.group(1)
                     categoria = m.group(2).lower()
 
-                # Tenta extrair competência do XML
+                # Tenta extrair competÃªncia do XML
                 competencia_doc = None
                 try:
                     xml_text = raw.decode("utf-8", errors="ignore")
@@ -917,7 +922,7 @@ async def baixar_nfe_json(
                     "xml_base64": base64.b64encode(raw).decode("ascii"),
                 })
             except Exception as exc:
-                # Não derruba a resposta inteira por causa de 1 arquivo
+                # NÃ£o derruba a resposta inteira por causa de 1 arquivo
                 arquivos_base64.append({
                     "nome": os.path.basename(caminho or ""),
                     "categoria": "erro",
@@ -942,4 +947,7 @@ async def baixar_nfe_json(
                 os.remove(cert_path)
         except Exception:
             pass
+
+
+
 
