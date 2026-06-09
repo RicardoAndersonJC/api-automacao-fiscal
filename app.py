@@ -1,4 +1,4 @@
-﻿import base64
+import base64
 import gzip
 import io
 import json
@@ -449,6 +449,7 @@ def processar_consulta(
     somente_completas: bool,
     manifestar_ciencia: bool,
     start_nsu: str | None = None,
+    filtrar_competencia: bool = True,
 ) -> dict[str, Any]:
     ambiente = garantir_ambiente(ambiente)
     cnpj = garantir_cnpj(cnpj)
@@ -544,7 +545,7 @@ def processar_consulta(
                     )
                     continue
 
-                if not mesmo_mes(resumo.get("dh_emi"), competencia):
+                if filtrar_competencia and not mesmo_mes(resumo.get("dh_emi"), competencia):
                     ignorados_competencia += 1
                     documentos.append(
                         {
@@ -575,14 +576,16 @@ def processar_consulta(
                     if manifestar_ciencia and chave and chave not in manifestadas:
                         resumo_docs_para_manifestar.append((chave, {"nsu": doc_zip.attrib.get("NSU"), "competencia": comp_doc}))
                     elif not somente_completas:
-                        caminho = salvar_documento(cnpj, competencia, doc_info, resumo)
+                        competencia_destino = comp_doc or competencia
+                        caminho = salvar_documento(cnpj, competencia_destino, doc_info, resumo)
                         if caminho:
                             salvos.append(caminho)
                     continue
 
                 if categoria == "completo":
                     completos += 1
-                    caminho = salvar_documento(cnpj, competencia, doc_info, resumo)
+                    competencia_destino = comp_doc or competencia
+                    caminho = salvar_documento(cnpj, competencia_destino, doc_info, resumo)
                     if caminho:
                         salvos.append(caminho)
                     documentos.append(
@@ -600,7 +603,8 @@ def processar_consulta(
                 if categoria == "evento":
                     eventos += 1
                 if not somente_completas:
-                    caminho = salvar_documento(cnpj, competencia, doc_info, resumo)
+                    competencia_destino = comp_doc or competencia
+                    caminho = salvar_documento(cnpj, competencia_destino, doc_info, resumo)
                     if caminho:
                         salvos.append(caminho)
                 documentos.append(
@@ -684,11 +688,14 @@ def processar_consulta(
                         chave = resumo.get("chave")
                         comp_doc = extrair_competencia_de_data(resumo.get("dh_emi"))
 
-                        if categoria != "completo" or not mesmo_mes(resumo.get("dh_emi"), competencia):
+                        if categoria != "completo":
+                            continue
+                        if filtrar_competencia and not mesmo_mes(resumo.get("dh_emi"), competencia):
                             continue
 
                         doc_info = {"xml": xml_doc, "schema": schema}
-                        caminho = salvar_documento(cnpj, competencia, doc_info, resumo)
+                        competencia_destino = comp_doc or competencia
+                        caminho = salvar_documento(cnpj, competencia_destino, doc_info, resumo)
                         if caminho and caminho not in salvos:
                             salvos.append(caminho)
                             completos += 1
@@ -710,7 +717,7 @@ def processar_consulta(
 
         salvar_manifestadas(cnpj, ambiente, manifestadas)
 
-        arquivos = listar_arquivos_zip(cnpj, competencia)
+        arquivos = listar_arquivos_zip(cnpj, competencia) if filtrar_competencia else salvos
         return {
             "success": True,
             "cStat": cstat_final,
@@ -777,6 +784,7 @@ async def baixar_nfe(
             somente_completas=garantir_bool(somente_completas),
             manifestar_ciencia=garantir_bool(manifestar_ciencia),
             start_nsu=start_nsu,
+            filtrar_competencia=True,
         )
         return JSONResponse(resultado)
     except Exception as exc:
@@ -827,6 +835,7 @@ async def baixar_nfe_json(
     somente_completas: str = Form("true"),
     manifestar_ciencia: str = Form("false"),
     start_nsu: str | None = Form(None),
+    filtrar_competencia: str = Form("false"),
     certificado: UploadFile = File(...),
 ):
     """
@@ -876,6 +885,7 @@ async def baixar_nfe_json(
             somente_completas=garantir_bool(somente_completas),
             manifestar_ciencia=garantir_bool(manifestar_ciencia),
             start_nsu=start_nsu,
+            filtrar_competencia=garantir_bool(filtrar_competencia),
         )
 
         # Substitui a lista de paths por uma lista enriquecida com base64.
@@ -934,7 +944,7 @@ async def baixar_nfe_json(
                 })
 
         resultado["arquivos"] = arquivos_base64
-        resultado["salvos"] = len(arquivos_base64)
+        resultado["salvos"] = len([a for a in arquivos_base64 if a.get("xml_base64")])
         return JSONResponse(resultado)
     except Exception as exc:
         return JSONResponse(
@@ -947,7 +957,3 @@ async def baixar_nfe_json(
                 os.remove(cert_path)
         except Exception:
             pass
-
-
-
-
