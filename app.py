@@ -5,7 +5,6 @@ import json
 import os
 import re
 import tempfile
-import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,7 +16,7 @@ from xml.etree import ElementTree as ET
 import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs12
-from fastapi import FastAPI, File, Form, Header, Request, Response, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, Header, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from lxml import etree
@@ -777,7 +776,7 @@ NFSE_ZIP_PREFIX = "nfse-zips"
 NFSE_ZIP_PAGE_SIZE = 1000
 NFSE_ZIP_MAX_FILES = 200000
 NFSE_ZIP_WORKERS = int(os.getenv("NFSE_ZIP_WORKERS", "32"))
-NFSE_ZIP_PROGRESS_EVERY = int(os.getenv("NFSE_ZIP_PROGRESS_EVERY", "100"))
+NFSE_ZIP_PROGRESS_EVERY = int(os.getenv("NFSE_ZIP_PROGRESS_EVERY", "25"))
 
 
 def nfse_now_iso() -> str:
@@ -1099,19 +1098,20 @@ def nfse_upload_zip(zip_path: str, storage_path: str) -> None:
         raise RuntimeError(f"Falha ao subir ZIP: HTTP {resp.status_code}: {resp.text[:500]}")
 
 
-def nfse_zip_worker(execucao_id: str, organizacao_id: str, filters: dict[str, Any]) -> None:
+def nfse_zip_worker(execucao_id: str, organizacao_id: str, filters: dict[str, Any], estimated_total: int = 0) -> None:
     zip_path = ""
     try:
         nfse_update_execucao(execucao_id, {
             "status": "processando",
-            "progresso": 0,
+            "progresso": 1,
             "parametros": {
                 "filters": filters,
-                "totalArquivos": 0,
+                "totalArquivos": max(0, int(estimated_total or 0)),
                 "processados": 0,
                 "zip_ok": 0,
                 "erros": 0,
                 "part_paths": [],
+                "fase": "Coletando XMLs salvos",
                 "updatedAt": nfse_now_iso(),
             },
         })
@@ -1131,9 +1131,10 @@ def nfse_zip_worker(execucao_id: str, organizacao_id: str, filters: dict[str, An
             "zip_ok": 0,
             "erros": 0,
             "part_paths": [],
+            "fase": "Compactando XMLs",
             "updatedAt": nfse_now_iso(),
         }
-        nfse_update_execucao(execucao_id, {"status": "processando", "parametros": params})
+        nfse_update_execucao(execucao_id, {"status": "processando", "progresso": 2, "parametros": params})
 
         tmp = tempfile.NamedTemporaryFile(prefix=f"nfse_zip_{execucao_id}_", suffix=".zip", delete=False)
         zip_path = tmp.name
@@ -1162,13 +1163,17 @@ def nfse_zip_worker(execucao_id: str, organizacao_id: str, filters: dict[str, An
                             "processados": processed,
                             "zip_ok": zip_ok,
                             "erros": errors,
+                            "fase": "Compactando XMLs",
                             "updatedAt": nfse_now_iso(),
                         })
-                        progresso = min(95, round((processed / total) * 95)) if total else 0
+                        progresso = min(95, max(2, round((processed / total) * 95))) if total else 2
                         nfse_update_execucao(execucao_id, {"progresso": progresso, "parametros": params})
 
         if zip_ok <= 0:
             raise RuntimeError("Nenhum XML pode ser adicionado ao ZIP")
+
+        params.update({"fase": "Enviando ZIP para storage", "updatedAt": nfse_now_iso()})
+        nfse_update_execucao(execucao_id, {"progresso": 98, "parametros": params})
 
         part_path = f"{NFSE_ZIP_PREFIX}/{execucao_id}_nfse_xmls.zip"
         nfse_upload_zip(zip_path, part_path)
@@ -1177,6 +1182,7 @@ def nfse_zip_worker(execucao_id: str, organizacao_id: str, filters: dict[str, An
             "zip_ok": zip_ok,
             "erros": errors,
             "part_paths": [part_path],
+            "fase": "ZIP pronto",
             "updatedAt": nfse_now_iso(),
             "error": None,
         })
@@ -1191,7 +1197,7 @@ def nfse_zip_worker(execucao_id: str, organizacao_id: str, filters: dict[str, An
         params = current.get("parametros") or {}
         if not isinstance(params, dict):
             params = {}
-        params.update({"error": str(exc), "updatedAt": nfse_now_iso()})
+        params.update({"fase": "Erro", "error": str(exc), "updatedAt": nfse_now_iso()})
         try:
             nfse_update_execucao(execucao_id, {
                 "status": "erro",
@@ -1214,27 +1220,40 @@ def nfse_zip_ping() -> dict[str, bool]:
 
 
 @app.post("/nfse/zip/start")
-async def nfse_zip_start(payload: dict[str, Any], authorization: str | None = Header(None)):
+async def nfse_zip_start(payload: dict[str, Any], background_tasks: BackgroundTasks, authorization: str | None = Header(None)):
     try:
         execucao_id = str(payload.get("execucao_id") or "").strip()
         organizacao_id = str(payload.get("organizacao_id") or "").strip()
         filters = payload.get("filters") or {}
         if not isinstance(filters, dict):
             filters = {}
+        estimated_total = int(payload.get("estimated_total") or 0)
         if not execucao_id:
             return JSONResponse({"success": False, "error": "execucao_id obrigatorio"}, status_code=400)
         if not organizacao_id:
             return JSONResponse({"success": False, "error": "organizacao_id obrigatorio"}, status_code=400)
 
         nfse_require_org_access(authorization, organizacao_id)
-        thread = threading.Thread(target=nfse_zip_worker, args=(execucao_id, organizacao_id, filters), daemon=True)
-        thread.start()
+        nfse_update_execucao(execucao_id, {
+            "status": "processando",
+            "progresso": 1,
+            "parametros": {
+                "filters": filters,
+                "totalArquivos": max(0, estimated_total),
+                "processados": 0,
+                "zip_ok": 0,
+                "erros": 0,
+                "part_paths": [],
+                "fase": "Fila Python iniciada",
+                "updatedAt": nfse_now_iso(),
+            },
+        })
+        background_tasks.add_task(nfse_zip_worker, execucao_id, organizacao_id, filters, estimated_total)
         return JSONResponse({"success": True, "background": True, "execucao_id": execucao_id})
     except PermissionError as exc:
         return JSONResponse({"success": False, "error": str(exc)}, status_code=403)
     except Exception as exc:
         return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
-
 
 @app.get("/health")
 def health() -> dict[str, bool]:
