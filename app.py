@@ -775,7 +775,7 @@ NFSE_ZIP_BUCKET = "fiscal-files"
 NFSE_ZIP_PREFIX = "nfse-zips"
 NFSE_ZIP_PAGE_SIZE = 1000
 NFSE_ZIP_MAX_FILES = 200000
-NFSE_ZIP_WORKERS = int(os.getenv("NFSE_ZIP_WORKERS", "32"))
+NFSE_ZIP_WORKERS = int(os.getenv("NFSE_ZIP_WORKERS", "64"))
 NFSE_ZIP_PROGRESS_EVERY = int(os.getenv("NFSE_ZIP_PROGRESS_EVERY", "25"))
 
 
@@ -1000,21 +1000,46 @@ def nfse_matches_filters(row: dict[str, Any], filters: dict[str, Any]) -> bool:
     return True
 
 
-def nfse_collect_rows(org_id: str, filters: dict[str, Any]) -> list[dict[str, Any]]:
+def nfse_collect_rows(org_id: str, filters: dict[str, Any], execucao_id: str | None = None, estimated_total: int = 0) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     offset = 0
+    competencia = str(filters.get("competencia") or "").strip()
+    search = str(filters.get("search") or "").strip()
+
     while True:
+        storage_like = "like.xml-nfse/%"
+        if competencia:
+            storage_like = f"like.xml-nfse/%/{competencia}/%"
+
         params = {
             "select": "id,nome,storage_path,empresa_id,metadata",
             "organizacao_id": f"eq.{org_id}",
             "tipo": "eq.XML",
-            "storage_path": "like.xml-nfse/%",
+            "storage_path": storage_like,
             "order": "created_at.desc",
             "limit": str(NFSE_ZIP_PAGE_SIZE),
             "offset": str(offset),
         }
         if filters.get("empresa_id"):
             params["empresa_id"] = f"eq.{filters.get('empresa_id')}"
+        if search:
+            params["nome"] = f"ilike.*{search}*"
+
+        if execucao_id and offset > 0:
+            nfse_update_execucao(execucao_id, {
+                "progresso": 1,
+                "parametros": {
+                    "filters": filters,
+                    "totalArquivos": max(0, int(estimated_total or 0)),
+                    "processados": 0,
+                    "zip_ok": 0,
+                    "erros": 0,
+                    "part_paths": [],
+                    "fase": f"Coletando XMLs salvos ({offset:,} lidos)",
+                    "updatedAt": nfse_now_iso(),
+                },
+            })
+
         resp = nfse_rest_request("GET", "/rest/v1/arquivos", headers=nfse_supabase_headers(None), params=params, timeout=90)
         batch = resp.json() or []
         rows.extend(row for row in batch if nfse_matches_filters(row, filters))
@@ -1116,7 +1141,7 @@ def nfse_zip_worker(execucao_id: str, organizacao_id: str, filters: dict[str, An
             },
         })
 
-        rows = nfse_collect_rows(organizacao_id, filters)
+        rows = nfse_collect_rows(organizacao_id, filters, execucao_id, estimated_total)
         total = len(rows)
         if total <= 0:
             raise RuntimeError("Nenhum XML encontrado para os filtros selecionados")
@@ -1145,7 +1170,7 @@ def nfse_zip_worker(execucao_id: str, organizacao_id: str, filters: dict[str, An
         zip_ok = 0
         errors = 0
 
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
             with ThreadPoolExecutor(max_workers=NFSE_ZIP_WORKERS) as executor:
                 futures = [executor.submit(nfse_download_storage_object, row) for row in rows]
                 for future in as_completed(futures):
