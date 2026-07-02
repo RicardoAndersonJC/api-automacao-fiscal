@@ -1123,6 +1123,38 @@ def nfse_upload_zip(zip_path: str, storage_path: str) -> None:
         raise RuntimeError(f"Falha ao subir ZIP: HTTP {resp.status_code}: {resp.text[:500]}")
 
 
+
+def nfse_build_zip_bytes(organizacao_id: str, filters: dict[str, Any], estimated_total: int = 0) -> tuple[bytes, int, int]:
+    rows = nfse_collect_rows(organizacao_id, filters, None, estimated_total)
+    total = len(rows)
+    if total <= 0:
+        raise RuntimeError("Nenhum XML encontrado para os filtros selecionados")
+    if total > NFSE_ZIP_MAX_FILES:
+        raise RuntimeError(f"Limite de {NFSE_ZIP_MAX_FILES} XMLs por ZIP excedido")
+
+    empresas = nfse_fetch_empresas(list({str(row.get("empresa_id")) for row in rows if row.get("empresa_id")}))
+    used_names: set[str] = set()
+    zip_ok = 0
+    errors = 0
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        with ThreadPoolExecutor(max_workers=NFSE_ZIP_WORKERS) as executor:
+            futures = [executor.submit(nfse_download_storage_object, row) for row in rows]
+            for future in as_completed(futures):
+                row, content, error = future.result()
+                if content:
+                    arcname = nfse_zip_arcname(row, empresas, used_names)
+                    zf.writestr(arcname, content)
+                    zip_ok += 1
+                else:
+                    errors += 1
+
+    if zip_ok <= 0:
+        raise RuntimeError("Nenhum XML pode ser adicionado ao ZIP")
+
+    buffer.seek(0)
+    return buffer.getvalue(), zip_ok, errors
 def nfse_zip_worker(execucao_id: str, organizacao_id: str, filters: dict[str, Any], estimated_total: int = 0) -> None:
     zip_path = ""
     try:
@@ -1243,6 +1275,35 @@ def nfse_zip_worker(execucao_id: str, organizacao_id: str, filters: dict[str, An
 def nfse_zip_ping() -> dict[str, bool]:
     return {"ok": True}
 
+
+@app.post("/nfse/zip/download")
+async def nfse_zip_download(payload: dict[str, Any], authorization: str | None = Header(None)):
+    try:
+        organizacao_id = str(payload.get("organizacao_id") or "").strip()
+        filters = payload.get("filters") or {}
+        if not isinstance(filters, dict):
+            filters = {}
+        estimated_total = int(payload.get("estimated_total") or 0)
+        if not organizacao_id:
+            return JSONResponse({"success": False, "error": "organizacao_id obrigatorio"}, status_code=400)
+
+        nfse_require_org_access(authorization, organizacao_id)
+        zip_bytes, zip_ok, errors = nfse_build_zip_bytes(organizacao_id, filters, estimated_total)
+        competencia = re.sub(r"[^0-9-]", "", str(filters.get("competencia") or "nfse")) or "nfse"
+        filename = f"nfse_xmls_{competencia}.zip"
+        return Response(
+            content=zip_bytes,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Zip-Ok": str(zip_ok),
+                "X-Zip-Errors": str(errors),
+            },
+        )
+    except PermissionError as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=403)
+    except Exception as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
 
 @app.post("/nfse/zip/start")
 async def nfse_zip_start(payload: dict[str, Any], background_tasks: BackgroundTasks, authorization: str | None = Header(None)):
