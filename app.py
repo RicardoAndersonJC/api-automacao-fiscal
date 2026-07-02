@@ -5,8 +5,11 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote
 from datetime import datetime
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -14,7 +17,7 @@ from xml.etree import ElementTree as ET
 import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs12
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, Header, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from lxml import etree
@@ -747,6 +750,470 @@ def processar_consulta(
                     os.remove(path)
             except Exception:
                 pass
+
+
+
+# ============================================================================
+# NFS-e Nacional ZIP worker
+# ============================================================================
+
+NFSE_ZIP_BUCKET = "fiscal-files"
+NFSE_ZIP_PREFIX = "nfse-zips"
+NFSE_ZIP_PAGE_SIZE = 1000
+NFSE_ZIP_MAX_FILES = 200000
+NFSE_ZIP_WORKERS = int(os.getenv("NFSE_ZIP_WORKERS", "32"))
+NFSE_ZIP_PROGRESS_EVERY = int(os.getenv("NFSE_ZIP_PROGRESS_EVERY", "100"))
+
+
+def nfse_now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def nfse_supabase_config() -> tuple[str, str]:
+    url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY") or ""
+    if not url or not service_key:
+        raise RuntimeError("Configure SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY na API.")
+    return url, service_key
+
+
+def nfse_supabase_headers(content_type: str | None = "application/json") -> dict[str, str]:
+    _, service_key = nfse_supabase_config()
+    headers = {
+        "apikey": service_key,
+        "Authorization": f"Bearer {service_key}",
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def nfse_rest_request(method: str, path: str, **kwargs) -> requests.Response:
+    url, _ = nfse_supabase_config()
+    resp = requests.request(method, f"{url}{path}", timeout=kwargs.pop("timeout", 60), **kwargs)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Supabase {method} {path} retornou {resp.status_code}: {resp.text[:500]}")
+    return resp
+
+
+def nfse_update_execucao(execucao_id: str, updates: dict[str, Any]) -> None:
+    headers = nfse_supabase_headers()
+    headers["Prefer"] = "return=minimal"
+    nfse_rest_request(
+        "PATCH",
+        "/rest/v1/execucoes",
+        params={"id": f"eq.{execucao_id}"},
+        headers=headers,
+        json=updates,
+    )
+
+
+def nfse_get_execucao(execucao_id: str) -> dict[str, Any] | None:
+    resp = nfse_rest_request(
+        "GET",
+        "/rest/v1/execucoes",
+        params={"select": "status,progresso,parametros", "id": f"eq.{execucao_id}", "limit": "1"},
+        headers=nfse_supabase_headers(None),
+    )
+    data = resp.json()
+    return data[0] if data else None
+
+
+def nfse_auth_user_id(authorization: str | None) -> str:
+    token = (authorization or "").replace("Bearer", "", 1).strip()
+    if not token:
+        raise PermissionError("Autenticacao necessaria.")
+    url, service_key = nfse_supabase_config()
+    resp = requests.get(
+        f"{url}/auth/v1/user",
+        headers={"apikey": service_key, "Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    if resp.status_code >= 400:
+        raise PermissionError("Usuario invalido ou sessao expirada.")
+    user_id = (resp.json() or {}).get("id")
+    if not user_id:
+        raise PermissionError("Usuario invalido.")
+    return user_id
+
+
+def nfse_require_org_access(authorization: str | None, org_id: str) -> str:
+    user_id = nfse_auth_user_id(authorization)
+    headers = nfse_supabase_headers()
+
+    try:
+        resp = nfse_rest_request(
+            "POST",
+            "/rest/v1/rpc/user_can_access_org",
+            headers=headers,
+            json={"p_org_id": org_id, "_user_id": user_id},
+        )
+        if resp.json() is True:
+            return user_id
+    except Exception:
+        pass
+
+    try:
+        resp = nfse_rest_request(
+            "POST",
+            "/rest/v1/rpc/is_global_admin",
+            headers=headers,
+            json={"_user_id": user_id},
+        )
+        if resp.json() is True:
+            return user_id
+    except Exception:
+        pass
+
+    resp = nfse_rest_request(
+        "GET",
+        "/rest/v1/usuarios_organizacoes",
+        headers=nfse_supabase_headers(None),
+        params={
+            "select": "id",
+            "user_id": f"eq.{user_id}",
+            "organizacao_id": f"eq.{org_id}",
+            "status": "eq.aprovado",
+            "limit": "1",
+        },
+    )
+    if resp.json():
+        return user_id
+    raise PermissionError("Sem permissao para esta organizacao.")
+
+
+def nfse_only_digits(value: Any) -> str:
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def nfse_get_competencia_from_date(value: Any) -> str | None:
+    text = str(value or "").strip()
+    match = re.match(r"^(\d{4})-(\d{2})", text)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+    match = re.match(r"^(\d{2})/(\d{2})/(\d{4})", text)
+    if match:
+        return f"{match.group(3)}-{match.group(2)}"
+    match = re.match(r"^(\d{4})(\d{2})(\d{2})$", text)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+    return None
+
+
+def nfse_get_competencia_from_path(storage_path: str | None) -> str | None:
+    parts = (storage_path or "").split("/")
+    competencia = parts[2] if len(parts) >= 3 else ""
+    return competencia if competencia and competencia != "_SEM_COMPETENCIA_" else None
+
+
+def nfse_get_arquivo_competencia(row: dict[str, Any]) -> str:
+    metadata = row.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return (
+        nfse_get_competencia_from_date(metadata.get("dataEmissao"))
+        or nfse_get_competencia_from_date(metadata.get("dataEvento"))
+        or nfse_get_competencia_from_date(metadata.get("dhEvento"))
+        or nfse_get_competencia_from_date(metadata.get("dhProc"))
+        or nfse_get_competencia_from_date(metadata.get("competencia"))
+        or str(metadata.get("competencia") or "")
+        or nfse_get_competencia_from_path(row.get("storage_path"))
+        or "_SEM_COMPETENCIA_"
+    )
+
+
+def nfse_is_evento(row: dict[str, Any]) -> bool:
+    metadata = row.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    values = [
+        metadata.get("tipoDoc"), metadata.get("tipoDocumento"), metadata.get("TipoDocumento"),
+        metadata.get("tipo_documento"), metadata.get("tpEvento"), metadata.get("descEvento"),
+        metadata.get("status"), metadata.get("situacao"), metadata.get("cancelada"),
+        metadata.get("cStat"), metadata.get("xMotivo"), row.get("nome"), row.get("storage_path"),
+    ]
+    text = " ".join(str(v) for v in values if v).upper()
+    return "EVENTO" in text or "CANCEL" in text or "PEDREGEVENTO" in text or bool(metadata.get("tpEvento"))
+
+
+def nfse_matches_filters(row: dict[str, Any], filters: dict[str, Any]) -> bool:
+    metadata = row.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    if filters.get("competencia") and nfse_get_arquivo_competencia(row) != filters.get("competencia"):
+        return False
+
+    tipo_doc = str(filters.get("tipo_doc") or "").upper()
+    if tipo_doc:
+        is_evento = nfse_is_evento(row)
+        if tipo_doc == "EVENTO" and not is_evento:
+            return False
+        if tipo_doc == "NFSE" and is_evento:
+            return False
+
+    search = str(filters.get("search") or "").strip().lower()
+    if search and search not in str(row.get("nome") or "").lower():
+        return False
+
+    emit_filter = nfse_only_digits(filters.get("emit_cnpj"))
+    if emit_filter and emit_filter not in nfse_only_digits(metadata.get("emit_cnpj")):
+        return False
+
+    dest_filter = nfse_only_digits(filters.get("dest_cnpj"))
+    if dest_filter:
+        dest_doc = nfse_only_digits(metadata.get("toma_cnpj") or metadata.get("toma_cpf"))
+        if dest_filter not in dest_doc:
+            return False
+
+    if "municipios" in filters and filters.get("municipios") is not None:
+        municipios = filters.get("municipios") or []
+        if not municipios:
+            return False
+        codes: list[str] = []
+        for raw in (metadata.get("mun_incid_cod"), metadata.get("mun_prest_cod")):
+            code = nfse_only_digits(raw)
+            if not code:
+                continue
+            codes.append(code)
+            if len(code) == 7:
+                codes.append(code[:6])
+        if not codes:
+            return "__sem__" in municipios
+        if not any(code in municipios for code in codes):
+            return False
+
+    return True
+
+
+def nfse_collect_rows(org_id: str, filters: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        params = {
+            "select": "id,nome,storage_path,empresa_id,metadata",
+            "organizacao_id": f"eq.{org_id}",
+            "tipo": "eq.XML",
+            "storage_path": "like.xml-nfse/%",
+            "order": "created_at.desc",
+            "limit": str(NFSE_ZIP_PAGE_SIZE),
+            "offset": str(offset),
+        }
+        if filters.get("empresa_id"):
+            params["empresa_id"] = f"eq.{filters.get('empresa_id')}"
+        resp = nfse_rest_request("GET", "/rest/v1/arquivos", headers=nfse_supabase_headers(None), params=params, timeout=90)
+        batch = resp.json() or []
+        rows.extend(row for row in batch if nfse_matches_filters(row, filters))
+        if len(batch) < NFSE_ZIP_PAGE_SIZE or len(rows) > NFSE_ZIP_MAX_FILES:
+            break
+        offset += NFSE_ZIP_PAGE_SIZE
+    return rows
+
+
+def nfse_fetch_empresas(empresa_ids: list[str]) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    ids = [eid for eid in empresa_ids if eid]
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        if not chunk:
+            continue
+        resp = nfse_rest_request(
+            "GET",
+            "/rest/v1/empresas",
+            headers=nfse_supabase_headers(None),
+            params={"select": "id,nome,apelido,cnpj", "id": f"in.({','.join(chunk)})"},
+        )
+        for empresa in resp.json() or []:
+            result[empresa.get("id")] = empresa
+    return result
+
+
+def nfse_sanitize_zip_segment(value: Any) -> str:
+    text = re.sub(r"[<>:\"\\|?*\x00-\x1F]", "_", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    return (text[:120] or "Sem Nome")
+
+
+def nfse_unique_path(base_path: str, used: set[str]) -> str:
+    if base_path not in used:
+        used.add(base_path)
+        return base_path
+    folder, name = base_path.rsplit("/", 1) if "/" in base_path else ("", base_path)
+    stem, ext = os.path.splitext(name)
+    prefix = f"{folder}/" if folder else ""
+    counter = 1
+    while True:
+        candidate = f"{prefix}{stem}_{counter}{ext}"
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+        counter += 1
+
+
+def nfse_zip_arcname(row: dict[str, Any], empresas: dict[str, dict[str, Any]], used: set[str]) -> str:
+    empresa = empresas.get(row.get("empresa_id") or "") or {}
+    empresa_base = nfse_sanitize_zip_segment(empresa.get("apelido") or empresa.get("nome") or "Sem Empresa")
+    empresa_doc = nfse_only_digits(empresa.get("cnpj")) or str(row.get("empresa_id") or "")[:8]
+    empresa_nome = nfse_sanitize_zip_segment(f"{empresa_base} - {empresa_doc}" if empresa_doc else empresa_base)
+    competencia = nfse_sanitize_zip_segment(nfse_get_arquivo_competencia(row))
+    file_name = nfse_sanitize_zip_segment(row.get("nome") or os.path.basename(row.get("storage_path") or "") or f"{row.get('id')}.xml")
+    return nfse_unique_path(f"{empresa_nome}/{competencia}/{file_name}", used)
+
+
+def nfse_download_storage_object(row: dict[str, Any]) -> tuple[dict[str, Any], bytes | None, str | None]:
+    storage_path = row.get("storage_path") or ""
+    url, _ = nfse_supabase_config()
+    object_url = f"{url}/storage/v1/object/{NFSE_ZIP_BUCKET}/{quote(storage_path, safe='/')}"
+    try:
+        resp = requests.get(object_url, headers=nfse_supabase_headers(None), timeout=90)
+        if resp.status_code >= 400:
+            return row, None, f"HTTP {resp.status_code}"
+        return row, resp.content, None
+    except Exception as exc:
+        return row, None, str(exc)
+
+
+def nfse_upload_zip(zip_path: str, storage_path: str) -> None:
+    url, _ = nfse_supabase_config()
+    object_url = f"{url}/storage/v1/object/{NFSE_ZIP_BUCKET}/{quote(storage_path, safe='/')}"
+    headers = nfse_supabase_headers("application/zip")
+    headers["x-upsert"] = "true"
+    with open(zip_path, "rb") as f:
+        resp = requests.post(object_url, headers=headers, data=f, timeout=600)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Falha ao subir ZIP: HTTP {resp.status_code}: {resp.text[:500]}")
+
+
+def nfse_zip_worker(execucao_id: str, organizacao_id: str, filters: dict[str, Any]) -> None:
+    zip_path = ""
+    try:
+        nfse_update_execucao(execucao_id, {
+            "status": "processando",
+            "progresso": 0,
+            "parametros": {
+                "filters": filters,
+                "totalArquivos": 0,
+                "processados": 0,
+                "zip_ok": 0,
+                "erros": 0,
+                "part_paths": [],
+                "updatedAt": nfse_now_iso(),
+            },
+        })
+
+        rows = nfse_collect_rows(organizacao_id, filters)
+        total = len(rows)
+        if total <= 0:
+            raise RuntimeError("Nenhum XML encontrado para os filtros selecionados")
+        if total > NFSE_ZIP_MAX_FILES:
+            raise RuntimeError(f"Limite de {NFSE_ZIP_MAX_FILES} XMLs por ZIP excedido")
+
+        empresas = nfse_fetch_empresas(list({str(row.get("empresa_id")) for row in rows if row.get("empresa_id")}))
+        params = {
+            "filters": filters,
+            "totalArquivos": total,
+            "processados": 0,
+            "zip_ok": 0,
+            "erros": 0,
+            "part_paths": [],
+            "updatedAt": nfse_now_iso(),
+        }
+        nfse_update_execucao(execucao_id, {"status": "processando", "parametros": params})
+
+        tmp = tempfile.NamedTemporaryFile(prefix=f"nfse_zip_{execucao_id}_", suffix=".zip", delete=False)
+        zip_path = tmp.name
+        tmp.close()
+
+        used_names: set[str] = set()
+        processed = 0
+        zip_ok = 0
+        errors = 0
+
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            with ThreadPoolExecutor(max_workers=NFSE_ZIP_WORKERS) as executor:
+                futures = [executor.submit(nfse_download_storage_object, row) for row in rows]
+                for future in as_completed(futures):
+                    row, content, error = future.result()
+                    processed += 1
+                    if content:
+                        arcname = nfse_zip_arcname(row, empresas, used_names)
+                        zf.writestr(arcname, content)
+                        zip_ok += 1
+                    else:
+                        errors += 1
+
+                    if processed == total or processed % NFSE_ZIP_PROGRESS_EVERY == 0:
+                        params.update({
+                            "processados": processed,
+                            "zip_ok": zip_ok,
+                            "erros": errors,
+                            "updatedAt": nfse_now_iso(),
+                        })
+                        progresso = min(95, round((processed / total) * 95)) if total else 0
+                        nfse_update_execucao(execucao_id, {"progresso": progresso, "parametros": params})
+
+        if zip_ok <= 0:
+            raise RuntimeError("Nenhum XML pode ser adicionado ao ZIP")
+
+        part_path = f"{NFSE_ZIP_PREFIX}/{execucao_id}_nfse_xmls.zip"
+        nfse_upload_zip(zip_path, part_path)
+        params.update({
+            "processados": total,
+            "zip_ok": zip_ok,
+            "erros": errors,
+            "part_paths": [part_path],
+            "updatedAt": nfse_now_iso(),
+            "error": None,
+        })
+        nfse_update_execucao(execucao_id, {
+            "status": "concluido",
+            "progresso": 100,
+            "finalizado_em": nfse_now_iso(),
+            "parametros": params,
+        })
+    except Exception as exc:
+        current = nfse_get_execucao(execucao_id) or {}
+        params = current.get("parametros") or {}
+        if not isinstance(params, dict):
+            params = {}
+        params.update({"error": str(exc), "updatedAt": nfse_now_iso()})
+        try:
+            nfse_update_execucao(execucao_id, {
+                "status": "erro",
+                "finalizado_em": nfse_now_iso(),
+                "parametros": params,
+            })
+        except Exception:
+            pass
+    finally:
+        if zip_path:
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
+
+
+@app.post("/nfse/zip/start")
+async def nfse_zip_start(payload: dict[str, Any], authorization: str | None = Header(None)):
+    try:
+        execucao_id = str(payload.get("execucao_id") or "").strip()
+        organizacao_id = str(payload.get("organizacao_id") or "").strip()
+        filters = payload.get("filters") or {}
+        if not isinstance(filters, dict):
+            filters = {}
+        if not execucao_id:
+            return JSONResponse({"success": False, "error": "execucao_id obrigatorio"}, status_code=400)
+        if not organizacao_id:
+            return JSONResponse({"success": False, "error": "organizacao_id obrigatorio"}, status_code=400)
+
+        nfse_require_org_access(authorization, organizacao_id)
+        thread = threading.Thread(target=nfse_zip_worker, args=(execucao_id, organizacao_id, filters), daemon=True)
+        thread.start()
+        return JSONResponse({"success": True, "background": True, "execucao_id": execucao_id})
+    except PermissionError as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=403)
+    except Exception as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
 
 
 @app.get("/health")
