@@ -17,7 +17,7 @@ from xml.etree import ElementTree as ET
 import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs12
-from fastapi import FastAPI, File, Form, Header, UploadFile
+from fastapi import FastAPI, File, Form, Header, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from lxml import etree
@@ -50,10 +50,25 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def ensure_cors_headers(request: Request, call_next):
+    origin = request.headers.get("origin") or "*"
+    if request.method == "OPTIONS":
+        response = Response(status_code=204)
+    else:
+        response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "authorization, content-type, apikey, x-client-info"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    response.headers["Vary"] = "Origin"
+    return response
 
 
 def limpar_cnpj(cnpj: str) -> str:
@@ -1191,6 +1206,11 @@ def nfse_zip_worker(execucao_id: str, organizacao_id: str, filters: dict[str, An
                 os.remove(zip_path)
             except Exception:
                 pass
+
+
+@app.get("/nfse/zip/ping")
+def nfse_zip_ping() -> dict[str, bool]:
+    return {"ok": True}
 
 
 @app.post("/nfse/zip/start")
