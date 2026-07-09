@@ -592,7 +592,7 @@ def processar_consulta(
                     )
                     if manifestar_ciencia and chave and chave not in manifestadas:
                         resumo_docs_para_manifestar.append((chave, {"nsu": doc_zip.attrib.get("NSU"), "competencia": comp_doc}))
-                    elif not somente_completas:
+                    if not somente_completas:
                         competencia_destino = comp_doc or competencia
                         caminho = salvar_documento(cnpj, competencia_destino, doc_info, resumo)
                         if caminho:
