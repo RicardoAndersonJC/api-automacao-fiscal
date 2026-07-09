@@ -1342,8 +1342,8 @@ async def nfse_zip_start(payload: dict[str, Any], background_tasks: BackgroundTa
         return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
 
 @app.get("/health")
-def health() -> dict[str, bool]:
-    return {"ok": True}
+def health() -> dict[str, object]:
+    return {"ok": True, "version": "bc81100", "nfe_resumo_manifestar_fix": True}
 
 
 @app.post("/baixar-nfe")
