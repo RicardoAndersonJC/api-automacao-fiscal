@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import hmac
 import os
+import re
 import shutil
 import tempfile
 import threading
 import time
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -28,6 +30,28 @@ _active_lock = threading.Lock()
 _batch_size = 250
 _lease_seconds = 300
 _heartbeat_interval = 45.0
+_transient_statuses = {408, 429, 500, 502, 503, 504}
+
+
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        return max(minimum, min(int(os.environ.get(name, default)), maximum))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_archive_name(value: str, arquivo_id: str) -> str:
+    parts = str(value or "").replace("\\", "/").split("/")
+    safe_parts = []
+    for part in parts:
+        cleaned = re.sub(r"[^A-Za-z0-9._ -]", "_", part).replace("..", "_").strip(". ")
+        if cleaned:
+            safe_parts.append(cleaned[:160])
+    if not safe_parts:
+        safe_parts = ["_SEM_COMPETENCIA_", f"{arquivo_id}.xml"]
+    elif len(safe_parts) == 1:
+        safe_parts.insert(0, "_SEM_COMPETENCIA_")
+    return "/".join(safe_parts)
 
 
 def _settings() -> tuple[str, str, str]:
@@ -61,23 +85,41 @@ def _rpc(url: str, key: str, name: str, payload: dict[str, Any]) -> Any:
     return response.json() if response.content else None
 
 
-def _download_into(
-    url: str, key: str, storage_path: str, target: Any
-) -> int:
+def _download_to_temp(
+    url: str, key: str, item: dict[str, Any], target_dir: Path
+) -> dict[str, Any]:
+    storage_path = str(item["storage_path"])
     encoded = quote(storage_path, safe="/")
-    with requests.get(
-        f"{url}/storage/v1/object/fiscal-files/{encoded}",
-        headers=_headers(key),
-        stream=True,
-        timeout=(15, 120),
-    ) as response:
-        response.raise_for_status()
-        size = 0
-        for chunk in response.iter_content(chunk_size=256 * 1024):
-            if chunk:
-                target.write(chunk)
-                size += len(chunk)
-        return size
+    target = target_dir / f"{int(item['seq']):020d}_{item['arquivo_id']}.xml"
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            with requests.get(
+                f"{url}/storage/v1/object/fiscal-files/{encoded}",
+                headers=_headers(key),
+                stream=True,
+                timeout=(15, 120),
+            ) as response:
+                if response.status_code in _transient_statuses and attempt < 2:
+                    raise requests.HTTPError(
+                        f"HTTP transitorio {response.status_code}", response=response
+                    )
+                response.raise_for_status()
+                size = 0
+                with target.open("wb") as output:
+                    for chunk in response.iter_content(chunk_size=256 * 1024):
+                        if chunk:
+                            output.write(chunk)
+                            size += len(chunk)
+                return {"item": item, "path": target, "size": size, "error": None}
+        except Exception as exc:
+            last_error = exc
+            target.unlink(missing_ok=True)
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if attempt >= 2 or (status is not None and status not in _transient_statuses):
+                break
+            time.sleep(0.25 * (2**attempt))
+    return {"item": item, "path": None, "size": 0, "error": str(last_error)[:1000]}
 
 
 def _upload_zip(
@@ -151,12 +193,17 @@ def process_nfse_xml_zip(job_id: str) -> None:
 
         temp_dir = Path(tempfile.mkdtemp(prefix=f"nfse_zip_{job_id[:8]}_"))
         zip_path = temp_dir / "nfse_xmls.zip"
+        download_dir = temp_dir / "downloads"
+        download_dir.mkdir()
+        download_concurrency = _bounded_env_int("NFSE_ZIP_DOWNLOAD_CONCURRENCY", 8, 1, 16)
+        checkpoint_size = _bounded_env_int("NFSE_ZIP_CHECKPOINT_SIZE", 25, 10, 50)
+        compression_level = _bounded_env_int("NFSE_ZIP_COMPRESSION_LEVEL", 2, 0, 9)
         with zipfile.ZipFile(
             zip_path,
             mode="w",
             compression=zipfile.ZIP_DEFLATED,
             allowZip64=True,
-            compresslevel=6,
+            compresslevel=compression_level,
         ) as archive:
             while True:
                 items = _rpc(
@@ -172,43 +219,59 @@ def process_nfse_xml_zip(job_id: str) -> None:
                 if not items:
                     break
 
-                results: list[dict[str, Any]] = []
-                for item in items:
+                for start in range(0, len(items), checkpoint_size):
+                    wave = items[start : start + checkpoint_size]
                     if heartbeat_lost.is_set():
                         raise RuntimeError(heartbeat_error[-1] if heartbeat_error else "Lease perdido")
-                    try:
-                        with archive.open(
-                            str(item["archive_name"]), mode="w", force_zip64=True
-                        ) as entry:
-                            size = _download_into(
-                                url, key, str(item["storage_path"]), entry
+                    with ThreadPoolExecutor(
+                        max_workers=download_concurrency,
+                        thread_name_prefix="nfse-xml-download",
+                    ) as executor:
+                        downloaded = list(
+                            executor.map(
+                                lambda item: _download_to_temp(url, key, item, download_dir),
+                                wave,
                             )
-                        results.append(
-                            {
-                                "arquivo_id": item["arquivo_id"],
-                                "ok": True,
-                                "size": size,
-                            }
                         )
-                    except Exception as exc:
-                        results.append(
-                            {
+                    results: list[dict[str, Any]] = []
+                    for downloaded_item in downloaded:
+                        item = downloaded_item["item"]
+                        path = downloaded_item["path"]
+                        if heartbeat_lost.is_set():
+                            raise RuntimeError(
+                                heartbeat_error[-1] if heartbeat_error else "Lease perdido"
+                            )
+                        if path is not None:
+                            try:
+                                archive.write(
+                                    path,
+                                    arcname=_safe_archive_name(
+                                        str(item["archive_name"]), str(item["arquivo_id"])
+                                    ),
+                                )
+                                results.append({
+                                    "arquivo_id": item["arquivo_id"],
+                                    "ok": True,
+                                    "size": downloaded_item["size"],
+                                })
+                            finally:
+                                path.unlink(missing_ok=True)
+                        else:
+                            results.append({
                                 "arquivo_id": item["arquivo_id"],
                                 "ok": False,
-                                "error": str(exc)[:1000],
-                            }
-                        )
-
-                _rpc(
-                    url,
-                    key,
-                    "checkpoint_nfse_xml_zip_items",
-                    {
-                        "p_job_id": job_id,
-                        "p_worker_id": worker_id,
-                        "p_results": results,
-                    },
-                )
+                                "error": downloaded_item["error"],
+                            })
+                    _rpc(
+                        url,
+                        key,
+                        "checkpoint_nfse_xml_zip_items",
+                        {
+                            "p_job_id": job_id,
+                            "p_worker_id": worker_id,
+                            "p_results": results,
+                        },
+                    )
         object_path = (
             f"{job['organizacao_id']}/{job['usuario_id']}/{job_id}/"
             "nfse_xmls.zip"
