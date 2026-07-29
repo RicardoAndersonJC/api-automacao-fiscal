@@ -8,7 +8,9 @@ RAM.
 from __future__ import annotations
 
 import hmac
+import json
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -27,10 +29,16 @@ from fastapi.responses import JSONResponse
 
 _active: set[str] = set()
 _active_lock = threading.Lock()
-_batch_size = 250
 _lease_seconds = 300
 _heartbeat_interval = 45.0
 _transient_statuses = {408, 429, 500, 502, 503, 504}
+_download_session_local = threading.local()
+
+
+def _log(stage: str, job_id: str, **fields: Any) -> None:
+    """Structured logs without XML contents, credentials or signed URLs."""
+    print(json.dumps({"event": "nfse_zip", "stage": stage, "job_id": job_id, **fields},
+                     ensure_ascii=False, default=str), flush=True)
 
 
 def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -74,8 +82,35 @@ def _headers(key: str) -> dict[str, str]:
     }
 
 
-def _rpc(url: str, key: str, name: str, payload: dict[str, Any]) -> Any:
-    response = requests.post(
+def _new_session(pool_size: int = 8) -> requests.Session:
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=pool_size,
+        pool_maxsize=pool_size,
+        max_retries=0,
+        pool_block=True,
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def _download_session(pool_size: int) -> requests.Session:
+    session = getattr(_download_session_local, "session", None)
+    if session is None:
+        session = _new_session(pool_size)
+        _download_session_local.session = session
+    return session
+
+
+def _rpc(
+    url: str,
+    key: str,
+    name: str,
+    payload: dict[str, Any],
+    session: requests.Session | None = None,
+) -> Any:
+    response = (session or requests).post(
         f"{url}/rest/v1/rpc/{name}",
         headers=_headers(key),
         json=payload,
@@ -86,7 +121,11 @@ def _rpc(url: str, key: str, name: str, payload: dict[str, Any]) -> Any:
 
 
 def _download_to_temp(
-    url: str, key: str, item: dict[str, Any], target_dir: Path
+    url: str,
+    key: str,
+    item: dict[str, Any],
+    target_dir: Path,
+    pool_size: int,
 ) -> dict[str, Any]:
     storage_path = str(item["storage_path"])
     encoded = quote(storage_path, safe="/")
@@ -94,7 +133,7 @@ def _download_to_temp(
     last_error: Exception | None = None
     for attempt in range(3):
         try:
-            with requests.get(
+            with _download_session(pool_size).get(
                 f"{url}/storage/v1/object/fiscal-files/{encoded}",
                 headers=_headers(key),
                 stream=True,
@@ -118,18 +157,27 @@ def _download_to_temp(
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if attempt >= 2 or (status is not None and status not in _transient_statuses):
                 break
-            time.sleep(0.25 * (2**attempt))
+            retry_after = getattr(getattr(exc, "response", None), "headers", {}).get("Retry-After")
+            try:
+                delay = min(float(retry_after), 30.0) if retry_after else 0.25 * (2**attempt)
+            except (TypeError, ValueError):
+                delay = 0.25 * (2**attempt)
+            time.sleep(delay + random.uniform(0, max(0.05, delay * 0.2)))
     return {"item": item, "path": None, "size": 0, "error": str(last_error)[:1000]}
 
 
 def _upload_zip(
-    url: str, key: str, object_path: str, local_path: Path
+    url: str,
+    key: str,
+    object_path: str,
+    local_path: Path,
+    session: requests.Session | None = None,
 ) -> None:
     encoded = quote(object_path, safe="/")
     headers = _headers(key)
     headers.update({"Content-Type": "application/zip", "x-upsert": "true"})
     with local_path.open("rb") as body:
-        response = requests.post(
+        response = (session or requests).post(
             f"{url}/storage/v1/object/nfse-exports-private/{encoded}",
             headers=headers,
             data=body,
@@ -152,8 +200,11 @@ def process_nfse_xml_zip(job_id: str) -> None:
     heartbeat_lost = threading.Event()
     heartbeat_error: list[str] = []
     heartbeat_thread: threading.Thread | None = None
+    control_session: requests.Session | None = None
     try:
         url, key, _ = _settings()
+        control_session = _new_session(4)
+        job_started = time.monotonic()
         job = _first(
             _rpc(
                 url,
@@ -164,25 +215,30 @@ def process_nfse_xml_zip(job_id: str) -> None:
                     "p_worker_id": worker_id,
                     "p_lease_seconds": _lease_seconds,
                 },
+                control_session,
             )
         )
         if not job:
             return
 
         def keep_lease_alive() -> None:
-            while not heartbeat_stop.wait(_heartbeat_interval):
-                try:
-                    ok = _rpc(url, key, "heartbeat_nfse_xml_zip_job", {
-                        "p_job_id": job_id,
-                        "p_worker_id": worker_id,
-                        "p_lease_seconds": _lease_seconds,
-                    })
-                    if ok is not True:
-                        raise RuntimeError("Lease perdido durante a geracao")
-                except Exception as exc:
-                    heartbeat_error.append(str(exc))
-                    heartbeat_lost.set()
-                    return
+            heartbeat_session = _new_session(2)
+            try:
+                while not heartbeat_stop.wait(_heartbeat_interval):
+                    try:
+                        ok = _rpc(url, key, "heartbeat_nfse_xml_zip_job", {
+                            "p_job_id": job_id,
+                            "p_worker_id": worker_id,
+                            "p_lease_seconds": _lease_seconds,
+                        }, heartbeat_session)
+                        if ok is not True:
+                            raise RuntimeError("Lease perdido durante a geracao")
+                    except Exception as exc:
+                        heartbeat_error.append(str(exc))
+                        heartbeat_lost.set()
+                        return
+            finally:
+                heartbeat_session.close()
 
         heartbeat_thread = threading.Thread(
             target=keep_lease_alive,
@@ -196,15 +252,22 @@ def process_nfse_xml_zip(job_id: str) -> None:
         download_dir = temp_dir / "downloads"
         download_dir.mkdir()
         download_concurrency = _bounded_env_int("NFSE_ZIP_DOWNLOAD_CONCURRENCY", 8, 1, 16)
-        checkpoint_size = _bounded_env_int("NFSE_ZIP_CHECKPOINT_SIZE", 25, 10, 50)
+        checkpoint_size = _bounded_env_int("NFSE_ZIP_CHECKPOINT_SIZE", 250, 250, 500)
         compression_level = _bounded_env_int("NFSE_ZIP_COMPRESSION_LEVEL", 2, 0, 9)
+        _log("running", job_id, concurrency=download_concurrency, checkpoint_size=checkpoint_size)
+        total_download_ms = 0
+        total_checkpoint_ms = 0
+        bytes_downloaded = 0
         with zipfile.ZipFile(
             zip_path,
             mode="w",
             compression=zipfile.ZIP_DEFLATED,
             allowZip64=True,
             compresslevel=compression_level,
-        ) as archive:
+        ) as archive, ThreadPoolExecutor(
+            max_workers=download_concurrency,
+            thread_name_prefix="nfse-xml-download",
+        ) as executor:
             while True:
                 items = _rpc(
                     url,
@@ -213,8 +276,11 @@ def process_nfse_xml_zip(job_id: str) -> None:
                     {
                         "p_job_id": job_id,
                         "p_worker_id": worker_id,
-                        "p_limit": _batch_size,
-                    },
+                        # Claim e checkpoint usam o mesmo tamanho efetivo. Assim
+                        # NFSE_ZIP_CHECKPOINT_SIZE=500 reduz de fato as viagens
+                        # ao banco, sem uma pagina intermediaria fixa em 250.
+                        "p_limit": checkpoint_size,
+                    }, control_session,
                 ) or []
                 if not items:
                     break
@@ -223,16 +289,16 @@ def process_nfse_xml_zip(job_id: str) -> None:
                     wave = items[start : start + checkpoint_size]
                     if heartbeat_lost.is_set():
                         raise RuntimeError(heartbeat_error[-1] if heartbeat_error else "Lease perdido")
-                    with ThreadPoolExecutor(
-                        max_workers=download_concurrency,
-                        thread_name_prefix="nfse-xml-download",
-                    ) as executor:
-                        downloaded = list(
-                            executor.map(
-                                lambda item: _download_to_temp(url, key, item, download_dir),
-                                wave,
-                            )
+                    download_started = time.monotonic()
+                    downloaded = list(
+                        executor.map(
+                            lambda item: _download_to_temp(
+                                url, key, item, download_dir, download_concurrency
+                            ),
+                            wave,
                         )
+                    )
+                    total_download_ms += int((time.monotonic() - download_started) * 1000)
                     results: list[dict[str, Any]] = []
                     for downloaded_item in downloaded:
                         item = downloaded_item["item"]
@@ -254,6 +320,7 @@ def process_nfse_xml_zip(job_id: str) -> None:
                                     "ok": True,
                                     "size": downloaded_item["size"],
                                 })
+                                bytes_downloaded += int(downloaded_item["size"])
                             finally:
                                 path.unlink(missing_ok=True)
                         else:
@@ -262,7 +329,8 @@ def process_nfse_xml_zip(job_id: str) -> None:
                                 "ok": False,
                                 "error": downloaded_item["error"],
                             })
-                    _rpc(
+                    checkpoint_started = time.monotonic()
+                    checkpoint = _rpc(
                         url,
                         key,
                         "checkpoint_nfse_xml_zip_items",
@@ -270,7 +338,15 @@ def process_nfse_xml_zip(job_id: str) -> None:
                             "p_job_id": job_id,
                             "p_worker_id": worker_id,
                             "p_results": results,
-                        },
+                        }, control_session,
+                    )
+                    total_checkpoint_ms += int((time.monotonic() - checkpoint_started) * 1000)
+                    _log(
+                        "checkpoint",
+                        job_id,
+                        processed=(checkpoint or {}).get("processados") if isinstance(checkpoint, dict) else None,
+                        batch=len(results),
+                        bytes_downloaded=bytes_downloaded,
                     )
         object_path = (
             f"{job['organizacao_id']}/{job['usuario_id']}/{job_id}/"
@@ -278,7 +354,9 @@ def process_nfse_xml_zip(job_id: str) -> None:
         )
         if heartbeat_lost.is_set():
             raise RuntimeError(heartbeat_error[-1] if heartbeat_error else "Lease perdido")
-        _upload_zip(url, key, object_path, zip_path)
+        upload_started = time.monotonic()
+        _upload_zip(url, key, object_path, zip_path, control_session)
+        upload_ms = int((time.monotonic() - upload_started) * 1000)
         if heartbeat_lost.is_set():
             raise RuntimeError(heartbeat_error[-1] if heartbeat_error else "Lease perdido durante upload")
         _rpc(
@@ -290,7 +368,17 @@ def process_nfse_xml_zip(job_id: str) -> None:
                 "p_worker_id": worker_id,
                 "p_result_path": object_path,
                 "p_size": zip_path.stat().st_size,
-            },
+            }, control_session,
+        )
+        _log(
+            "completed",
+            job_id,
+            duration_ms=int((time.monotonic() - job_started) * 1000),
+            download_duration_ms=total_download_ms,
+            checkpoint_duration_ms=total_checkpoint_ms,
+            upload_duration_ms=upload_ms,
+            bytes_downloaded=bytes_downloaded,
+            zip_bytes=zip_path.stat().st_size,
         )
     except Exception as exc:
         if url and key:
@@ -303,7 +391,7 @@ def process_nfse_xml_zip(job_id: str) -> None:
                         "p_job_id": job_id,
                         "p_worker_id": worker_id,
                         "p_error": str(exc)[:1000],
-                    },
+                    }, control_session,
                 )
             except Exception:
                 pass
@@ -313,12 +401,15 @@ def process_nfse_xml_zip(job_id: str) -> None:
             heartbeat_thread.join(timeout=2)
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
+        if control_session:
+            control_session.close()
         with _active_lock:
             _active.discard(job_id)
 
 
 def install_nfse_zip_routes(app: FastAPI) -> None:
     @app.post("/nfse/xml-zip/dispatch")
+    @app.post("/nfe/xml-zip/dispatch")
     async def dispatch_nfse_xml_zip(
         payload: dict[str, Any],
         x_nfse_zip_secret: str | None = Header(default=None),

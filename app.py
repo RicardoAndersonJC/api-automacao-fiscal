@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from lxml import etree
 from signxml import XMLSigner, methods
 from nfse_zip_worker import install_nfse_zip_routes
+from nfe_danfe import install_nfe_danfe_routes
 
 NFE_NS = "http://www.portalfiscal.inf.br/nfe"
 SOAP12_NS = "http://www.w3.org/2003/05/soap-envelope"
@@ -46,6 +47,7 @@ os.makedirs(BASE_DIR, exist_ok=True)
 
 app = FastAPI()
 install_nfse_zip_routes(app)
+install_nfe_danfe_routes(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

@@ -6,3 +6,4 @@ cryptography
 lxml
 signxml
 python-multipart
+BrazilFiscalReport==1.0.1
