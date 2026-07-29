@@ -251,8 +251,8 @@ def process_nfse_xml_zip(job_id: str) -> None:
         zip_path = temp_dir / "nfse_xmls.zip"
         download_dir = temp_dir / "downloads"
         download_dir.mkdir()
-        download_concurrency = _bounded_env_int("NFSE_ZIP_DOWNLOAD_CONCURRENCY", 8, 1, 16)
-        checkpoint_size = _bounded_env_int("NFSE_ZIP_CHECKPOINT_SIZE", 250, 250, 500)
+        download_concurrency = _bounded_env_int("NFSE_ZIP_DOWNLOAD_CONCURRENCY", 12, 1, 24)
+        checkpoint_size = _bounded_env_int("NFSE_ZIP_CHECKPOINT_SIZE", 500, 250, 1000)
         compression_level = _bounded_env_int("NFSE_ZIP_COMPRESSION_LEVEL", 2, 0, 9)
         _log("running", job_id, concurrency=download_concurrency, checkpoint_size=checkpoint_size)
         total_download_ms = 0
