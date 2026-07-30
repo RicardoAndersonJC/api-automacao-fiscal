@@ -14,6 +14,7 @@ import json
 import os
 import random
 import re
+import secrets
 import shutil
 import tempfile
 import threading
@@ -28,7 +29,7 @@ from urllib.parse import quote, urljoin, urlparse
 import requests
 from lxml import etree
 from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 _active: set[str] = set()
 _active_lock = threading.Lock()
@@ -36,6 +37,7 @@ _lease_seconds = 300
 _heartbeat_interval = 45.0
 _transient_statuses = {408, 429, 500, 502, 503, 504}
 _download_session_local = threading.local()
+_zip_result_ttl_seconds = 2 * 60 * 60
 
 _excel_columns = [
     "Arquivo", "Numero_NFSe", "Competencia", "Dh_Emissao_DPS",
@@ -372,6 +374,34 @@ def _first(value: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _zip_result_dir() -> Path:
+    path = Path(tempfile.gettempdir()) / "nfse_zip_results"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _cleanup_zip_results() -> None:
+    cutoff = time.time() - _zip_result_ttl_seconds
+    for path in _zip_result_dir().glob("*.zip"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
+def _publish_zip_download(zip_path: Path) -> tuple[str, int]:
+    _cleanup_zip_results()
+    token = secrets.token_urlsafe(32)
+    target = _zip_result_dir() / f"{token}.zip"
+    size = zip_path.stat().st_size
+    shutil.move(str(zip_path), str(target))
+    public_base = os.environ.get(
+        "NFSE_ZIP_PUBLIC_URL", "https://api-automacao-fiscal.onrender.com"
+    ).rstrip("/")
+    return f"external:{public_base}/nfse/xml-zip/download/{token}", size
+
+
 def process_nfse_xml_zip(job_id: str) -> None:
     worker_id = str(uuid.uuid4())
     temp_dir: Path | None = None
@@ -561,18 +591,11 @@ def process_nfse_xml_zip(job_id: str) -> None:
 
         if heartbeat_lost.is_set():
             raise RuntimeError(heartbeat_error[-1] if heartbeat_error else "Lease perdido")
-        upload_started = time.monotonic()
-        object_paths: list[str] = []
-        total_zip_bytes = 0
-        for zip_path in zip_paths:
-            object_path = (
-                f"{job['organizacao_id']}/{job['usuario_id']}/{job_id}/"
-                f"{zip_path.name}"
-            )
-            _upload_zip(url, key, object_path, zip_path, control_session)
-            object_paths.append(object_path)
-            total_zip_bytes += zip_path.stat().st_size
-        upload_ms = int((time.monotonic() - upload_started) * 1000)
+        publish_started = time.monotonic()
+        if len(zip_paths) != 1:
+            raise RuntimeError("A geracao deveria produzir um unico ZIP")
+        external_path, total_zip_bytes = _publish_zip_download(zip_paths[0])
+        upload_ms = int((time.monotonic() - publish_started) * 1000)
         if heartbeat_lost.is_set():
             raise RuntimeError(heartbeat_error[-1] if heartbeat_error else "Lease perdido durante upload")
         _rpc(
@@ -582,7 +605,7 @@ def process_nfse_xml_zip(job_id: str) -> None:
             {
                 "p_job_id": job_id,
                 "p_worker_id": worker_id,
-                "p_result_paths": object_paths,
+                "p_result_paths": [external_path],
                 "p_size": total_zip_bytes,
             }, control_session,
         )
@@ -598,12 +621,13 @@ def process_nfse_xml_zip(job_id: str) -> None:
             zip_parts=len(zip_paths),
         )
     except Exception as exc:
+        _log("failed", job_id, error=str(exc)[:500])
         if url and key:
             try:
                 _rpc(
                     url,
                     key,
-                    "defer_nfse_xml_zip_job",
+                    "fail_nfse_xml_zip_job",
                     {
                         "p_job_id": job_id,
                         "p_worker_id": worker_id,
@@ -797,6 +821,23 @@ def process_nfse_excel(job_id: str) -> None:
 
 
 def install_nfse_zip_routes(app: FastAPI) -> None:
+    @app.get("/nfse/xml-zip/download/{token}")
+    async def download_nfse_xml_zip(token: str):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{40,64}", token):
+            return JSONResponse({"error": "Link invalido"}, status_code=404)
+        _cleanup_zip_results()
+        path = _zip_result_dir() / f"{token}.zip"
+        if not path.is_file():
+            return JSONResponse(
+                {"error": "Arquivo expirado ou indisponivel"}, status_code=404
+            )
+        return FileResponse(
+            path,
+            media_type="application/zip",
+            filename="nfse_xmls.zip",
+            headers={"Cache-Control": "private, no-store"},
+        )
+
     @app.post("/nfse/xml-zip/dispatch")
     @app.post("/nfe/xml-zip/dispatch")
     @app.post("/nfse/excel/dispatch")
