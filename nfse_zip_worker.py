@@ -1,14 +1,15 @@
-"""Worker de ZIPs multipartes dos XMLs NFS-e.
+"""Worker de ZIP único dos XMLs NFS-e com upload retomável.
 
 Projetado para o web service Render existente: o endpoint apenas despacha uma
 thread; concorrencia entre instancias e retomada sao controladas por leases no
-Postgres. As partes usam ZIP64 e arquivos temporarios em disco, sem acumular
-XMLs em RAM.
+Postgres. O ZIP usa ZIP64, arquivo temporário em disco e upload TUS em blocos,
+sem acumular XMLs em RAM.
 """
 from __future__ import annotations
 
 import hmac
 import html
+import base64
 import json
 import os
 import random
@@ -22,7 +23,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 from lxml import etree
@@ -279,17 +280,67 @@ def _upload_zip(
     local_path: Path,
     session: requests.Session | None = None,
 ) -> None:
-    encoded = quote(object_path, safe="/")
+    # Supabase recomenda TUS para arquivos acima de 6 MB. O ZIP continua sendo
+    # um único objeto; somente a transferência ocorre em blocos retomáveis.
+    parsed = urlparse(url)
+    project_ref = parsed.hostname.split(".")[0] if parsed.hostname else ""
+    storage_origin = (
+        f"{parsed.scheme}://{project_ref}.storage.supabase.co"
+        if project_ref else url
+    )
+    endpoint = f"{storage_origin}/storage/v1/upload/resumable"
     headers = _headers(key)
-    headers.update({"Content-Type": "application/zip", "x-upsert": "true"})
-    with local_path.open("rb") as body:
-        response = (session or requests).post(
-            f"{url}/storage/v1/object/nfse-exports-private/{encoded}",
-            headers=headers,
-            data=body,
-            timeout=(15, 900),
+    metadata = {
+        "bucketName": "nfse-exports-private",
+        "objectName": object_path,
+        "contentType": "application/zip",
+        "cacheControl": "3600",
+    }
+    encoded_metadata = ",".join(
+        f"{name} {base64.b64encode(value.encode()).decode()}"
+        for name, value in metadata.items()
+    )
+    headers.update({
+        "Tus-Resumable": "1.0.0",
+        "Upload-Length": str(local_path.stat().st_size),
+        "Upload-Metadata": encoded_metadata,
+        "x-upsert": "true",
+    })
+    headers.pop("Content-Type", None)
+    client = session or requests.Session()
+    created = client.post(endpoint, headers=headers, timeout=(15, 60))
+    if created.status_code != 201:
+        raise requests.HTTPError(
+            f"TUS create HTTP {created.status_code}: {created.text[:500]}",
+            response=created,
         )
-    response.raise_for_status()
+    upload_url = urljoin(endpoint, created.headers["Location"])
+    chunk_size = 6 * 1024 * 1024
+    offset = 0
+    with local_path.open("rb") as body:
+        while offset < local_path.stat().st_size:
+            body.seek(offset)
+            chunk = body.read(chunk_size)
+            patch_headers = {
+                "Authorization": f"Bearer {key}",
+                "apikey": key,
+                "Tus-Resumable": "1.0.0",
+                "Upload-Offset": str(offset),
+                "Content-Type": "application/offset+octet-stream",
+                "Content-Length": str(len(chunk)),
+            }
+            response = client.patch(
+                upload_url,
+                headers=patch_headers,
+                data=chunk,
+                timeout=(15, 180),
+            )
+            if response.status_code != 204:
+                raise requests.HTTPError(
+                    f"TUS patch HTTP {response.status_code}: {response.text[:500]}",
+                    response=response,
+                )
+            offset = int(response.headers.get("Upload-Offset", offset + len(chunk)))
 
 
 def _upload_excel(
@@ -383,9 +434,7 @@ def process_nfse_xml_zip(job_id: str) -> None:
         download_concurrency = _bounded_env_int("NFSE_ZIP_DOWNLOAD_CONCURRENCY", 12, 1, 24)
         checkpoint_size = _bounded_env_int("NFSE_ZIP_CHECKPOINT_SIZE", 500, 250, 1000)
         compression_level = _bounded_env_int("NFSE_ZIP_COMPRESSION_LEVEL", 2, 0, 9)
-        part_max_bytes = _bounded_env_int(
-            "NFSE_ZIP_PART_MAX_UNCOMPRESSED_MB", 40, 10, 250
-        ) * 1024 * 1024
+        part_max_bytes = 5 * 1024 * 1024 * 1024
         _log("running", job_id, concurrency=download_concurrency, checkpoint_size=checkpoint_size)
         total_download_ms = 0
         total_checkpoint_ms = 0
@@ -395,7 +444,11 @@ def process_nfse_xml_zip(job_id: str) -> None:
         archive: zipfile.ZipFile | None = None
 
         def open_next_part() -> zipfile.ZipFile:
-            part_path = temp_dir / f"nfse_xmls_parte_{len(zip_paths) + 1:03d}.zip"
+            part_path = (
+                temp_dir / "nfse_xmls.zip"
+                if not zip_paths
+                else temp_dir / f"nfse_xmls_parte_{len(zip_paths) + 1:03d}.zip"
+            )
             zip_paths.append(part_path)
             return zipfile.ZipFile(
                 part_path,
