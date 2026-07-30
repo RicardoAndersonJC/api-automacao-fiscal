@@ -1,9 +1,9 @@
-"""Worker de ZIP unico dos XMLs NFS-e.
+"""Worker de ZIPs multipartes dos XMLs NFS-e.
 
 Projetado para o web service Render existente: o endpoint apenas despacha uma
 thread; concorrencia entre instancias e retomada sao controladas por leases no
-Postgres. O ZIP usa ZIP64 e arquivo temporario em disco, sem acumular XMLs em
-RAM.
+Postgres. As partes usam ZIP64 e arquivos temporarios em disco, sem acumular
+XMLs em RAM.
 """
 from __future__ import annotations
 
@@ -377,27 +377,41 @@ def process_nfse_xml_zip(job_id: str) -> None:
         heartbeat_thread.start()
 
         temp_dir = Path(tempfile.mkdtemp(prefix=f"nfse_zip_{job_id[:8]}_"))
-        zip_path = temp_dir / "nfse_xmls.zip"
+        zip_paths: list[Path] = []
         download_dir = temp_dir / "downloads"
         download_dir.mkdir()
         download_concurrency = _bounded_env_int("NFSE_ZIP_DOWNLOAD_CONCURRENCY", 12, 1, 24)
         checkpoint_size = _bounded_env_int("NFSE_ZIP_CHECKPOINT_SIZE", 500, 250, 1000)
         compression_level = _bounded_env_int("NFSE_ZIP_COMPRESSION_LEVEL", 2, 0, 9)
+        part_max_bytes = _bounded_env_int(
+            "NFSE_ZIP_PART_MAX_UNCOMPRESSED_MB", 40, 10, 250
+        ) * 1024 * 1024
         _log("running", job_id, concurrency=download_concurrency, checkpoint_size=checkpoint_size)
         total_download_ms = 0
         total_checkpoint_ms = 0
         bytes_downloaded = 0
-        with zipfile.ZipFile(
-            zip_path,
-            mode="w",
-            compression=zipfile.ZIP_DEFLATED,
-            allowZip64=True,
-            compresslevel=compression_level,
-        ) as archive, ThreadPoolExecutor(
-            max_workers=download_concurrency,
-            thread_name_prefix="nfse-xml-download",
-        ) as executor:
-            while True:
+        part_uncompressed_bytes = 0
+        part_entries = 0
+        archive: zipfile.ZipFile | None = None
+
+        def open_next_part() -> zipfile.ZipFile:
+            part_path = temp_dir / f"nfse_xmls_parte_{len(zip_paths) + 1:03d}.zip"
+            zip_paths.append(part_path)
+            return zipfile.ZipFile(
+                part_path,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+                allowZip64=True,
+                compresslevel=compression_level,
+            )
+
+        try:
+            archive = open_next_part()
+            with ThreadPoolExecutor(
+                max_workers=download_concurrency,
+                thread_name_prefix="nfse-xml-download",
+            ) as executor:
+              while True:
                 items = _rpc(
                     url,
                     key,
@@ -438,6 +452,15 @@ def process_nfse_xml_zip(job_id: str) -> None:
                             )
                         if path is not None:
                             try:
+                                item_size = int(downloaded_item["size"])
+                                if (
+                                    part_entries > 0
+                                    and part_uncompressed_bytes + item_size > part_max_bytes
+                                ):
+                                    archive.close()
+                                    archive = open_next_part()
+                                    part_uncompressed_bytes = 0
+                                    part_entries = 0
                                 archive.write(
                                     path,
                                     arcname=_safe_archive_name(
@@ -449,7 +472,9 @@ def process_nfse_xml_zip(job_id: str) -> None:
                                     "ok": True,
                                     "size": downloaded_item["size"],
                                 })
-                                bytes_downloaded += int(downloaded_item["size"])
+                                bytes_downloaded += item_size
+                                part_uncompressed_bytes += item_size
+                                part_entries += 1
                             finally:
                                 path.unlink(missing_ok=True)
                         else:
@@ -477,26 +502,35 @@ def process_nfse_xml_zip(job_id: str) -> None:
                         batch=len(results),
                         bytes_downloaded=bytes_downloaded,
                     )
-        object_path = (
-            f"{job['organizacao_id']}/{job['usuario_id']}/{job_id}/"
-            "nfse_xmls.zip"
-        )
+        finally:
+            if archive is not None:
+                archive.close()
+
         if heartbeat_lost.is_set():
             raise RuntimeError(heartbeat_error[-1] if heartbeat_error else "Lease perdido")
         upload_started = time.monotonic()
-        _upload_zip(url, key, object_path, zip_path, control_session)
+        object_paths: list[str] = []
+        total_zip_bytes = 0
+        for zip_path in zip_paths:
+            object_path = (
+                f"{job['organizacao_id']}/{job['usuario_id']}/{job_id}/"
+                f"{zip_path.name}"
+            )
+            _upload_zip(url, key, object_path, zip_path, control_session)
+            object_paths.append(object_path)
+            total_zip_bytes += zip_path.stat().st_size
         upload_ms = int((time.monotonic() - upload_started) * 1000)
         if heartbeat_lost.is_set():
             raise RuntimeError(heartbeat_error[-1] if heartbeat_error else "Lease perdido durante upload")
         _rpc(
             url,
             key,
-            "finish_nfse_xml_zip_job",
+            "finish_nfse_xml_zip_job_parts",
             {
                 "p_job_id": job_id,
                 "p_worker_id": worker_id,
-                "p_result_path": object_path,
-                "p_size": zip_path.stat().st_size,
+                "p_result_paths": object_paths,
+                "p_size": total_zip_bytes,
             }, control_session,
         )
         _log(
@@ -507,7 +541,8 @@ def process_nfse_xml_zip(job_id: str) -> None:
             checkpoint_duration_ms=total_checkpoint_ms,
             upload_duration_ms=upload_ms,
             bytes_downloaded=bytes_downloaded,
-            zip_bytes=zip_path.stat().st_size,
+            zip_bytes=total_zip_bytes,
+            zip_parts=len(zip_paths),
         )
     except Exception as exc:
         if url and key:
