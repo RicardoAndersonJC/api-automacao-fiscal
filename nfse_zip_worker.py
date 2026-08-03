@@ -835,7 +835,11 @@ def install_nfse_zip_routes(app: FastAPI) -> None:
             path,
             media_type="application/zip",
             filename="nfse_xmls.zip",
-            headers={"Cache-Control": "private, no-store"},
+            headers={
+                "Cache-Control": "private, no-store",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers": "Content-Disposition, Content-Length",
+            },
         )
 
     @app.post("/nfse/xml-zip/dispatch")
