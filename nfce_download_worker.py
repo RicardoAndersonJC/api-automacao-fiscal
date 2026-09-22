@@ -480,7 +480,7 @@ async def create_job(
     authorization: str | None = Header(None),
 ) -> dict[str, Any]:
     _cleanup_expired()
-    if os.getenv("NFCE_ENABLE_SVRS_DISCOVERY", "false").lower() != "true":
+    if os.getenv("NFCE_ENABLE_SVRS_DISCOVERY", "true").lower() != "true":
         raise HTTPException(
             status_code=503,
             detail="Busca NFC-e aguardando habilitação do piloto autorizado.",
