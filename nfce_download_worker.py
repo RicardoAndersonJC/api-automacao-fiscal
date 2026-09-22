@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-import certifi
+
 import requests
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, pkcs12
 from cryptography.x509.oid import NameOID
@@ -307,7 +307,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
 
         session = requests.Session()
         session.cert = (str(cert_path), str(key_path))
-        session.verify = certifi.where()
+        session.verify = True
         records: list[dict[str, Any]] = []
         found: list[dict[str, Any]] = []
         current_month, number = cfg["aamm"], cfg["number"] + 1
