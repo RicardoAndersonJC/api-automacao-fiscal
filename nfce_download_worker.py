@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-
+import certifi
 import requests
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, pkcs12
 from cryptography.x509.oid import NameOID
@@ -45,6 +45,7 @@ REQUEST_TIMEOUT = int(os.getenv("NFCE_REQUEST_TIMEOUT", "45"))
 JOB_TTL_SECONDS = int(os.getenv("NFCE_JOB_TTL_SECONDS", "21600"))
 MAX_UPLOAD_BYTES = int(os.getenv("NFCE_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024)))
 MAX_NUMERACOES = int(os.getenv("NFCE_MAX_NUMERACOES", "10000"))
+MAX_QUEUED_JOBS = int(os.getenv("NFCE_MAX_QUEUED_JOBS", "10"))
 WORK_ROOT = Path(os.getenv("NFCE_WORK_ROOT", tempfile.gettempdir())) / "nexus_nfce_jobs"
 WORK_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -229,6 +230,8 @@ def _certificate_files(pfx_bytes: bytes, password: str, directory: Path) -> tupl
         cert_data += item.public_bytes(Encoding.PEM)
     cert_path.write_bytes(cert_data)
     key_path.write_bytes(key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
+    cert_path.chmod(0o600)
+    key_path.chmod(0o600)
     subject = cert.subject.rfc4514_string()
     common_names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
     identity = " ".join([subject] + [item.value for item in common_names])
@@ -296,6 +299,7 @@ def _download(session: requests.Session, key: str) -> str | None:
 def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, options: dict[str, int]) -> None:
     cert_path: Path | None = None
     key_path: Path | None = None
+    session: requests.Session | None = None
     try:
         _update(job, status="running", message="Validando XML e certificado", progress=1)
         cfg = parse_seed_xml(seed_bytes)
@@ -307,7 +311,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
 
         session = requests.Session()
         session.cert = (str(cert_path), str(key_path))
-        session.verify = True
+        session.verify = certifi.where()
         records: list[dict[str, Any]] = []
         found: list[dict[str, Any]] = []
         current_month, number = cfg["aamm"], cfg["number"] + 1
@@ -385,8 +389,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             else:
                 item["download_status"] = "NAO_EXTRAIDO"
             _update(job, downloaded=downloaded, progress=68 + int(index / max(1, len(found)) * 27))
-        session.close()
-
         summary = io.StringIO()
         writer = csv.DictWriter(summary, fieldnames=["AAMM", "nNF", "cStat", "xMotivo", "chave_real", "download_status"], delimiter=";")
         writer.writeheader()
@@ -406,6 +408,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         for path in (cert_path, key_path):
             if path:
                 path.unlink(missing_ok=True)
+        if session is not None:
+            session.close()
 
 
 def _cleanup_expired() -> None:
@@ -454,6 +458,23 @@ def _authenticate(authorization: str | None) -> str:
     user_id = str(response.json().get("id") or "")
     if not user_id:
         raise HTTPException(status_code=401, detail="Sessão inválida.")
+    try:
+        permission_response = requests.post(
+            f"{supabase_url}/rest/v1/rpc/user_has_module_access",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "apikey": anon_key,
+                "Content-Type": "application/json",
+            },
+            json={"_module_name": "downloads_xml"},
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=503, detail="Não foi possível validar a permissão.") from exc
+    if permission_response.status_code != 200:
+        raise HTTPException(status_code=503, detail="Falha ao validar a permissão do módulo.")
+    if permission_response.json() is not True:
+        raise HTTPException(status_code=403, detail="Sem permissão para Downloads XML.")
     _auth_cache[digest] = (time.time() + 300, user_id)
     return user_id
 
@@ -486,6 +507,12 @@ async def create_job(
             detail="Busca NFC-e aguardando habilitação do piloto autorizado.",
         )
     owner_id = _authenticate(authorization)
+    with _jobs_lock:
+        active_jobs = [item for item in _jobs.values() if item.status in {"queued", "running"}]
+        if any(item.owner_id == owner_id for item in active_jobs):
+            raise HTTPException(status_code=409, detail="Você já possui uma busca NFC-e em andamento.")
+        if len(active_jobs) >= MAX_QUEUED_JOBS:
+            raise HTTPException(status_code=429, detail="Fila NFC-e temporariamente cheia.")
     if not (2 <= gatilho_mes <= janela_mes < lacuna_parada <= 5000):
         raise HTTPException(status_code=400, detail="Parâmetros de lacuna inválidos.")
     if not (1 <= max_numeracoes <= MAX_NUMERACOES):

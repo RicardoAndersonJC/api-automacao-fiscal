@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.env
+*.pfx
+*.p12
+*.pem
+*.key
+dados/

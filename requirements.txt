@@ -2,6 +2,7 @@ fastapi
 gunicorn
 uvicorn[standard]
 requests
+certifi
 cryptography
 lxml
 signxml
