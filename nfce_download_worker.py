@@ -443,6 +443,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     job, "file", key=item["chave_real"], aamm=item["AAMM"],
                     number=item["nNF"], emitted_at=_xml_emission_date(xml),
                     advance_cursor=not cursor_blocked,
+                    consulted=len(records), found=len(found), item_index=index,
                     xml_base64=base64.b64encode(full_xml.encode("utf-8")).decode("ascii"),
                 )
                 (xml_dir / f'{item["chave_real"]}-procNFe.xml').write_text(full_xml, encoding="utf-8")
