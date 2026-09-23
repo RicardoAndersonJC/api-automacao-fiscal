@@ -252,23 +252,34 @@ def _callback(job: Job, event: str, **payload: Any) -> None:
     parsed = urlparse(supabase_url)
     if parsed.scheme != "https" or parsed.hostname != "vqhtbyiecsxxprikpnus.supabase.co":
         raise RuntimeError("Destino persistente NFC-e não autorizado.")
-    response = requests.post(
-        f"{supabase_url}/functions/v1/nfce-download",
-        json={
-            "action": "callback", "event": event,
-            "run_id": job.external_run_id, "token": job.callback_token, **payload,
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
-    if not response.ok:
-        detail = ""
+    request_body = {
+        "action": "callback", "event": event,
+        "run_id": job.external_run_id, "token": job.callback_token, **payload,
+    }
+    last_error = ""
+    for attempt in range(3):
         try:
-            body = response.json()
-            detail = str(body.get("error") or body.get("message") or "")
-        except (ValueError, AttributeError):
-            detail = response.text.strip()
-        detail = re.sub(r"\s+", " ", detail)[:500] or response.reason
-        raise RuntimeError(f"Callback NFC-e falhou ({response.status_code}): {detail}")
+            response = requests.post(
+                f"{supabase_url}/functions/v1/nfce-download",
+                json=request_body,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if response.ok:
+                return
+            try:
+                body = response.json()
+                detail = str(body.get("error") or body.get("message") or "")
+            except (ValueError, AttributeError):
+                detail = response.text.strip()
+            detail = re.sub(r"\s+", " ", detail)[:500] or response.reason
+            last_error = f"Callback NFC-e falhou ({response.status_code}): {detail}"
+            if response.status_code < 500:
+                break
+        except requests.RequestException as exc:
+            last_error = f"Callback NFC-e indisponível: {exc}"
+        if attempt < 2:
+            time.sleep((0.5 * (2 ** attempt)) + (secrets.randbelow(250) / 1000))
+    raise RuntimeError(last_error or "Callback NFC-e falhou sem resposta.")
 
 
 def _certificate_files(pfx_bytes: bytes, password: str, directory: Path) -> tuple[Path, Path, str]:
