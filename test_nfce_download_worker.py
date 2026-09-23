@@ -1,6 +1,6 @@
 import unittest
 
-from nfce_download_worker import access_key, extract_downloaded_xml, next_aamm, parse_seed_xml
+from nfce_download_worker import access_key, extract_downloaded_xml, next_aamm, parse_seed_xml, svrs_ca_bundle
 
 
 SEED = b'''<?xml version="1.0"?><nfeProc xmlns="http://www.portalfiscal.inf.br/nfe"><NFe><infNFe Id="NFe27260808850821000129650010000280491313219441"><ide><cUF>27</cUF><mod>65</mod><serie>1</serie><nNF>28049</nNF><dhEmi>2026-08-01T12:00:00-03:00</dhEmi><tpEmis>1</tpEmis></ide><emit><CNPJ>08850821000129</CNPJ><xNome>TESTE</xNome></emit></infNFe></NFe></nfeProc>'''
@@ -23,6 +23,9 @@ class NfceWorkerTest(unittest.TestCase):
     def test_extract_xml(self):
         raw = 'prefix &lt;nfeProc xmlns="http://www.portalfiscal.inf.br/nfe"&gt;&lt;NFe/&gt;&lt;/nfeProc&gt; suffix'
         self.assertIn("<nfeProc", extract_downloaded_xml(raw) or "")
+
+    def test_svrs_ca_bundle_is_pinned(self):
+        self.assertTrue(svrs_ca_bundle().endswith("icp-brasil-v10.pem"))
 
 
 if __name__ == "__main__":

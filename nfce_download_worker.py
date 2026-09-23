@@ -30,8 +30,9 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-import certifi
 import requests
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, pkcs12
 from cryptography.x509.oid import NameOID
 from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
@@ -48,6 +49,8 @@ MAX_NUMERACOES = int(os.getenv("NFCE_MAX_NUMERACOES", "10000"))
 MAX_QUEUED_JOBS = int(os.getenv("NFCE_MAX_QUEUED_JOBS", "10"))
 WORK_ROOT = Path(os.getenv("NFCE_WORK_ROOT", tempfile.gettempdir())) / "nexus_nfce_jobs"
 WORK_ROOT.mkdir(parents=True, exist_ok=True)
+ICP_BRASIL_CA_PATH = Path(__file__).with_name("icp-brasil-v10.pem")
+ICP_BRASIL_CA_SHA256 = "6E0BFF069A26994C15DE2C4888CC54AF84882E5495B7FBF66BE9CCFFEC7489F6"
 
 router = APIRouter(prefix="/nfce/download-jobs", tags=["NFC-e"])
 _jobs_lock = threading.Lock()
@@ -94,6 +97,17 @@ class Job:
 
 def _digits(value: str) -> str:
     return re.sub(r"\D", "", value or "")
+
+
+def svrs_ca_bundle() -> str:
+    try:
+        certificate = x509.load_pem_x509_certificate(ICP_BRASIL_CA_PATH.read_bytes())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("Cadeia ICP-Brasil v10 ausente ou inválida.") from exc
+    fingerprint = certificate.fingerprint(hashes.SHA256()).hex().upper()
+    if fingerprint != ICP_BRASIL_CA_SHA256:
+        raise RuntimeError("Fingerprint da cadeia ICP-Brasil v10 não confere.")
+    return str(ICP_BRASIL_CA_PATH)
 
 
 def _local_name(element: ET.Element) -> str:
@@ -311,7 +325,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
 
         session = requests.Session()
         session.cert = (str(cert_path), str(key_path))
-        session.verify = certifi.where()
+        session.verify = svrs_ca_bundle()
         records: list[dict[str, Any]] = []
         found: list[dict[str, Any]] = []
         current_month, number = cfg["aamm"], cfg["number"] + 1

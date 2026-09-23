@@ -4,5 +4,6 @@ __pycache__/
 *.pfx
 *.p12
 *.pem
+!icp-brasil-v10.pem
 *.key
 dados/
