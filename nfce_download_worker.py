@@ -424,6 +424,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         xml_dir = job.directory / "xml"
         xml_dir.mkdir()
         downloaded = 0
+        cursor_blocked = False
         for index, item in enumerate(found, 1):
             xml = None
             last_download_error = ""
@@ -441,6 +442,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 _callback(
                     job, "file", key=item["chave_real"], aamm=item["AAMM"],
                     number=item["nNF"], emitted_at=_xml_emission_date(xml),
+                    advance_cursor=not cursor_blocked,
                     xml_base64=base64.b64encode(full_xml.encode("utf-8")).decode("ascii"),
                 )
                 (xml_dir / f'{item["chave_real"]}-procNFe.xml').write_text(full_xml, encoding="utf-8")
@@ -448,6 +450,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 downloaded += 1
             else:
                 item["download_status"] = "NAO_EXTRAIDO"
+                cursor_blocked = True
                 if last_download_error:
                     item["xMotivo"] = f'{item.get("xMotivo", "")} | download: {last_download_error[:300]}'
             _update(job, downloaded=downloaded, progress=68 + int(index / max(1, len(found)) * 27))
