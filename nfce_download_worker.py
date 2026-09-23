@@ -260,7 +260,15 @@ def _callback(job: Job, event: str, **payload: Any) -> None:
         },
         timeout=REQUEST_TIMEOUT,
     )
-    response.raise_for_status()
+    if not response.ok:
+        detail = ""
+        try:
+            body = response.json()
+            detail = str(body.get("error") or body.get("message") or "")
+        except (ValueError, AttributeError):
+            detail = response.text.strip()
+        detail = re.sub(r"\s+", " ", detail)[:500] or response.reason
+        raise RuntimeError(f"Callback NFC-e falhou ({response.status_code}): {detail}")
 
 
 def _certificate_files(pfx_bytes: bytes, password: str, directory: Path) -> tuple[Path, Path, str]:
