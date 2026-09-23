@@ -1,16 +1,17 @@
-"""Worker assíncrono de download de NFC-e via SVRS, sem persistência em banco.
+"""Worker assíncrono de download de NFC-e via SVRS.
 
 Integração no servidor FastAPI existente::
 
     from integrations.python.nfce_download_worker import router as nfce_router
     app.include_router(nfce_router)
 
-O estado e os artefatos são temporários e locais ao processo. Em produção use um
-único processo/worker para este router (ou sticky sessions) e um volume temporário.
+O estado de execução é temporário. Jobs internos entregam cada XML ao Supabase
+configurado no servidor usando token efêmero validado no banco.
 """
 
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
 import html
@@ -28,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
 import requests
@@ -76,6 +78,8 @@ class Job:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     zip_path: Path | None = None
+    callback_token: str | None = None
+    external_run_id: str | None = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -107,7 +111,15 @@ def svrs_ca_bundle() -> str:
     fingerprint = certificate.fingerprint(hashes.SHA256()).hex().upper()
     if fingerprint != ICP_BRASIL_CA_SHA256:
         raise RuntimeError("Fingerprint da cadeia ICP-Brasil v10 não confere.")
-    return str(ICP_BRASIL_CA_PATH)
+    # A consulta NFC-e usa ICP-Brasil, enquanto o portal de download usa
+    # GlobalSign. O mesmo Session precisa confiar nas duas cadeias.
+    bundle_path = WORK_ROOT / "svrs-ca-bundle.pem"
+    if not bundle_path.exists():
+        public_roots = Path(requests.certs.where()).read_bytes()
+        separator = b"" if public_roots.endswith(b"\n") else b"\n"
+        bundle_path.write_bytes(public_roots + separator + ICP_BRASIL_CA_PATH.read_bytes())
+        bundle_path.chmod(0o600)
+    return str(bundle_path)
 
 
 def _local_name(element: ET.Element) -> str:
@@ -227,6 +239,30 @@ def extract_downloaded_xml(text: str) -> str | None:
     return None
 
 
+def _xml_emission_date(xml: str) -> str:
+    match = re.search(r"<dhEmi>([^<]+)</dhEmi>", xml)
+    return match.group(1).strip() if match else ""
+
+
+def _callback(job: Job, event: str, **payload: Any) -> None:
+    """Entrega somente ao Supabase configurado no servidor; nunca aceita URL do cliente."""
+    if not job.callback_token or not job.external_run_id:
+        return
+    supabase_url = os.getenv("SUPABASE_URL", "https://vqhtbyiecsxxprikpnus.supabase.co").rstrip("/")
+    parsed = urlparse(supabase_url)
+    if parsed.scheme != "https" or parsed.hostname != "vqhtbyiecsxxprikpnus.supabase.co":
+        raise RuntimeError("Destino persistente NFC-e não autorizado.")
+    response = requests.post(
+        f"{supabase_url}/functions/v1/nfce-download",
+        json={
+            "action": "callback", "event": event,
+            "run_id": job.external_run_id, "token": job.callback_token, **payload,
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+
+
 def _certificate_files(pfx_bytes: bytes, password: str, directory: Path) -> tuple[Path, Path, str]:
     if len(pfx_bytes) > MAX_UPLOAD_BYTES:
         raise ValueError("Certificado excede o limite permitido.")
@@ -310,7 +346,7 @@ def _download(session: requests.Session, key: str) -> str | None:
     return extract_downloaded_xml(post_response.text)
 
 
-def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, options: dict[str, int]) -> None:
+def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, options: dict[str, Any]) -> None:
     cert_path: Path | None = None
     key_path: Path | None = None
     session: requests.Session | None = None
@@ -328,7 +364,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         session.verify = svrs_ca_bundle()
         records: list[dict[str, Any]] = []
         found: list[dict[str, Any]] = []
-        current_month, number = cfg["aamm"], cfg["number"] + 1
+        current_month = str(options.get("start_aamm") or cfg["aamm"])
+        start_number = int(options.get("start_number") if options.get("start_number") is not None else cfg["number"])
+        number = start_number + 1
         consecutive_217, gap_start, last_probe = 0, None, number - 1
         max_numbers = options["max_numbers"]
 
@@ -388,20 +426,30 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         downloaded = 0
         for index, item in enumerate(found, 1):
             xml = None
+            last_download_error = ""
             for attempt in range(3):
                 if index > 1 or attempt > 0:
                     time.sleep(options["download_interval_seconds"])
-                xml = _download(session, item["chave_real"])
+                try:
+                    xml = _download(session, item["chave_real"])
+                except requests.RequestException as exc:
+                    last_download_error = str(exc)
                 if xml:
                     break
             if xml:
-                (xml_dir / f'{item["chave_real"]}-procNFe.xml').write_text(
-                    '<?xml version="1.0" encoding="UTF-8"?>\n' + xml, encoding="utf-8"
+                full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+                _callback(
+                    job, "file", key=item["chave_real"], aamm=item["AAMM"],
+                    number=item["nNF"], emitted_at=_xml_emission_date(xml),
+                    xml_base64=base64.b64encode(full_xml.encode("utf-8")).decode("ascii"),
                 )
+                (xml_dir / f'{item["chave_real"]}-procNFe.xml').write_text(full_xml, encoding="utf-8")
                 item["download_status"] = "OK"
                 downloaded += 1
             else:
                 item["download_status"] = "NAO_EXTRAIDO"
+                if last_download_error:
+                    item["xMotivo"] = f'{item.get("xMotivo", "")} | download: {last_download_error[:300]}'
             _update(job, downloaded=downloaded, progress=68 + int(index / max(1, len(found)) * 27))
         summary = io.StringIO()
         writer = csv.DictWriter(summary, fieldnames=["AAMM", "nNF", "cStat", "xMotivo", "chave_real", "download_status"], delimiter=";")
@@ -414,9 +462,14 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             archive.writestr("resumo.csv", summary.getvalue().encode("utf-8-sig"))
             for xml_path in xml_dir.glob("*.xml"):
                 archive.write(xml_path, arcname=f"XML/{xml_path.name}")
+        _callback(job, "completed", consulted=len(records), found=len(found), downloaded=downloaded)
         _update(job, status="completed", message="Processamento concluído", progress=100, consulted=len(records), found=len(found), downloaded=downloaded, zip_path=zip_path)
     except Exception as exc:
         _update(job, status="failed", message="Falha no processamento", error=str(exc), progress=100)
+        try:
+            _callback(job, "failed", error=str(exc))
+        except Exception:
+            pass
     finally:
         password = ""  # reduz o tempo de vida da referência ao segredo
         for path in (cert_path, key_path):
@@ -493,12 +546,78 @@ def _authenticate(authorization: str | None) -> str:
     return user_id
 
 
+def _validate_internal_run(run_id: str, token: str) -> None:
+    supabase_url = os.getenv("SUPABASE_URL", "https://vqhtbyiecsxxprikpnus.supabase.co").rstrip("/")
+    anon_key = os.getenv(
+        "SUPABASE_ANON_KEY",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZxaHRieWllY3N4eHByaWtwbnVzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjYwNjU3OTUsImV4cCI6MjA4MTY0MTc5NX0.aOvciVxs4NjCpHEYZXQziJy-0PQpcy4h-E2CbMZWKJ8",
+    )
+    try:
+        response = requests.post(
+            f"{supabase_url}/rest/v1/rpc/claim_nfce_download_run",
+            headers={"apikey": anon_key, "Authorization": f"Bearer {anon_key}", "Content-Type": "application/json"},
+            json={"p_run_id": run_id, "p_token": token}, timeout=10,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=503, detail="Não foi possível validar o job persistente.") from exc
+    if response.status_code != 200 or response.json() is not True:
+        raise HTTPException(status_code=401, detail="Job persistente inválido ou já utilizado.")
+
+
 def _owned_job(job_id: str, owner_id: str) -> Job:
     with _jobs_lock:
         job = _jobs.get(job_id)
     if not job or job.owner_id != owner_id:
         raise HTTPException(status_code=404, detail="Processamento não encontrado.")
     return job
+
+
+@router.post("/internal", status_code=202)
+async def create_internal_job(
+    run_id: str = Form(...),
+    run_token: str = Form(...),
+    xml_semente: UploadFile = File(...),
+    certificado: UploadFile = File(...),
+    senha: str = Form(...),
+    inicio_aamm: str = Form(...),
+    inicio_nnf: int = Form(...),
+    data_referencia: str = Form(...),
+) -> dict[str, Any]:
+    _cleanup_expired()
+    _validate_internal_run(run_id, run_token)
+    if not re.fullmatch(r"\d{4}", inicio_aamm) or inicio_nnf < 0:
+        raise HTTPException(status_code=400, detail="Cursor NFC-e inválido.")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_referencia):
+        raise HTTPException(status_code=400, detail="Data de referência inválida.")
+    with _jobs_lock:
+        active_jobs = [item for item in _jobs.values() if item.status in {"queued", "running"}]
+        if len(active_jobs) >= MAX_QUEUED_JOBS:
+            raise HTTPException(status_code=429, detail="Fila NFC-e temporariamente cheia.")
+    seed_bytes = await xml_semente.read(MAX_UPLOAD_BYTES + 1)
+    pfx_bytes = await certificado.read(MAX_UPLOAD_BYTES + 1)
+    try:
+        parse_seed_xml(seed_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not pfx_bytes or len(pfx_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="Certificado ausente ou maior que o limite.")
+    job_id = secrets.token_urlsafe(24)
+    directory = WORK_ROOT / job_id
+    directory.mkdir(mode=0o700)
+    job = Job(
+        id=job_id, owner_id=f"run:{run_id}", directory=directory,
+        callback_token=run_token, external_run_id=run_id,
+    )
+    with _jobs_lock:
+        _jobs[job_id] = job
+    options: dict[str, Any] = {
+        "month_trigger": 8, "month_window": 30, "stop_gap": 80,
+        "max_numbers": min(1000, MAX_NUMERACOES), "query_interval_ms": 700,
+        "download_interval_seconds": 30, "start_aamm": inicio_aamm,
+        "start_number": inicio_nnf, "reference_date": data_referencia,
+    }
+    _executor.submit(run_job, job, seed_bytes, pfx_bytes, senha, options)
+    return job.public()
 
 
 @router.post("", status_code=202)
