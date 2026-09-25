@@ -443,6 +443,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         consecutive_217, gap_start, last_probe = 0, None, number - 1
         max_numbers = options["max_numbers"]
         last_progress_at = 0.0
+        last_consulted_aamm = current_month
+        last_consulted_nnf = start_number
 
         def report_progress(message: str, force: bool = False) -> None:
             nonlocal last_progress_at
@@ -475,6 +477,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 progress=min(65, 2 + int(len(records) / max_numbers * 63)),
             )
             status, reason, real_key = _consult(session, cfg, number, current_month)
+            last_consulted_aamm = current_month
+            last_consulted_nnf = number
             report_progress(f"Consultando {current_month} nNF {number}")
             record = {"AAMM": current_month, "nNF": number, "cStat": status, "xMotivo": reason, "chave_real": real_key}
             records.append(record)
@@ -501,6 +505,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         if len(records) >= max_numbers:
                             break
                         status2, reason2, real2 = _consult(session, cfg, probe, following)
+                        last_consulted_aamm = following
+                        last_consulted_nnf = probe
                         probe_record = {"AAMM": following, "nNF": probe, "cStat": status2, "xMotivo": reason2, "chave_real": real2}
                         records.append(probe_record)
                         if status2 == "613" and real2:
@@ -522,7 +528,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         xml_dir = job.directory / "xml"
         xml_dir.mkdir(exist_ok=True)
         downloaded = 0
-        cursor_blocked = False
         # Downloads são I/O-bound. Executa poucos em paralelo, com Session própria por thread.
         # O callback de arquivo continua serializado na ordem encontrada para preservar o cursor.
         download_results: dict[int, tuple[dict[str, Any], str | None, str]] = {}
@@ -546,7 +551,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     _callback(
                         job, "file", key=item["chave_real"], aamm=item["AAMM"],
                         number=item["nNF"], emitted_at=_xml_emission_date(xml),
-                        advance_cursor=not cursor_blocked,
+                        advance_cursor=True,
                         consulted=len(records), found=len(found), item_index=index,
                         xml_base64=base64.b64encode(full_xml.encode("utf-8")).decode("ascii"),
                     )
@@ -555,9 +560,13 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     downloaded += 1
                 else:
                     item["download_status"] = "NAO_EXTRAIDO"
-                    cursor_blocked = True
-                    if last_download_error:
-                        item["xMotivo"] = f'{item.get("xMotivo", "")} | download: {last_download_error[:300]}'
+                    failure_reason = last_download_error or "SVRS respondeu, mas nenhum XML válido foi extraído"
+                    item["xMotivo"] = f'{item.get("xMotivo", "")} | download: {failure_reason[:300]}'
+                    _callback(
+                        job, "download_failed", key=item["chave_real"], aamm=item["AAMM"],
+                        number=item["nNF"], error=failure_reason,
+                        consulted=len(records), found=len(found), item_index=index,
+                    )
                 _update(job, downloaded=downloaded, progress=68 + int(index / max(1, len(found)) * 27))
         summary = io.StringIO()
         writer = csv.DictWriter(summary, fieldnames=["AAMM", "nNF", "cStat", "xMotivo", "chave_real", "download_status"], delimiter=";")
@@ -570,7 +579,10 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             archive.writestr("resumo.csv", summary.getvalue().encode("utf-8-sig"))
             for xml_path in xml_dir.glob("*.xml"):
                 archive.write(xml_path, arcname=f"XML/{xml_path.name}")
-        _callback(job, "completed", consulted=len(records), found=len(found), downloaded=downloaded)
+        _callback(
+            job, "completed", consulted=len(records), found=len(found), downloaded=downloaded,
+            cursor_aamm=last_consulted_aamm, cursor_nnf=last_consulted_nnf,
+        )
         _update(job, status="completed", message="Processamento concluído", progress=100, consulted=len(records), found=len(found), downloaded=downloaded, zip_path=zip_path)
     except Exception as exc:
         _update(job, status="failed", message="Falha no processamento", error=str(exc), progress=100)
