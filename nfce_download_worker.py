@@ -528,9 +528,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         xml_dir = job.directory / "xml"
         xml_dir.mkdir(exist_ok=True)
         downloaded = 0
-        # Downloads são I/O-bound. Executa poucos em paralelo, com Session própria por thread.
-        # O callback de arquivo continua serializado na ordem encontrada para preservar o cursor.
-        download_results: dict[int, tuple[dict[str, Any], str | None, str]] = {}
+        processed_downloads = 0
+        # Persiste cada resultado assim que o download termina.
         if found:
             with ThreadPoolExecutor(max_workers=DOWNLOAD_CONCURRENCY) as pool:
                 future_map = {
@@ -538,36 +537,41 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     for index, item in enumerate(found, 1)
                 }
                 for future in as_completed(future_map):
-                    index = future_map[future]
+                    original_index = future_map[future]
                     try:
-                        download_results[index] = future.result()
+                        item, xml, last_download_error = future.result()
                     except Exception as exc:
-                        download_results[index] = (found[index - 1], None, str(exc))
+                        item, xml, last_download_error = found[original_index - 1], None, str(exc)
 
-            for index in range(1, len(found) + 1):
-                item, xml, last_download_error = download_results[index]
-                if xml:
-                    full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
-                    _callback(
-                        job, "file", key=item["chave_real"], aamm=item["AAMM"],
-                        number=item["nNF"], emitted_at=_xml_emission_date(xml),
-                        advance_cursor=True,
-                        consulted=len(records), found=len(found), item_index=index,
-                        xml_base64=base64.b64encode(full_xml.encode("utf-8")).decode("ascii"),
-                    )
-                    (xml_dir / f'{item["chave_real"]}-procNFe.xml').write_text(full_xml, encoding="utf-8")
-                    item["download_status"] = "OK"
-                    downloaded += 1
-                else:
-                    item["download_status"] = "NAO_EXTRAIDO"
-                    failure_reason = last_download_error or "SVRS respondeu, mas nenhum XML válido foi extraído"
-                    item["xMotivo"] = f'{item.get("xMotivo", "")} | download: {failure_reason[:300]}'
-                    _callback(
-                        job, "download_failed", key=item["chave_real"], aamm=item["AAMM"],
-                        number=item["nNF"], error=failure_reason,
-                        consulted=len(records), found=len(found), item_index=index,
-                    )
-                _update(job, downloaded=downloaded, progress=68 + int(index / max(1, len(found)) * 27))
+                    processed_downloads += 1
+                    if xml:
+                        full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+                        _callback(
+                            job, "file", key=item["chave_real"], aamm=item["AAMM"],
+                            number=item["nNF"], emitted_at=_xml_emission_date(xml),
+                            advance_cursor=True,
+                            consulted=len(records), found=len(found), item_index=original_index,
+                            xml_base64=base64.b64encode(full_xml.encode("utf-8")).decode("ascii"),
+                        )
+                        (xml_dir / f'{item["chave_real"]}-procNFe.xml').write_text(full_xml, encoding="utf-8")
+                        item["download_status"] = "OK"
+                        downloaded += 1
+                    else:
+                        item["download_status"] = "NAO_EXTRAIDO"
+                        failure_reason = last_download_error or "SVRS respondeu, mas nenhum XML válido foi extraído"
+                        item["xMotivo"] = f'{item.get("xMotivo", "")} | download: {failure_reason[:300]}'
+                        _callback(
+                            job, "download_failed", key=item["chave_real"], aamm=item["AAMM"],
+                            number=item["nNF"], error=failure_reason,
+                            consulted=len(records), found=len(found), item_index=original_index,
+                        )
+
+                    message = f"Baixando XMLs: {processed_downloads}/{len(found)} processados · {downloaded} salvos"
+                    _update(job, downloaded=downloaded, message=message,
+                            progress=68 + int(processed_downloads / max(1, len(found)) * 27))
+                    if processed_downloads == len(found) or processed_downloads % 10 == 0:
+                        _callback(job, "progress", consulted=len(records), found=len(found),
+                                  downloaded=downloaded, message=message)
         summary = io.StringIO()
         writer = csv.DictWriter(summary, fieldnames=["AAMM", "nNF", "cStat", "xMotivo", "chave_real", "download_status"], delimiter=";")
         writer.writeheader()
