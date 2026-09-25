@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,7 +57,10 @@ ICP_BRASIL_CA_SHA256 = "6E0BFF069A26994C15DE2C4888CC54AF84882E5495B7FBF66BE9CCFF
 router = APIRouter(prefix="/nfce/download-jobs", tags=["NFC-e"])
 _jobs_lock = threading.Lock()
 _jobs: dict[str, "Job"] = {}
-_executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("NFCE_WORKERS", "1"))))
+_executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("NFCE_WORKERS", "2"))))
+# Concorrência limitada: acelera I/O sem disparar centenas de requisições contra a SVRS.
+QUERY_CONCURRENCY = max(1, min(8, int(os.getenv("NFCE_QUERY_CONCURRENCY", "4"))))
+DOWNLOAD_CONCURRENCY = max(1, min(4, int(os.getenv("NFCE_DOWNLOAD_CONCURRENCY", "2"))))
 _auth_cache: dict[str, tuple[float, str]] = {}
 
 
@@ -349,6 +352,41 @@ def _consult(session: requests.Session, cfg: dict[str, Any], number: int, aamm: 
     return status, reason, real_key
 
 
+def _new_svrs_session(cert_path: Path, key_path: Path, verify_path: str) -> requests.Session:
+    """Cria uma Session independente para uso seguro por uma thread."""
+    session = requests.Session()
+    session.cert = (str(cert_path), str(key_path))
+    session.verify = verify_path
+    return session
+
+
+def _consult_one(cert_path: Path, key_path: Path, verify_path: str, cfg: dict[str, Any], number: int, aamm: str) -> tuple[int, str, str, str]:
+    session = _new_svrs_session(cert_path, key_path, verify_path)
+    try:
+        status, reason, real_key = _consult(session, cfg, number, aamm)
+        return number, status, reason, real_key
+    finally:
+        session.close()
+
+
+def _download_one(cert_path: Path, key_path: Path, verify_path: str, item: dict[str, Any]) -> tuple[dict[str, Any], str | None, str]:
+    session = _new_svrs_session(cert_path, key_path, verify_path)
+    last_error = ""
+    try:
+        for attempt in range(3):
+            if attempt:
+                time.sleep(min(2.0, 0.5 * (2 ** (attempt - 1))))
+            try:
+                xml = _download(session, item["chave_real"])
+                if xml:
+                    return item, xml, ""
+            except requests.RequestException as exc:
+                last_error = str(exc)
+        return item, None, last_error
+    finally:
+        session.close()
+
+
 def _download(session: requests.Session, key: str) -> str | None:
     get_response = session.get(
         SVRS_DOWNLOAD_GET_URL,
@@ -395,9 +433,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         if cert_cnpj and cert_cnpj != cfg["cnpj"]:
             raise ValueError("O CNPJ do certificado é diferente do emitente do XML.")
 
-        session = requests.Session()
-        session.cert = (str(cert_path), str(key_path))
-        session.verify = svrs_ca_bundle()
+        verify_path = svrs_ca_bundle()
+        session = _new_svrs_session(cert_path, key_path, verify_path)
         records: list[dict[str, Any]] = []
         found: list[dict[str, Any]] = []
         current_month = str(options.get("start_aamm") or cfg["aamm"])
@@ -486,36 +523,42 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         xml_dir.mkdir(exist_ok=True)
         downloaded = 0
         cursor_blocked = False
-        for index, item in enumerate(found, 1):
-            xml = None
-            last_download_error = ""
-            for attempt in range(3):
-                if index > 1 or attempt > 0:
-                    time.sleep(options["download_interval_seconds"])
-                try:
-                    xml = _download(session, item["chave_real"])
-                except requests.RequestException as exc:
-                    last_download_error = str(exc)
+        # Downloads são I/O-bound. Executa poucos em paralelo, com Session própria por thread.
+        # O callback de arquivo continua serializado na ordem encontrada para preservar o cursor.
+        download_results: dict[int, tuple[dict[str, Any], str | None, str]] = {}
+        if found:
+            with ThreadPoolExecutor(max_workers=DOWNLOAD_CONCURRENCY) as pool:
+                future_map = {
+                    pool.submit(_download_one, cert_path, key_path, verify_path, item): index
+                    for index, item in enumerate(found, 1)
+                }
+                for future in as_completed(future_map):
+                    index = future_map[future]
+                    try:
+                        download_results[index] = future.result()
+                    except Exception as exc:
+                        download_results[index] = (found[index - 1], None, str(exc))
+
+            for index in range(1, len(found) + 1):
+                item, xml, last_download_error = download_results[index]
                 if xml:
-                    break
-            if xml:
-                full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
-                _callback(
-                    job, "file", key=item["chave_real"], aamm=item["AAMM"],
-                    number=item["nNF"], emitted_at=_xml_emission_date(xml),
-                    advance_cursor=not cursor_blocked,
-                    consulted=len(records), found=len(found), item_index=index,
-                    xml_base64=base64.b64encode(full_xml.encode("utf-8")).decode("ascii"),
-                )
-                (xml_dir / f'{item["chave_real"]}-procNFe.xml').write_text(full_xml, encoding="utf-8")
-                item["download_status"] = "OK"
-                downloaded += 1
-            else:
-                item["download_status"] = "NAO_EXTRAIDO"
-                cursor_blocked = True
-                if last_download_error:
-                    item["xMotivo"] = f'{item.get("xMotivo", "")} | download: {last_download_error[:300]}'
-            _update(job, downloaded=downloaded, progress=68 + int(index / max(1, len(found)) * 27))
+                    full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+                    _callback(
+                        job, "file", key=item["chave_real"], aamm=item["AAMM"],
+                        number=item["nNF"], emitted_at=_xml_emission_date(xml),
+                        advance_cursor=not cursor_blocked,
+                        consulted=len(records), found=len(found), item_index=index,
+                        xml_base64=base64.b64encode(full_xml.encode("utf-8")).decode("ascii"),
+                    )
+                    (xml_dir / f'{item["chave_real"]}-procNFe.xml').write_text(full_xml, encoding="utf-8")
+                    item["download_status"] = "OK"
+                    downloaded += 1
+                else:
+                    item["download_status"] = "NAO_EXTRAIDO"
+                    cursor_blocked = True
+                    if last_download_error:
+                        item["xMotivo"] = f'{item.get("xMotivo", "")} | download: {last_download_error[:300]}'
+                _update(job, downloaded=downloaded, progress=68 + int(index / max(1, len(found)) * 27))
         summary = io.StringIO()
         writer = csv.DictWriter(summary, fieldnames=["AAMM", "nNF", "cStat", "xMotivo", "chave_real", "download_status"], delimiter=";")
         writer.writeheader()
@@ -677,8 +720,10 @@ async def create_internal_job(
         _jobs[job_id] = job
     options: dict[str, Any] = {
         "month_trigger": 8, "month_window": 30, "stop_gap": 80,
-        "max_numbers": min(1000, MAX_NUMERACOES), "query_interval_ms": 700,
-        "download_interval_seconds": 30, "start_aamm": inicio_aamm,
+        "max_numbers": min(1000, MAX_NUMERACOES),
+        "query_interval_ms": int(os.getenv("NFCE_QUERY_INTERVAL_MS", "100")),
+        "download_interval_seconds": int(os.getenv("NFCE_DOWNLOAD_INTERVAL_SECONDS", "1")),
+        "start_aamm": inicio_aamm,
         "start_number": inicio_nnf, "reference_date": data_referencia,
     }
     _executor.submit(run_job, job, seed_bytes, pfx_bytes, senha, options)
@@ -705,8 +750,8 @@ async def create_job(
     janela_mes: int = Form(30),
     lacuna_parada: int = Form(80),
     max_numeracoes: int = Form(1000),
-    intervalo_consulta_ms: int = Form(700),
-    intervalo_download_segundos: int = Form(30),
+    intervalo_consulta_ms: int = Form(100),
+    intervalo_download_segundos: int = Form(1),
     authorization: str | None = Header(None),
 ) -> dict[str, Any]:
     _cleanup_expired()
@@ -726,7 +771,7 @@ async def create_job(
         raise HTTPException(status_code=400, detail="Parâmetros de lacuna inválidos.")
     if not (1 <= max_numeracoes <= MAX_NUMERACOES):
         raise HTTPException(status_code=400, detail=f"max_numeracoes deve estar entre 1 e {MAX_NUMERACOES}.")
-    if not (200 <= intervalo_consulta_ms <= 10000 and 1 <= intervalo_download_segundos <= 300):
+    if not (0 <= intervalo_consulta_ms <= 10000 and 0 <= intervalo_download_segundos <= 300):
         raise HTTPException(status_code=400, detail="Intervalos fora dos limites permitidos.")
     seed_bytes, pfx_bytes = await xml_semente.read(MAX_UPLOAD_BYTES + 1), await certificado.read(MAX_UPLOAD_BYTES + 1)
     try:
