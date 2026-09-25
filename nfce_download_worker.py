@@ -244,6 +244,18 @@ def _xml_emission_date(xml: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def _anon_headers() -> dict[str, str]:
+    anon_key = os.getenv(
+        "SUPABASE_ANON_KEY",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZxaHRieWllY3N4eHByaWtwbnVzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjYwNjU3OTUsImV4cCI6MjA4MTY0MTc5NX0.aOvciVxs4NjCpHEYZXQziJy-0PQpcy4h-E2CbMZWKJ8",
+    )
+    return {
+        "Content-Type": "application/json",
+        "apikey": anon_key,
+        "Authorization": f"Bearer {anon_key}",
+    }
+
+
 def _callback(job: Job, event: str, **payload: Any) -> None:
     """Entrega somente ao Supabase configurado no servidor; nunca aceita URL do cliente."""
     if not job.callback_token or not job.external_run_id:
@@ -257,12 +269,15 @@ def _callback(job: Job, event: str, **payload: Any) -> None:
         "run_id": job.external_run_id, "token": job.callback_token, **payload,
     }
     last_error = ""
-    for attempt in range(3):
+    timeout = 12 if event == "progress" else REQUEST_TIMEOUT
+    attempts = 1 if event == "progress" else 3
+    for attempt in range(attempts):
         try:
             response = requests.post(
                 f"{supabase_url}/functions/v1/nfce-download",
                 json=request_body,
-                timeout=REQUEST_TIMEOUT,
+                headers=_anon_headers(),
+                timeout=timeout,
             )
             if response.ok:
                 return
@@ -277,8 +292,10 @@ def _callback(job: Job, event: str, **payload: Any) -> None:
                 break
         except requests.RequestException as exc:
             last_error = f"Callback NFC-e indisponível: {exc}"
-        if attempt < 2:
+        if attempt < attempts - 1:
             time.sleep((0.5 * (2 ** attempt)) + (secrets.randbelow(250) / 1000))
+    if event == "progress":
+        return
     raise RuntimeError(last_error or "Callback NFC-e falhou sem resposta.")
 
 
@@ -388,7 +405,30 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         number = start_number + 1
         consecutive_217, gap_start, last_probe = 0, None, number - 1
         max_numbers = options["max_numbers"]
+        last_progress_at = 0.0
 
+        def report_progress(message: str, force: bool = False) -> None:
+            nonlocal last_progress_at
+            now = time.time()
+            if not force and now - last_progress_at < 8:
+                return
+            last_progress_at = now
+            _update(
+                job,
+                message=message,
+                consulted=len(records),
+                found=len(found),
+                current_number=number,
+                current_competence=current_month,
+                progress=min(65, 2 + int(len(records) / max(1, max_numbers) * 63)),
+            )
+            _callback(
+                job, "progress",
+                consulted=len(records), found=len(found), downloaded=job.downloaded,
+                message=message, current_number=number, current_competence=current_month,
+            )
+
+        report_progress(f"Consultando {current_month} a partir da nNF {number}", force=True)
         while len(records) < max_numbers:
             _update(
                 job,
@@ -398,6 +438,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 progress=min(65, 2 + int(len(records) / max_numbers * 63)),
             )
             status, reason, real_key = _consult(session, cfg, number, current_month)
+            report_progress(f"Consultando {current_month} nNF {number}")
             record = {"AAMM": current_month, "nNF": number, "cStat": status, "xMotivo": reason, "chave_real": real_key}
             records.append(record)
             if status == "613" and real_key:
@@ -440,8 +481,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             time.sleep(options["query_interval_ms"] / 1000)
 
         _update(job, consulted=len(records), found=len(found), message=f"Baixando {len(found)} XML(s)", progress=68)
+        _callback(job, "progress", consulted=len(records), found=len(found), message=f"Baixando {len(found)} XML(s)")
         xml_dir = job.directory / "xml"
-        xml_dir.mkdir()
+        xml_dir.mkdir(exist_ok=True)
         downloaded = 0
         cursor_blocked = False
         for index, item in enumerate(found, 1):
@@ -641,6 +683,17 @@ async def create_internal_job(
     }
     _executor.submit(run_job, job, seed_bytes, pfx_bytes, senha, options)
     return job.public()
+
+
+@router.post("/internal/status")
+async def internal_job_status(job_id: str = Form(""), run_id: str = Form("")) -> dict[str, Any]:
+    with _jobs_lock:
+        job = _jobs.get(job_id) if job_id else None
+        if job is None and run_id:
+            job = next((item for item in _jobs.values() if item.external_run_id == run_id), None)
+    if job is None:
+        return {"alive": False}
+    return {"alive": True, **job.public()}
 
 
 @router.post("", status_code=202)
