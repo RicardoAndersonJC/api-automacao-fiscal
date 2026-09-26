@@ -62,9 +62,17 @@ _executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("NFCE_WORKERS", 
 # Concorrência limitada: acelera I/O sem disparar centenas de requisições contra a SVRS.
 QUERY_CONCURRENCY = max(1, min(8, int(os.getenv("NFCE_QUERY_CONCURRENCY", "4"))))
 DOWNLOAD_CONCURRENCY = 1  # SVRS: download serial para respeitar o intervalo entre XMLs
-# Limita recuperação de pendências por execução para não bloquear a varredura por horas.
-MAX_PENDING_PER_RUN = max(1, min(200, int(os.getenv("NFCE_MAX_PENDING_PER_RUN", "120"))))
-PENDING_INTERVAL_SECONDS = max(0, min(60, int(os.getenv("NFCE_PENDING_INTERVAL_SECONDS", "15"))))
+# Lote curto de propósito: cada XML espera 90–120s. 18 × 90s cabe num ciclo
+# sem estourar o tempo do worker nem disparar o limite da SVRS.
+MAX_PENDING_PER_RUN = max(1, min(24, int(os.getenv("NFCE_MAX_PENDING_PER_RUN", "18"))))
+# Piso de 1 min 30 s e teto de 2 min entre downloads. Abaixo disso a SVRS
+# devolve página sem XML e o lote inteiro parece "falha".
+SVRS_INTERVAL_MIN_SECONDS = 90
+SVRS_INTERVAL_MAX_SECONDS = 120
+WORKER_BUSY_DETAIL = (
+    "O worker já está ocupado com outros downloads de NFC-e. "
+    "Aguarde o lote atual; esta empresa volta sozinha para a fila."
+)
 _auth_cache: dict[str, tuple[float, str]] = {}
 
 
@@ -232,6 +240,90 @@ def extract_status(text: str) -> tuple[str, str, str]:
     )
 
 
+def format_wait(seconds: int) -> str:
+    minutes, rest = divmod(max(0, int(seconds)), 60)
+    if minutes and rest:
+        return f"{minutes} min {rest} s"
+    if minutes:
+        return f"{minutes} min"
+    return f"{rest} s"
+
+
+def clamp_download_interval(seconds: int) -> int:
+    """Mantém o espaço entre downloads da SVRS entre 1 min 30 s e 2 min."""
+    try:
+        value = int(seconds)
+    except (TypeError, ValueError):
+        value = SVRS_INTERVAL_MIN_SECONDS
+    return max(SVRS_INTERVAL_MIN_SECONDS, min(SVRS_INTERVAL_MAX_SECONDS, value))
+
+
+_RATE_LIMIT_HINTS = (
+    "muitas consultas",
+    "muitas requisi",
+    "excesso de requis",
+    "too many",
+    "captcha",
+    "recaptcha",
+    "bloqueio",
+    "bloqueado",
+    "tente novamente mais tarde",
+    "limite de acesso",
+    "acesso temporariamente",
+)
+_UNAVAILABLE_HINTS = (
+    "cancelad",
+    "inexistente",
+    "não encontr",
+    "nao encontr",
+    "documento inválido",
+    "documento invalido",
+    "denegad",
+    "chave de acesso inválida",
+    "chave de acesso invalida",
+)
+
+
+def classify_portal_body(status_code: int, text: str) -> str:
+    """Classifica a página da SVRS: rate_limit, unavailable ou no_xml."""
+    if status_code in {429, 503}:
+        return "rate_limit"
+    sample = html.unescape(text or "")[:8000].lower()
+    if any(hint in sample for hint in _RATE_LIMIT_HINTS):
+        return "rate_limit"
+    if any(hint in sample for hint in _UNAVAILABLE_HINTS):
+        return "unavailable"
+    return "no_xml"
+
+
+def download_failure_message(kind: str, status_code: int = 0) -> str:
+    if kind == "rate_limit":
+        return (
+            "Limite da SVRS: muitas consultas em sequência. "
+            "Esta NFC-e continua na fila. O lote pausa 1 min 30 s para não tomar bloqueio."
+        )
+    if kind == "unavailable":
+        return (
+            "NFC-e sem XML no portal da SVRS (cancelada ou indisponível). "
+            "Não é falha de conexão."
+        )
+    if kind == "timeout":
+        return (
+            "A SVRS não respondeu a tempo. "
+            "A chave continua na fila e será tentada de novo com intervalo de 1 min 30 s."
+        )
+    if kind == "http":
+        code = f" HTTP {status_code}" if status_code else ""
+        return (
+            f"A SVRS retornou erro{code}. "
+            "A chave continua na fila para o próximo lote."
+        )
+    return (
+        "O portal da SVRS respondeu, mas não trouxe o XML desta chave. "
+        "Nova tentativa no próximo lote."
+    )
+
+
 def extract_downloaded_xml(text: str) -> str | None:
     cleaned = html.unescape(text.replace(r'\"', '"').replace(r"\/", "/"))
     for opening, closing in (("<nfeProc", "</nfeProc>"), ("<NFe", "</NFe>")):
@@ -389,34 +481,59 @@ def _consult_one(cert_path: Path, key_path: Path, verify_path: str, cfg: dict[st
         session.close()
 
 
-def _download_one(cert_path: Path, key_path: Path, verify_path: str, item: dict[str, Any]) -> tuple[dict[str, Any], str | None, str]:
+def _portal_http_failure(response: requests.Response) -> tuple[str, str] | None:
+    if response.status_code < 400:
+        return None
+    kind = classify_portal_body(response.status_code, response.text)
+    if kind == "rate_limit" or response.status_code in {429, 503}:
+        return "rate_limit", download_failure_message("rate_limit", response.status_code)
+    if kind == "unavailable":
+        return "unavailable", download_failure_message("unavailable")
+    return "http", download_failure_message("http", response.status_code)
+
+
+def _download_one(
+    cert_path: Path, key_path: Path, verify_path: str, item: dict[str, Any]
+) -> tuple[dict[str, Any], str | None, str, str]:
+    """Uma tentativa por chave. Rede/timeout ganha uma segunda chance no mesmo intervalo.
+
+    Limite da SVRS não é retentado na hora: repetir na sequência piora o bloqueio.
+    """
     session = _new_svrs_session(cert_path, key_path, verify_path)
-    last_error = ""
+    interval = clamp_download_interval(int(item.get("_download_interval_seconds", SVRS_INTERVAL_MIN_SECONDS)))
     try:
-        retry_interval = max(0, int(item.get("_download_interval_seconds", 90)))
-        for attempt in range(3):
-            if attempt and retry_interval:
-                time.sleep(retry_interval)
+        for attempt in range(2):
             try:
-                xml = _download(session, item["chave_real"])
+                xml, kind, message = _download(session, item["chave_real"])
                 if xml:
-                    return item, xml, ""
-                last_error = "SVRS respondeu, mas nenhum XML válido foi extraído"
+                    return item, xml, "", "ok"
+                if kind == "rate_limit" or attempt == 1 or kind in {"unavailable", "no_xml"}:
+                    return item, None, message, kind
+            except requests.Timeout:
+                if attempt == 1:
+                    return item, None, download_failure_message("timeout"), "timeout"
             except requests.RequestException as exc:
-                last_error = str(exc)
-        return item, None, last_error
+                if attempt == 1:
+                    text = str(exc)
+                    if "429" in text or "503" in text:
+                        return item, None, download_failure_message("rate_limit"), "rate_limit"
+                    return item, None, download_failure_message("http"), "http"
+            time.sleep(interval)
+        return item, None, download_failure_message("no_xml"), "no_xml"
     finally:
         session.close()
 
 
-def _download(session: requests.Session, key: str) -> str | None:
+def _download(session: requests.Session, key: str) -> tuple[str | None, str, str]:
     get_response = session.get(
         SVRS_DOWNLOAD_GET_URL,
         params={"OrigemSite": "2", "Ambiente": "1", "ChaveAcessoDfe": key},
         headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html,application/xml;q=0.9,*/*;q=0.8"},
         timeout=REQUEST_TIMEOUT,
     )
-    get_response.raise_for_status()
+    blocked = _portal_http_failure(get_response)
+    if blocked:
+        return None, blocked[0], blocked[1]
     hidden: dict[str, str] = {}
     for tag in re.findall(r"<input\b[^>]*>", get_response.text, re.I):
         if not re.search(r'\btype=["\']?hidden["\']?', tag, re.I):
@@ -438,8 +555,15 @@ def _download(session: requests.Session, key: str) -> str | None:
         },
         timeout=REQUEST_TIMEOUT,
     )
-    post_response.raise_for_status()
-    return extract_downloaded_xml(post_response.text)
+    blocked = _portal_http_failure(post_response)
+    if blocked:
+        return None, blocked[0], blocked[1]
+    xml = extract_downloaded_xml(post_response.text)
+    if xml:
+        return xml, "ok", ""
+    page = f"{get_response.text}\n{post_response.text}"
+    kind = classify_portal_body(post_response.status_code, page)
+    return None, kind, download_failure_message(kind, post_response.status_code)
 
 
 def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, options: dict[str, Any]) -> None:
@@ -459,12 +583,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         session = _new_svrs_session(cert_path, key_path, verify_path)
         records: list[dict[str, Any]] = []
         pending_items = list(options.get("pending_items") or [])
-        interval_seconds = max(0, int(options.get("download_interval_seconds", 90)))
-        pending_interval_seconds = max(
-            0,
-            int(options.get("pending_interval_seconds", PENDING_INTERVAL_SECONDS)),
+        interval_seconds = clamp_download_interval(
+            int(options.get("download_interval_seconds", SVRS_INTERVAL_MIN_SECONDS))
         )
         pending_only = bool(options.get("pending_only"))
+        paused_for_svrs = False
         xml_dir = job.directory / "xml"
         xml_dir.mkdir(exist_ok=True)
 
@@ -477,7 +600,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             pending_queue = list(pending_items)[:MAX_PENDING_PER_RUN]
             pending_total = len(pending_queue)
             pending_remaining = max(0, len(pending_items) - pending_total)
-            interval_seconds = pending_interval_seconds
             _update(
                 job,
                 message=(
@@ -515,7 +637,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     "_download_interval_seconds": interval_seconds,
                 }
 
-                item, xml, last_download_error = _download_one(
+                item, xml, last_download_error, failure_kind = _download_one(
                     cert_path, key_path, verify_path, item
                 )
 
@@ -542,11 +664,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     )
                     pending_saved += 1
                 else:
-                    pending_failed += 1
-                    failure_reason = (
-                        last_download_error
-                        or "SVRS respondeu, mas nenhum XML válido foi extraído"
-                    )
+                    failure_reason = last_download_error or download_failure_message(failure_kind)
+                    if failure_kind == "rate_limit":
+                        paused_for_svrs = True
+                    else:
+                        pending_failed += 1
                     _callback(
                         job,
                         "download_failed",
@@ -554,11 +676,22 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         aamm=item["AAMM"],
                         number=item["nNF"],
                         error=failure_reason,
+                        error_kind=failure_kind,
                         consulted=0,
                         found=0,
                         item_index=pending_index,
                         mode="pending_recovery",
                     )
+                    if paused_for_svrs:
+                        _update(
+                            job,
+                            message=(
+                                "Pausa: a SVRS limitou as consultas. "
+                                f"{pending_saved} salvas neste lote. "
+                                "O restante continua na fila daqui a 1 min 30 s."
+                            ),
+                        )
+                        break
 
                 message = (
                     f"Recuperando pendências: {pending_index}/{pending_total} · "
@@ -592,7 +725,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     _update(
                         job,
                         message=(
-                            f"Aguardando {interval_seconds}s · próxima pendência · "
+                            f"Aguardando {format_wait(interval_seconds)} · próxima NFC-e · "
                             f"{pending_index}/{pending_total}"
                         ),
                     )
@@ -609,17 +742,24 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 pending_remaining=pending_remaining,
                 mode="pending_recovery",
                 message=(
-                    f"Pendências do lote: {pending_saved} salvas · "
-                    f"{pending_failed} falhas"
-                    + (
-                        f" · {pending_remaining} ficam para a próxima execução"
-                        if pending_remaining or pending_only
-                        else " · seguindo para varredura"
+                    (
+                        f"Pausa por limite da SVRS · {pending_saved} salvas · "
+                        "o restante segue no próximo lote"
+                    )
+                    if paused_for_svrs
+                    else (
+                        f"Pendências do lote: {pending_saved} salvas · "
+                        f"{pending_failed} sem XML"
+                        + (
+                            f" · {pending_remaining} ficam para a próxima execução"
+                            if pending_remaining or pending_only
+                            else " · seguindo para varredura"
+                        )
                     )
                 ),
             )
 
-            if pending_only:
+            if pending_only or paused_for_svrs:
                 start_aamm = str(options.get("start_aamm") or cfg["aamm"])
                 start_nnf = int(
                     options.get("start_number")
@@ -634,22 +774,34 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     downloaded=pending_saved,
                     pending_saved=pending_saved,
                     pending_failed=pending_failed,
+                    pause_for_svrs=paused_for_svrs,
                     cursor_aamm=start_aamm,
                     cursor_nnf=start_nnf,
                     message=(
-                        f"Lote de pendências: {pending_saved} salvas · "
-                        f"{pending_failed} falhas"
-                        + (
-                            f" · {pending_remaining} restantes na fila"
-                            if pending_remaining
-                            else ""
+                        (
+                            f"Pausa por limite da SVRS · {pending_saved} salvas. "
+                            "As demais NFC-e continuam na fila e seguem em 1 min 30 s."
+                        )
+                        if paused_for_svrs
+                        else (
+                            f"Lote de pendências: {pending_saved} salvas · "
+                            f"{pending_failed} sem XML"
+                            + (
+                                f" · {pending_remaining} restantes na fila"
+                                if pending_remaining
+                                else ""
+                            )
                         )
                     ),
                 )
                 _update(
                     job,
                     status="completed",
-                    message="Pendências do lote processadas",
+                    message=(
+                        "Pausa por limite da SVRS"
+                        if paused_for_svrs
+                        else "Pendências do lote processadas"
+                    ),
                     progress=100,
                     downloaded=pending_saved,
                 )
@@ -759,11 +911,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             for original_index, item in enumerate(found, 1):
                 item["_download_interval_seconds"] = interval_seconds
                 try:
-                    item, xml, last_download_error = _download_one(
+                    item, xml, last_download_error, failure_kind = _download_one(
                         cert_path, key_path, verify_path, item
                     )
                 except Exception as exc:
-                    xml, last_download_error = None, str(exc)
+                    xml, last_download_error, failure_kind = None, str(exc), "http"
 
                 processed_downloads += 1
                 if xml:
@@ -781,19 +933,26 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     item["download_status"] = "OK"
                     downloaded += 1
                 else:
-                    item["download_status"] = "NAO_EXTRAIDO"
-                    failure_reason = (
-                        last_download_error
-                        or "SVRS respondeu, mas nenhum XML válido foi extraído"
-                    )
+                    item["download_status"] = "LIMITE_SVRS" if failure_kind == "rate_limit" else "NAO_EXTRAIDO"
+                    failure_reason = last_download_error or download_failure_message(failure_kind)
                     item["xMotivo"] = (
                         f'{item.get("xMotivo", "")} | download: {failure_reason[:300]}'
                     )
                     _callback(
                         job, "download_failed", key=item["chave_real"], aamm=item["AAMM"],
-                        number=item["nNF"], error=failure_reason,
+                        number=item["nNF"], error=failure_reason, error_kind=failure_kind,
                         consulted=len(records), found=len(found), item_index=original_index,
                     )
+                    if failure_kind == "rate_limit":
+                        paused_for_svrs = True
+                        _update(
+                            job,
+                            message=(
+                                "Pausa: a SVRS limitou as consultas. "
+                                "As NFC-e restantes continuam na fila."
+                            ),
+                        )
+                        break
 
                 message = (
                     f"Baixando XMLs: {processed_downloads}/{len(found)} processados · "
@@ -813,7 +972,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     _update(
                         job,
                         message=(
-                            f"Aguardando {interval_seconds}s para o próximo XML · "
+                            f"Aguardando {format_wait(interval_seconds)} para o próximo XML · "
                             f"{processed_downloads}/{len(found)} processados · "
                             f"{downloaded} salvos"
                         ),
@@ -831,7 +990,12 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             for xml_path in xml_dir.glob("*.xml"):
                 archive.write(xml_path, arcname=f"XML/{xml_path.name}")
         completion_message = "Processamento concluído"
-        if pending_saved or pending_failed:
+        if paused_for_svrs:
+            completion_message = (
+                f"Pausa por limite da SVRS · {downloaded} XML salvos. "
+                "O restante continua na fila e segue em 1 min 30 s."
+            )
+        elif pending_saved or pending_failed:
             completion_message = (
                 f"Concluído · pendências {pending_saved} salvas/"
                 f"{pending_failed} falhas · varredura {len(found)} encontradas/"
@@ -841,6 +1005,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             job, "completed", consulted=len(records), found=len(found), downloaded=downloaded,
             cursor_aamm=last_consulted_aamm, cursor_nnf=last_consulted_nnf,
             pending_saved=pending_saved, pending_failed=pending_failed,
+            pause_for_svrs=paused_for_svrs,
             message=completion_message,
         )
         _update(
@@ -1007,7 +1172,7 @@ async def create_internal_job(
     with _jobs_lock:
         active_jobs = [item for item in _jobs.values() if item.status in {"queued", "running"}]
         if len(active_jobs) >= MAX_QUEUED_JOBS:
-            raise HTTPException(status_code=429, detail="Fila NFC-e temporariamente cheia.")
+            raise HTTPException(status_code=429, detail=WORKER_BUSY_DETAIL)
     seed_bytes = await xml_semente.read(MAX_UPLOAD_BYTES + 1)
     pfx_bytes = await certificado.read(MAX_UPLOAD_BYTES + 1)
     try:
@@ -1032,10 +1197,7 @@ async def create_internal_job(
         "month_trigger": 8, "month_window": 30, "stop_gap": 80,
         "max_numbers": min(1000, MAX_NUMERACOES),
         "query_interval_ms": int(os.getenv("NFCE_QUERY_INTERVAL_MS", "100")),
-        "download_interval_seconds": intervalo_download_segundos,
-        "pending_interval_seconds": min(intervalo_download_segundos, PENDING_INTERVAL_SECONDS)
-        if pending_only or normalized_pending
-        else intervalo_download_segundos,
+        "download_interval_seconds": clamp_download_interval(intervalo_download_segundos),
         "pending_only": pending_only,
         "start_aamm": inicio_aamm,
         "start_number": inicio_nnf, "reference_date": data_referencia,
@@ -1081,7 +1243,7 @@ async def create_job(
         if any(item.owner_id == owner_id for item in active_jobs):
             raise HTTPException(status_code=409, detail="Você já possui uma busca NFC-e em andamento.")
         if len(active_jobs) >= MAX_QUEUED_JOBS:
-            raise HTTPException(status_code=429, detail="Fila NFC-e temporariamente cheia.")
+            raise HTTPException(status_code=429, detail=WORKER_BUSY_DETAIL)
     if not (2 <= gatilho_mes <= janela_mes < lacuna_parada <= 5000):
         raise HTTPException(status_code=400, detail="Parâmetros de lacuna inválidos.")
     if not (1 <= max_numeracoes <= MAX_NUMERACOES):
@@ -1107,7 +1269,7 @@ async def create_job(
         "stop_gap": lacuna_parada,
         "max_numbers": max_numeracoes,
         "query_interval_ms": intervalo_consulta_ms,
-        "download_interval_seconds": intervalo_download_segundos,
+        "download_interval_seconds": clamp_download_interval(intervalo_download_segundos),
     }
     _executor.submit(run_job, job, seed_bytes, pfx_bytes, senha, options)
     return job.public()
