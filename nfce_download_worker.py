@@ -16,6 +16,7 @@ import csv
 import hashlib
 import html
 import io
+import json
 import os
 import re
 import secrets
@@ -373,13 +374,15 @@ def _download_one(cert_path: Path, key_path: Path, verify_path: str, item: dict[
     session = _new_svrs_session(cert_path, key_path, verify_path)
     last_error = ""
     try:
+        retry_interval = max(0, int(item.get("_download_interval_seconds", 90)))
         for attempt in range(3):
-            if attempt:
-                time.sleep(min(2.0, 0.5 * (2 ** (attempt - 1))))
+            if attempt and retry_interval:
+                time.sleep(retry_interval)
             try:
                 xml = _download(session, item["chave_real"])
                 if xml:
                     return item, xml, ""
+                last_error = "SVRS respondeu, mas nenhum XML válido foi extraído"
             except requests.RequestException as exc:
                 last_error = str(exc)
         return item, None, last_error
@@ -436,6 +439,146 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         verify_path = svrs_ca_bundle()
         session = _new_svrs_session(cert_path, key_path, verify_path)
         records: list[dict[str, Any]] = []
+        pending_items = list(options.get("pending_items") or [])
+        interval_seconds = max(0, int(options.get("download_interval_seconds", 90)))
+        xml_dir = job.directory / "xml"
+        xml_dir.mkdir(exist_ok=True)
+
+        # Reprocessa primeiro a fila persistente enviada pela Edge Function.
+        # Pendências não alteram o cursor de descoberta.
+        if pending_items:
+            pending_total = len(pending_items)
+            pending_saved = 0
+            _update(
+                job,
+                message=f"Reprocessando {pending_total} NFC-e(s) pendente(s)",
+                progress=2,
+            )
+            _callback(
+                job,
+                "progress",
+                consulted=0,
+                found=pending_total,
+                downloaded=0,
+                message=f"Reprocessando {pending_total} NFC-e(s) pendente(s)",
+            )
+
+            for pending_index, pending in enumerate(pending_items, 1):
+                item = {
+                    "AAMM": str(pending["aamm"]),
+                    "nNF": int(pending["nnf"]),
+                    "cStat": "PENDENTE",
+                    "xMotivo": "Reprocessamento de pendência",
+                    "chave_real": str(pending["chave"]),
+                    "_download_interval_seconds": interval_seconds,
+                }
+
+                item, xml, last_download_error = _download_one(
+                    cert_path, key_path, verify_path, item
+                )
+
+                if xml:
+                    full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+                    _callback(
+                        job,
+                        "file",
+                        key=item["chave_real"],
+                        aamm=item["AAMM"],
+                        number=item["nNF"],
+                        emitted_at=_xml_emission_date(xml),
+                        advance_cursor=False,
+                        consulted=0,
+                        found=pending_total,
+                        item_index=pending_index,
+                        xml_base64=base64.b64encode(
+                            full_xml.encode("utf-8")
+                        ).decode("ascii"),
+                    )
+                    (xml_dir / f'{item["chave_real"]}-procNFe.xml').write_text(
+                        full_xml, encoding="utf-8"
+                    )
+                    pending_saved += 1
+                else:
+                    failure_reason = (
+                        last_download_error
+                        or "SVRS respondeu, mas nenhum XML válido foi extraído"
+                    )
+                    _callback(
+                        job,
+                        "download_failed",
+                        key=item["chave_real"],
+                        aamm=item["AAMM"],
+                        number=item["nNF"],
+                        error=failure_reason,
+                        consulted=0,
+                        found=pending_total,
+                        item_index=pending_index,
+                    )
+
+                message = (
+                    f"Pendências: {pending_index}/{pending_total} processadas · "
+                    f"{pending_saved} salvas"
+                )
+                _update(
+                    job,
+                    downloaded=pending_saved,
+                    message=message,
+                    progress=min(60, 2 + int(pending_index / max(1, pending_total) * 58)),
+                )
+                _callback(
+                    job,
+                    "progress",
+                    consulted=0,
+                    found=pending_total,
+                    downloaded=pending_saved,
+                    message=message,
+                )
+
+                if pending_index < pending_total and interval_seconds:
+                    _update(
+                        job,
+                        message=(
+                            f"Aguardando {interval_seconds}s para a próxima pendência · "
+                            f"{pending_index}/{pending_total} processadas"
+                        ),
+                    )
+                    time.sleep(interval_seconds)
+
+            # Uma execução que recebeu pendências é dedicada somente à recuperação.
+            # Assim não mistura uma fila potencialmente longa com uma nova varredura.
+            summary = io.StringIO()
+            writer = csv.writer(summary, delimiter=";")
+            writer.writerow(["tipo", "total_pendentes", "salvas"])
+            writer.writerow(["reprocessamento", pending_total, pending_saved])
+            zip_path = job.directory / f'nfce_pendencias_{cfg["cnpj"]}_{int(time.time())}.zip'
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("resumo.csv", summary.getvalue().encode("utf-8-sig"))
+                for xml_path in xml_dir.glob("*.xml"):
+                    archive.write(xml_path, arcname=f"XML/{xml_path.name}")
+
+            # Mantém exatamente o cursor recebido; pendência nunca avança a varredura.
+            _callback(
+                job,
+                "completed",
+                consulted=0,
+                found=pending_total,
+                downloaded=pending_saved,
+                cursor_aamm=str(options["start_aamm"]),
+                cursor_nnf=int(options["start_number"]),
+            )
+            _update(
+                job,
+                status="completed",
+                message=(
+                    f"Reprocessamento concluído: {pending_saved}/{pending_total} salvas"
+                ),
+                progress=100,
+                consulted=0,
+                found=pending_total,
+                downloaded=pending_saved,
+                zip_path=zip_path,
+            )
+            return
         found: list[dict[str, Any]] = []
         current_month = str(options.get("start_aamm") or cfg["aamm"])
         start_number = int(options.get("start_number") if options.get("start_number") is not None else cfg["number"])
@@ -505,12 +648,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         if len(records) >= max_numbers:
                             break
                         status2, reason2, real2 = _consult(session, cfg, probe, following)
-                        last_consulted_aamm = following
-                        last_consulted_nnf = probe
                         probe_record = {"AAMM": following, "nNF": probe, "cStat": status2, "xMotivo": reason2, "chave_real": real2}
                         records.append(probe_record)
                         if status2 == "613" and real2:
                             found.append(probe_record)
+                            last_consulted_aamm, last_consulted_nnf = following, probe
                             current_month, number = following, probe + 1
                             consecutive_217, gap_start, last_probe, switched = 0, None, probe, True
                             break
@@ -529,61 +671,72 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         xml_dir.mkdir(exist_ok=True)
         downloaded = 0
         processed_downloads = 0
-        # Persiste cada resultado assim que o download termina.
+        # Download estritamente serial: nenhuma próxima requisição começa antes
+        # de terminar o intervalo configurado.
         if found:
-            with ThreadPoolExecutor(max_workers=DOWNLOAD_CONCURRENCY) as pool:
-                future_map = {
-                    pool.submit(_download_one, cert_path, key_path, verify_path, item): index
-                    for index, item in enumerate(found, 1)
-                }
-                for future in as_completed(future_map):
-                    original_index = future_map[future]
-                    try:
-                        item, xml, last_download_error = future.result()
-                    except Exception as exc:
-                        item, xml, last_download_error = found[original_index - 1], None, str(exc)
+            for original_index, item in enumerate(found, 1):
+                item["_download_interval_seconds"] = interval_seconds
+                try:
+                    item, xml, last_download_error = _download_one(
+                        cert_path, key_path, verify_path, item
+                    )
+                except Exception as exc:
+                    xml, last_download_error = None, str(exc)
 
-                    processed_downloads += 1
-                    if xml:
-                        full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
-                        _callback(
-                            job, "file", key=item["chave_real"], aamm=item["AAMM"],
-                            number=item["nNF"], emitted_at=_xml_emission_date(xml),
-                            advance_cursor=True,
-                            consulted=len(records), found=len(found), item_index=original_index,
-                            xml_base64=base64.b64encode(full_xml.encode("utf-8")).decode("ascii"),
-                        )
-                        (xml_dir / f'{item["chave_real"]}-procNFe.xml').write_text(full_xml, encoding="utf-8")
-                        item["download_status"] = "OK"
-                        downloaded += 1
-                    else:
-                        item["download_status"] = "NAO_EXTRAIDO"
-                        failure_reason = last_download_error or "SVRS respondeu, mas nenhum XML válido foi extraído"
-                        item["xMotivo"] = f'{item.get("xMotivo", "")} | download: {failure_reason[:300]}'
-                        _callback(
-                            job, "download_failed", key=item["chave_real"], aamm=item["AAMM"],
-                            number=item["nNF"], error=failure_reason,
-                            consulted=len(records), found=len(found), item_index=original_index,
-                        )
+                processed_downloads += 1
+                if xml:
+                    full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+                    _callback(
+                        job, "file", key=item["chave_real"], aamm=item["AAMM"],
+                        number=item["nNF"], emitted_at=_xml_emission_date(xml),
+                        advance_cursor=False,
+                        consulted=len(records), found=len(found), item_index=original_index,
+                        xml_base64=base64.b64encode(full_xml.encode("utf-8")).decode("ascii"),
+                    )
+                    (xml_dir / f'{item["chave_real"]}-procNFe.xml').write_text(
+                        full_xml, encoding="utf-8"
+                    )
+                    item["download_status"] = "OK"
+                    downloaded += 1
+                else:
+                    item["download_status"] = "NAO_EXTRAIDO"
+                    failure_reason = (
+                        last_download_error
+                        or "SVRS respondeu, mas nenhum XML válido foi extraído"
+                    )
+                    item["xMotivo"] = (
+                        f'{item.get("xMotivo", "")} | download: {failure_reason[:300]}'
+                    )
+                    _callback(
+                        job, "download_failed", key=item["chave_real"], aamm=item["AAMM"],
+                        number=item["nNF"], error=failure_reason,
+                        consulted=len(records), found=len(found), item_index=original_index,
+                    )
 
-                    message = f"Baixando XMLs: {processed_downloads}/{len(found)} processados · {downloaded} salvos"
-                    _update(job, downloaded=downloaded, message=message,
-                            progress=68 + int(processed_downloads / max(1, len(found)) * 27))
-                    if processed_downloads == len(found) or processed_downloads % 10 == 0:
-                        _callback(job, "progress", consulted=len(records), found=len(found),
-                                  downloaded=downloaded, message=message)
+                message = (
+                    f"Baixando XMLs: {processed_downloads}/{len(found)} processados · "
+                    f"{downloaded} salvos"
+                )
+                _update(
+                    job, downloaded=downloaded, message=message,
+                    progress=68 + int(processed_downloads / max(1, len(found)) * 27),
+                )
+                if processed_downloads == len(found) or processed_downloads % 10 == 0:
+                    _callback(
+                        job, "progress", consulted=len(records), found=len(found),
+                        downloaded=downloaded, message=message,
+                    )
 
-                    # A SVRS pode bloquear/recusar downloads feitos em sequência.
-                    # Aguarda o intervalo configurado antes de solicitar o próximo XML.
-                    if processed_downloads < len(found):
-                        interval_seconds = max(0, int(options.get("download_interval_seconds", 90)))
-                        if interval_seconds:
-                            wait_message = (
-                                f"Aguardando {interval_seconds}s para o próximo XML · "
-                                f"{processed_downloads}/{len(found)} processados · {downloaded} salvos"
-                            )
-                            _update(job, message=wait_message)
-                            time.sleep(interval_seconds)
+                if processed_downloads < len(found) and interval_seconds:
+                    _update(
+                        job,
+                        message=(
+                            f"Aguardando {interval_seconds}s para o próximo XML · "
+                            f"{processed_downloads}/{len(found)} processados · "
+                            f"{downloaded} salvos"
+                        ),
+                    )
+                    time.sleep(interval_seconds)
         summary = io.StringIO()
         writer = csv.DictWriter(summary, fieldnames=["AAMM", "nNF", "cStat", "xMotivo", "chave_real", "download_status"], delimiter=";")
         writer.writeheader()
@@ -718,6 +871,7 @@ async def create_internal_job(
     inicio_aamm: str = Form(...),
     inicio_nnf: int = Form(...),
     data_referencia: str = Form(...),
+    pendentes_json: str = Form("[]"),
 ) -> dict[str, Any]:
     _cleanup_expired()
     _validate_internal_run(run_id, run_token)
@@ -725,6 +879,29 @@ async def create_internal_job(
         raise HTTPException(status_code=400, detail="Cursor NFC-e inválido.")
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_referencia):
         raise HTTPException(status_code=400, detail="Data de referência inválida.")
+    try:
+        pending_items = json.loads(pendentes_json or "[]")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="pendentes_json inválido.") from exc
+    if not isinstance(pending_items, list):
+        raise HTTPException(status_code=400, detail="pendentes_json deve ser uma lista.")
+    normalized_pending: list[dict[str, Any]] = []
+    seen_pending: set[str] = set()
+    for raw in pending_items:
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="Item pendente inválido.")
+        key = _digits(str(raw.get("chave") or ""))
+        aamm = str(raw.get("aamm") or "")
+        try:
+            nnf = int(raw.get("nnf"))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="nNF pendente inválida.") from exc
+        if len(key) != 44 or not key.isdigit() or not re.fullmatch(r"\d{4}", aamm) or nnf < 0:
+            raise HTTPException(status_code=400, detail="Metadados de pendência inválidos.")
+        if key in seen_pending:
+            continue
+        seen_pending.add(key)
+        normalized_pending.append({"chave": key, "aamm": aamm, "nnf": nnf})
     with _jobs_lock:
         active_jobs = [item for item in _jobs.values() if item.status in {"queued", "running"}]
         if len(active_jobs) >= MAX_QUEUED_JOBS:
@@ -753,6 +930,7 @@ async def create_internal_job(
         "download_interval_seconds": int(os.getenv("NFCE_DOWNLOAD_INTERVAL_SECONDS", "90")),
         "start_aamm": inicio_aamm,
         "start_number": inicio_nnf, "reference_date": data_referencia,
+        "pending_items": normalized_pending,
     }
     _executor.submit(run_job, job, seed_bytes, pfx_bytes, senha, options)
     return job.public()
