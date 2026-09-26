@@ -23,7 +23,11 @@ from lxml import etree
 from signxml import XMLSigner, methods
 from nfse_zip_worker import install_nfse_zip_routes
 from nfe_danfe import install_nfe_danfe_routes
-from nfce_download_worker import router as nfce_download_router
+from nfce_download_worker import (
+    MAX_PENDING_PER_RUN,
+    discovery_scan_complete,
+    router as nfce_download_router,
+)
 
 logger = logging.getLogger("api-automacao-fiscal")
 
@@ -897,8 +901,15 @@ def processar_consulta(
 
 @app.get("/")
 @app.get("/health")
-def health() -> dict[str, bool]:
-    return {"ok": True}
+def health() -> dict[str, bool | str | int]:
+    return {
+        "ok": True,
+        "git": os.environ.get("RENDER_GIT_COMMIT", ""),
+        "nfce_max_pending": MAX_PENDING_PER_RUN,
+        "nfce_scan_gap_only": bool(
+            discovery_scan_complete("gap") and not discovery_scan_complete("cap")
+        ),
+    }
 
 
 def serializar_arquivo_xml(caminho: str) -> dict[str, Any]:
