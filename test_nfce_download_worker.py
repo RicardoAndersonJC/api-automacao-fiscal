@@ -118,10 +118,12 @@ class NfceWorkerTest(unittest.TestCase):
         self.assertAlmostEqual(limiter.wait("soap"), 0.1)
 
     def test_company_stays_open_until_the_gap_closes_the_scan(self):
-        self.assertFalse(discovery_scan_complete("cap"))
-        self.assertFalse(discovery_scan_complete("hold"))
-        self.assertFalse(discovery_scan_complete("ack"))
-        self.assertTrue(discovery_scan_complete("gap"))
+        self.assertFalse(discovery_scan_complete("cap", 3))
+        self.assertTrue(discovery_scan_complete("cap", 0))
+        self.assertFalse(discovery_scan_complete("hold", 0))
+        self.assertFalse(discovery_scan_complete("ack", 0))
+        self.assertTrue(discovery_scan_complete("gap", 0))
+        self.assertTrue(discovery_scan_complete("gap", 4))
 
     def test_timeout_retries_three_times_and_rate_limit_does_not(self):
         self.assertTrue(download_retries_immediately("timeout", 0))

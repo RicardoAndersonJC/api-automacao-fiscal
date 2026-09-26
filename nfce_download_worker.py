@@ -318,9 +318,13 @@ def apply_discovery_step(
     return aamm, number, action, key
 
 
-def discovery_scan_complete(reason: str) -> bool:
-    """A empresa só sai da fila quando a varredura fecha no gap. Teto e pausa continuam."""
-    return reason == "gap"
+def discovery_scan_complete(reason: str, found_count: int = 0) -> bool:
+    """Gap fecha a varredura. Teto sem nenhuma chave também fecha, e a fila segue.
+    Teto com chave encontrada continua a mesma empresa. Pausa e falha de ack continuam abertas.
+    """
+    if reason == "gap":
+        return True
+    return reason == "cap" and found_count == 0
 
 
 def download_retries_immediately(kind: str, attempt: int) -> bool:
@@ -1051,6 +1055,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         start_number = int(options.get("start_number") if options.get("start_number") is not None else cfg["number"])
         number = start_number + 1
         consecutive_217, gap_start, last_probe = 0, None, number - 1
+        probed_this_gap = False
         max_numbers = options["max_numbers"]
         last_progress_at = 0.0
         # Cursor já gravado. Só anda depois de ausência (217) ou de ack HTTP 200 da chave.
@@ -1132,11 +1137,13 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 break
             if action != "absent":
                 consecutive_217, gap_start, last_probe = 0, None, number
+                probed_this_gap = False
                 number += 1
                 continue
             gap_start = number if gap_start is None else gap_start
             consecutive_217 += 1
-            if consecutive_217 >= options["month_trigger"]:
+            if consecutive_217 >= options["month_trigger"] and not probed_this_gap:
+                probed_this_gap = True
                 following = next_aamm(current_month)
                 if aamm_order(following) <= aamm_order(current_aamm()):
                     probe_start = max(gap_start, last_probe + 1)
@@ -1171,6 +1178,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         if action2 == "found":
                             current_month, number = following, probe + 1
                             consecutive_217, gap_start, last_probe, switched = 0, None, probe, True
+                            probed_this_gap = False
                             break
                     last_probe = probe_end
                     if switched:
@@ -1219,7 +1227,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         _callback(
             job, "completed", consulted=len(records), found=len(found), downloaded=downloaded,
             cursor_aamm=safe_aamm, cursor_nnf=safe_nnf, include_cursor=True,
-            scan_complete=discovery_scan_complete(scan_reason),
+            scan_complete=discovery_scan_complete(scan_reason, len(found)),
             pending_saved=pending_saved, pending_failed=pending_failed,
             pause_for_svrs=paused_for_svrs,
             message=completion_message,
