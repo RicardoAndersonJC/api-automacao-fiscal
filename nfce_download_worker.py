@@ -63,7 +63,8 @@ _executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("NFCE_WORKERS", 
 QUERY_CONCURRENCY = max(1, min(8, int(os.getenv("NFCE_QUERY_CONCURRENCY", "4"))))
 DOWNLOAD_CONCURRENCY = 1  # SVRS: download serial para respeitar o intervalo entre XMLs
 # Limita recuperação de pendências por execução para não bloquear a varredura por horas.
-MAX_PENDING_PER_RUN = max(1, min(200, int(os.getenv("NFCE_MAX_PENDING_PER_RUN", "40"))))
+MAX_PENDING_PER_RUN = max(1, min(200, int(os.getenv("NFCE_MAX_PENDING_PER_RUN", "120"))))
+PENDING_INTERVAL_SECONDS = max(0, min(60, int(os.getenv("NFCE_PENDING_INTERVAL_SECONDS", "15"))))
 _auth_cache: dict[str, tuple[float, str]] = {}
 
 
@@ -459,18 +460,24 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         records: list[dict[str, Any]] = []
         pending_items = list(options.get("pending_items") or [])
         interval_seconds = max(0, int(options.get("download_interval_seconds", 90)))
+        pending_interval_seconds = max(
+            0,
+            int(options.get("pending_interval_seconds", PENDING_INTERVAL_SECONDS)),
+        )
+        pending_only = bool(options.get("pending_only"))
         xml_dir = job.directory / "xml"
         xml_dir.mkdir(exist_ok=True)
 
         # Reprocessa primeiro a fila persistente enviada pela Edge Function.
         # Pendências NÃO contam como "encontradas" da varredura e NÃO avançam o cursor.
-        # Lote limitado: após recuperar o lote, a execução segue para descoberta.
+        # Lote limitado: a Edge reinicia a empresa até esgotar a fila.
         pending_saved = 0
         pending_failed = 0
         if pending_items:
             pending_queue = list(pending_items)[:MAX_PENDING_PER_RUN]
             pending_total = len(pending_queue)
             pending_remaining = max(0, len(pending_items) - pending_total)
+            interval_seconds = pending_interval_seconds
             _update(
                 job,
                 message=(
@@ -603,9 +610,50 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 mode="pending_recovery",
                 message=(
                     f"Pendências do lote: {pending_saved} salvas · "
-                    f"{pending_failed} falhas · seguindo para varredura"
+                    f"{pending_failed} falhas"
+                    + (
+                        f" · {pending_remaining} ficam para a próxima execução"
+                        if pending_remaining or pending_only
+                        else " · seguindo para varredura"
+                    )
                 ),
             )
+
+            if pending_only:
+                start_aamm = str(options.get("start_aamm") or cfg["aamm"])
+                start_nnf = int(
+                    options.get("start_number")
+                    if options.get("start_number") is not None
+                    else cfg["number"]
+                )
+                _callback(
+                    job,
+                    "completed",
+                    consulted=0,
+                    found=0,
+                    downloaded=pending_saved,
+                    pending_saved=pending_saved,
+                    pending_failed=pending_failed,
+                    cursor_aamm=start_aamm,
+                    cursor_nnf=start_nnf,
+                    message=(
+                        f"Lote de pendências: {pending_saved} salvas · "
+                        f"{pending_failed} falhas"
+                        + (
+                            f" · {pending_remaining} restantes na fila"
+                            if pending_remaining
+                            else ""
+                        )
+                    ),
+                )
+                _update(
+                    job,
+                    status="completed",
+                    message="Pendências do lote processadas",
+                    progress=100,
+                    downloaded=pending_saved,
+                )
+                return
 
         found: list[dict[str, Any]] = []
         current_month = str(options.get("start_aamm") or cfg["aamm"])
@@ -924,6 +972,8 @@ async def create_internal_job(
     inicio_nnf: int = Form(...),
     data_referencia: str = Form(...),
     pendentes_json: str = Form("[]"),
+    intervalo_download_segundos: int = Form(90),
+    somente_pendentes: str = Form("false"),
 ) -> dict[str, Any]:
     _cleanup_expired()
     _validate_internal_run(run_id, run_token)
@@ -975,11 +1025,18 @@ async def create_internal_job(
     )
     with _jobs_lock:
         _jobs[job_id] = job
+    if not (0 <= intervalo_download_segundos <= 300):
+        raise HTTPException(status_code=400, detail="Intervalo de download inválido.")
+    pending_only = str(somente_pendentes or "").strip().lower() in {"1", "true", "yes", "sim"}
     options: dict[str, Any] = {
         "month_trigger": 8, "month_window": 30, "stop_gap": 80,
         "max_numbers": min(1000, MAX_NUMERACOES),
         "query_interval_ms": int(os.getenv("NFCE_QUERY_INTERVAL_MS", "100")),
-        "download_interval_seconds": int(os.getenv("NFCE_DOWNLOAD_INTERVAL_SECONDS", "90")),
+        "download_interval_seconds": intervalo_download_segundos,
+        "pending_interval_seconds": min(intervalo_download_segundos, PENDING_INTERVAL_SECONDS)
+        if pending_only or normalized_pending
+        else intervalo_download_segundos,
+        "pending_only": pending_only,
         "start_aamm": inicio_aamm,
         "start_number": inicio_nnf, "reference_date": data_referencia,
         "pending_items": normalized_pending,
