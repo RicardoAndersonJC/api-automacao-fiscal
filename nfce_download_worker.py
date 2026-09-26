@@ -62,6 +62,8 @@ _executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("NFCE_WORKERS", 
 # Concorrência limitada: acelera I/O sem disparar centenas de requisições contra a SVRS.
 QUERY_CONCURRENCY = max(1, min(8, int(os.getenv("NFCE_QUERY_CONCURRENCY", "4"))))
 DOWNLOAD_CONCURRENCY = 1  # SVRS: download serial para respeitar o intervalo entre XMLs
+# Limita recuperação de pendências por execução para não bloquear a varredura por horas.
+MAX_PENDING_PER_RUN = max(1, min(200, int(os.getenv("NFCE_MAX_PENDING_PER_RUN", "40"))))
 _auth_cache: dict[str, tuple[float, str]] = {}
 
 
@@ -306,12 +308,28 @@ def _callback(job: Job, event: str, **payload: Any) -> None:
 def _certificate_files(pfx_bytes: bytes, password: str, directory: Path) -> tuple[Path, Path, str]:
     if len(pfx_bytes) > MAX_UPLOAD_BYTES:
         raise ValueError("Certificado excede o limite permitido.")
+    if not pfx_bytes or len(pfx_bytes) < 64:
+        raise ValueError("Certificado PFX vazio ou incompleto.")
+    if pfx_bytes[:1] != b"\x30" and not pfx_bytes.startswith(b"\x80"):
+        head = pfx_bytes[:32].lstrip()
+        if head.startswith((b"-----BEGIN", b"MII", b"{", b"<")):
+            raise ValueError(
+                "Certificado não está em formato PFX/P12 binário "
+                "(recebido texto/PEM/base64)."
+            )
     try:
         key, cert, chain = pkcs12.load_key_and_certificates(
             pfx_bytes, password.encode("utf-8") if password else None
         )
+    except ValueError as exc:
+        message = str(exc).lower()
+        if "password" in message or "mac" in message or "invalid" in message:
+            raise ValueError(
+                "Senha do certificado inválida ou PFX corrompido."
+            ) from exc
+        raise ValueError(f"Certificado ou senha inválidos: {exc}") from exc
     except Exception as exc:
-        raise ValueError("Certificado ou senha inválidos.") from exc
+        raise ValueError(f"Certificado ou senha inválidos: {exc}") from exc
     if key is None or cert is None:
         raise ValueError("O PFX não contém certificado e chave privada.")
     cert_path, key_path = directory / "client-cert.pem", directory / "client-key.pem"
@@ -445,25 +463,42 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         xml_dir.mkdir(exist_ok=True)
 
         # Reprocessa primeiro a fila persistente enviada pela Edge Function.
-        # Pendências não alteram o cursor de descoberta.
+        # Pendências NÃO contam como "encontradas" da varredura e NÃO avançam o cursor.
+        # Lote limitado: após recuperar o lote, a execução segue para descoberta.
+        pending_saved = 0
+        pending_failed = 0
         if pending_items:
-            pending_total = len(pending_items)
-            pending_saved = 0
+            pending_queue = list(pending_items)[:MAX_PENDING_PER_RUN]
+            pending_total = len(pending_queue)
+            pending_remaining = max(0, len(pending_items) - pending_total)
             _update(
                 job,
-                message=f"Reprocessando {pending_total} NFC-e(s) pendente(s)",
+                message=(
+                    f"Recuperando {pending_total} pendência(s)"
+                    + (
+                        f" ({pending_remaining} ficam para a próxima execução)"
+                        if pending_remaining
+                        else ""
+                    )
+                ),
                 progress=2,
             )
             _callback(
                 job,
                 "progress",
                 consulted=0,
-                found=pending_total,
+                found=0,
                 downloaded=0,
-                message=f"Reprocessando {pending_total} NFC-e(s) pendente(s)",
+                pending_total=pending_total,
+                pending_remaining=pending_remaining,
+                mode="pending_recovery",
+                message=(
+                    f"Recuperando pendências: 0/{pending_total} · "
+                    f"{pending_remaining} restantes na fila"
+                ),
             )
 
-            for pending_index, pending in enumerate(pending_items, 1):
+            for pending_index, pending in enumerate(pending_queue, 1):
                 item = {
                     "AAMM": str(pending["aamm"]),
                     "nNF": int(pending["nnf"]),
@@ -488,8 +523,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         emitted_at=_xml_emission_date(xml),
                         advance_cursor=False,
                         consulted=0,
-                        found=pending_total,
+                        found=0,
                         item_index=pending_index,
+                        mode="pending_recovery",
                         xml_base64=base64.b64encode(
                             full_xml.encode("utf-8")
                         ).decode("ascii"),
@@ -499,6 +535,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     )
                     pending_saved += 1
                 else:
+                    pending_failed += 1
                     failure_reason = (
                         last_download_error
                         or "SVRS respondeu, mas nenhum XML válido foi extraído"
@@ -511,13 +548,19 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         number=item["nNF"],
                         error=failure_reason,
                         consulted=0,
-                        found=pending_total,
+                        found=0,
                         item_index=pending_index,
+                        mode="pending_recovery",
                     )
 
                 message = (
-                    f"Pendências: {pending_index}/{pending_total} processadas · "
-                    f"{pending_saved} salvas"
+                    f"Recuperando pendências: {pending_index}/{pending_total} · "
+                    f"{pending_saved} salvas · {pending_failed} falhas"
+                    + (
+                        f" · {pending_remaining} na fila"
+                        if pending_remaining
+                        else ""
+                    )
                 )
                 _update(
                     job,
@@ -529,8 +572,12 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     job,
                     "progress",
                     consulted=0,
-                    found=pending_total,
+                    found=0,
                     downloaded=pending_saved,
+                    pending_total=pending_total,
+                    pending_failed=pending_failed,
+                    pending_remaining=pending_remaining,
+                    mode="pending_recovery",
                     message=message,
                 )
 
@@ -538,47 +585,28 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     _update(
                         job,
                         message=(
-                            f"Aguardando {interval_seconds}s para a próxima pendência · "
-                            f"{pending_index}/{pending_total} processadas"
+                            f"Aguardando {interval_seconds}s · próxima pendência · "
+                            f"{pending_index}/{pending_total}"
                         ),
                     )
                     time.sleep(interval_seconds)
 
-            # Uma execução que recebeu pendências é dedicada somente à recuperação.
-            # Assim não mistura uma fila potencialmente longa com uma nova varredura.
-            summary = io.StringIO()
-            writer = csv.writer(summary, delimiter=";")
-            writer.writerow(["tipo", "total_pendentes", "salvas"])
-            writer.writerow(["reprocessamento", pending_total, pending_saved])
-            zip_path = job.directory / f'nfce_pendencias_{cfg["cnpj"]}_{int(time.time())}.zip'
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-                archive.writestr("resumo.csv", summary.getvalue().encode("utf-8-sig"))
-                for xml_path in xml_dir.glob("*.xml"):
-                    archive.write(xml_path, arcname=f"XML/{xml_path.name}")
-
-            # Mantém exatamente o cursor recebido; pendência nunca avança a varredura.
             _callback(
                 job,
-                "completed",
+                "progress",
                 consulted=0,
-                found=pending_total,
+                found=0,
                 downloaded=pending_saved,
-                cursor_aamm=str(options["start_aamm"]),
-                cursor_nnf=int(options["start_number"]),
-            )
-            _update(
-                job,
-                status="completed",
+                pending_total=pending_total,
+                pending_failed=pending_failed,
+                pending_remaining=pending_remaining,
+                mode="pending_recovery",
                 message=(
-                    f"Reprocessamento concluído: {pending_saved}/{pending_total} salvas"
+                    f"Pendências do lote: {pending_saved} salvas · "
+                    f"{pending_failed} falhas · seguindo para varredura"
                 ),
-                progress=100,
-                consulted=0,
-                found=pending_total,
-                downloaded=pending_saved,
-                zip_path=zip_path,
             )
-            return
+
         found: list[dict[str, Any]] = []
         current_month = str(options.get("start_aamm") or cfg["aamm"])
         start_number = int(options.get("start_number") if options.get("start_number") is not None else cfg["number"])
@@ -608,6 +636,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 job, "progress",
                 consulted=len(records), found=len(found), downloaded=job.downloaded,
                 message=message, current_number=number, current_competence=current_month,
+                mode="discovery",
             )
 
         report_progress(f"Consultando {current_month} a partir da nNF {number}", force=True)
@@ -666,10 +695,15 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             time.sleep(options["query_interval_ms"] / 1000)
 
         _update(job, consulted=len(records), found=len(found), message=f"Baixando {len(found)} XML(s)", progress=68)
-        _callback(job, "progress", consulted=len(records), found=len(found), message=f"Baixando {len(found)} XML(s)")
+        _callback(
+            job, "progress",
+            consulted=len(records), found=len(found), downloaded=pending_saved,
+            message=f"Baixando {len(found)} XML(s) da varredura",
+            mode="download",
+        )
         xml_dir = job.directory / "xml"
         xml_dir.mkdir(exist_ok=True)
-        downloaded = 0
+        downloaded = pending_saved
         processed_downloads = 0
         # Download estritamente serial: nenhuma próxima requisição começa antes
         # de terminar o intervalo configurado.
@@ -748,11 +782,29 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             archive.writestr("resumo.csv", summary.getvalue().encode("utf-8-sig"))
             for xml_path in xml_dir.glob("*.xml"):
                 archive.write(xml_path, arcname=f"XML/{xml_path.name}")
+        completion_message = "Processamento concluído"
+        if pending_saved or pending_failed:
+            completion_message = (
+                f"Concluído · pendências {pending_saved} salvas/"
+                f"{pending_failed} falhas · varredura {len(found)} encontradas/"
+                f"{max(0, downloaded - pending_saved)} salvas"
+            )
         _callback(
             job, "completed", consulted=len(records), found=len(found), downloaded=downloaded,
             cursor_aamm=last_consulted_aamm, cursor_nnf=last_consulted_nnf,
+            pending_saved=pending_saved, pending_failed=pending_failed,
+            message=completion_message,
         )
-        _update(job, status="completed", message="Processamento concluído", progress=100, consulted=len(records), found=len(found), downloaded=downloaded, zip_path=zip_path)
+        _update(
+            job,
+            status="completed",
+            message=completion_message,
+            progress=100,
+            consulted=len(records),
+            found=len(found),
+            downloaded=downloaded,
+            zip_path=zip_path,
+        )
     except Exception as exc:
         _update(job, status="failed", message="Falha no processamento", error=str(exc), progress=100)
         try:

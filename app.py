@@ -2,10 +2,12 @@ import base64
 import gzip
 import io
 import json
+import logging
 import os
 import re
 import tempfile
 import time
+import warnings
 import zipfile
 from datetime import date, datetime
 from typing import Any
@@ -22,6 +24,8 @@ from signxml import XMLSigner, methods
 from nfse_zip_worker import install_nfse_zip_routes
 from nfe_danfe import install_nfe_danfe_routes
 from nfce_download_worker import router as nfce_download_router
+
+logger = logging.getLogger("api-automacao-fiscal")
 
 NFE_NS = "http://www.portalfiscal.inf.br/nfe"
 SOAP12_NS = "http://www.w3.org/2003/05/soap-envelope"
@@ -352,17 +356,53 @@ def resumir_documento(xml_doc: str, schema: str) -> dict[str, Any]:
     }
 
 
+def _load_pkcs12(pfx_data: bytes, senha: str):
+    """Carrega PFX/P12 com mensagem clara; BER fallback do cryptography não vira 500."""
+    if not pfx_data:
+        raise ValueError("Certificado PFX vazio.")
+    if len(pfx_data) < 64:
+        raise ValueError("Certificado PFX incompleto ou corrompido.")
+    # PKCS#12 costuma começar com SEQUENCE ASN.1 (0x30). Base64/texto indica envio errado.
+    if pfx_data[:1] != b"\x30" and not pfx_data.startswith(b"\x80"):
+        head = pfx_data[:32].lstrip()
+        if head.startswith((b"-----BEGIN", b"MII", b"{", b"<")):
+            raise ValueError(
+                "Certificado não está em formato PFX/P12 binário "
+                "(recebido texto/PEM/base64)."
+            )
+    password = senha.encode("utf-8") if senha else None
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            private_key, certificate, additional = pkcs12.load_key_and_certificates(
+                pfx_data,
+                password,
+            )
+            for item in caught:
+                logger.warning(
+                    "PKCS#12 warning durante carga do certificado: %s",
+                    item.message,
+                )
+    except ValueError as exc:
+        message = str(exc).lower()
+        if "password" in message or "mac" in message or "invalid" in message:
+            raise ValueError(
+                "Senha do certificado inválida ou PFX corrompido."
+            ) from exc
+        raise ValueError(f"Falha ao ler o certificado PFX: {exc}") from exc
+    except Exception as exc:
+        raise ValueError(f"Falha ao ler o certificado PFX: {exc}") from exc
+
+    if private_key is None or certificate is None:
+        raise ValueError("Não foi possível extrair certificado e chave do PFX.")
+    return private_key, certificate, additional
+
+
 def extrair_certificado(caminho_pfx: str, senha: str) -> tuple[str, str, bytes, bytes]:
     with open(caminho_pfx, "rb") as f:
         pfx_data = f.read()
 
-    private_key, certificate, additional_certificates = pkcs12.load_key_and_certificates(
-        pfx_data,
-        senha.encode("utf-8"),
-    )
-
-    if private_key is None or certificate is None:
-        raise ValueError("Não foi possível extrair certificado e chave do PFX.")
+    private_key, certificate, additional_certificates = _load_pkcs12(pfx_data, senha)
 
     cert_pem = certificate.public_bytes(serialization.Encoding.PEM)
     if additional_certificates:
@@ -855,6 +895,7 @@ def processar_consulta(
                 pass
 
 
+@app.get("/")
 @app.get("/health")
 def health() -> dict[str, bool]:
     return {"ok": True}
@@ -901,9 +942,12 @@ async def baixar_nfe(
 ):
     cert_path = None
     try:
+        pfx_bytes = await certificado.read()
+        if not pfx_bytes:
+            raise ValueError("Certificado PFX não enviado.")
         with tempfile.NamedTemporaryFile(prefix="cert_nfe_", suffix=".pfx", delete=False) as f:
             cert_path = f.name
-            f.write(await certificado.read())
+            f.write(pfx_bytes)
 
         resultado = processar_consulta(
             ambiente=ambiente,
@@ -925,9 +969,17 @@ async def baixar_nfe(
         resultado["arquivos"] = [serializar_arquivo_xml(path) for path in resultado.get("arquivos", [])]
         return JSONResponse(resultado)
     except ValueError as exc:
+        logger.warning("baixar-nfe-json rejeitado: %s", exc)
         return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
     except Exception as exc:
-        return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+        logger.exception("baixar-nfe-json falhou")
+        return JSONResponse(
+            {
+                "success": False,
+                "error": f"Falha interna ao consultar NFe: {exc}",
+            },
+            status_code=500,
+        )
     finally:
         try:
             if cert_path and os.path.exists(cert_path):
