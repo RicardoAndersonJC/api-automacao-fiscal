@@ -60,7 +60,7 @@ _jobs: dict[str, "Job"] = {}
 _executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("NFCE_WORKERS", "2"))))
 # Concorrência limitada: acelera I/O sem disparar centenas de requisições contra a SVRS.
 QUERY_CONCURRENCY = max(1, min(8, int(os.getenv("NFCE_QUERY_CONCURRENCY", "4"))))
-DOWNLOAD_CONCURRENCY = max(1, min(4, int(os.getenv("NFCE_DOWNLOAD_CONCURRENCY", "2"))))
+DOWNLOAD_CONCURRENCY = 1  # SVRS: download serial para respeitar o intervalo entre XMLs
 _auth_cache: dict[str, tuple[float, str]] = {}
 
 
@@ -572,6 +572,18 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     if processed_downloads == len(found) or processed_downloads % 10 == 0:
                         _callback(job, "progress", consulted=len(records), found=len(found),
                                   downloaded=downloaded, message=message)
+
+                    # A SVRS pode bloquear/recusar downloads feitos em sequência.
+                    # Aguarda o intervalo configurado antes de solicitar o próximo XML.
+                    if processed_downloads < len(found):
+                        interval_seconds = max(0, int(options.get("download_interval_seconds", 90)))
+                        if interval_seconds:
+                            wait_message = (
+                                f"Aguardando {interval_seconds}s para o próximo XML · "
+                                f"{processed_downloads}/{len(found)} processados · {downloaded} salvos"
+                            )
+                            _update(job, message=wait_message)
+                            time.sleep(interval_seconds)
         summary = io.StringIO()
         writer = csv.DictWriter(summary, fieldnames=["AAMM", "nNF", "cStat", "xMotivo", "chave_real", "download_status"], delimiter=";")
         writer.writeheader()
@@ -738,7 +750,7 @@ async def create_internal_job(
         "month_trigger": 8, "month_window": 30, "stop_gap": 80,
         "max_numbers": min(1000, MAX_NUMERACOES),
         "query_interval_ms": int(os.getenv("NFCE_QUERY_INTERVAL_MS", "100")),
-        "download_interval_seconds": int(os.getenv("NFCE_DOWNLOAD_INTERVAL_SECONDS", "1")),
+        "download_interval_seconds": int(os.getenv("NFCE_DOWNLOAD_INTERVAL_SECONDS", "90")),
         "start_aamm": inicio_aamm,
         "start_number": inicio_nnf, "reference_date": data_referencia,
     }
@@ -767,7 +779,7 @@ async def create_job(
     lacuna_parada: int = Form(80),
     max_numeracoes: int = Form(1000),
     intervalo_consulta_ms: int = Form(100),
-    intervalo_download_segundos: int = Form(1),
+    intervalo_download_segundos: int = Form(90),
     authorization: str | None = Header(None),
 ) -> dict[str, Any]:
     _cleanup_expired()
