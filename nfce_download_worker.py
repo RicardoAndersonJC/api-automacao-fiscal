@@ -700,6 +700,7 @@ def _download_one(
     limiter: SvrsRateLimiter | None = None,
     run_id: str = "",
     empresa_id: str = "",
+    notify=None,
 ) -> tuple[dict[str, Any], str | None, str, str]:
     """Até 3 tentativas em timeout/rede. Limite da SVRS não repete na hora.
 
@@ -712,7 +713,9 @@ def _download_one(
         kind = "no_xml"
         message = download_failure_message("no_xml")
         for attempt in range(3):
-            active.wait("download")
+            waited = active.wait("download")
+            if notify and (attempt > 0 or waited > 0):
+                notify(attempt)
             started = time.perf_counter()
             http_status: int | None = None
             try:
@@ -870,10 +873,28 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     "_download_interval_seconds": interval_seconds,
                 }
 
+                def notify_attempt(attempt: int) -> None:
+                    _callback(
+                        job,
+                        "progress",
+                        consulted=0,
+                        found=0,
+                        downloaded=pending_saved,
+                        pending_total=pending_total,
+                        pending_failed=pending_failed,
+                        pending_remaining=pending_remaining,
+                        mode="pending_recovery",
+                        message=(
+                            f"Aguardando {format_wait(interval_seconds)} · pendência "
+                            f"{pending_index}/{pending_total} · tentativa {attempt + 1}"
+                        ),
+                    )
+
                 item, xml, last_download_error, failure_kind = _download_one(
                     cert_path, key_path, verify_path, item, limiter,
                     run_id=job.external_run_id or "",
                     empresa_id=job.empresa_id,
+                    notify=notify_attempt,
                 )
 
                 if xml:
@@ -957,12 +978,22 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 )
 
                 if pending_index < pending_total and interval_seconds:
-                    _update(
+                    wait_message = (
+                        f"Aguardando {format_wait(interval_seconds)} · pendência "
+                        f"{pending_index}/{pending_total}"
+                    )
+                    _update(job, message=wait_message)
+                    _callback(
                         job,
-                        message=(
-                            f"Aguardando {format_wait(interval_seconds)} · próxima NFC-e · "
-                            f"{pending_index}/{pending_total}"
-                        ),
+                        "progress",
+                        consulted=0,
+                        found=0,
+                        downloaded=pending_saved,
+                        pending_total=pending_total,
+                        pending_failed=pending_failed,
+                        pending_remaining=pending_remaining,
+                        mode="pending_recovery",
+                        message=wait_message,
                     )
 
             _callback(
