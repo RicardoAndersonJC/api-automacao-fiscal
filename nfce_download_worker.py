@@ -17,6 +17,7 @@ import hashlib
 import html
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -27,7 +28,7 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -58,13 +59,11 @@ ICP_BRASIL_CA_SHA256 = "6E0BFF069A26994C15DE2C4888CC54AF84882E5495B7FBF66BE9CCFF
 router = APIRouter(prefix="/nfce/download-jobs", tags=["NFC-e"])
 _jobs_lock = threading.Lock()
 _jobs: dict[str, "Job"] = {}
-_executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("NFCE_WORKERS", "2"))))
-# Concorrência limitada: acelera I/O sem disparar centenas de requisições contra a SVRS.
-QUERY_CONCURRENCY = max(1, min(8, int(os.getenv("NFCE_QUERY_CONCURRENCY", "4"))))
-DOWNLOAD_CONCURRENCY = 1  # SVRS: download serial para respeitar o intervalo entre XMLs
-# Lote curto de propósito: cada XML espera 90–120s. 18 × 90s cabe num ciclo
-# sem estourar o tempo do worker nem disparar o limite da SVRS.
-MAX_PENDING_PER_RUN = max(1, min(24, int(os.getenv("NFCE_MAX_PENDING_PER_RUN", "18"))))
+# Um job por processo: dois downloads simultâneos somariam taxa no portal.
+_executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("NFCE_WORKERS", "1"))))
+DOWNLOAD_CONCURRENCY = 1
+# floor(1200s / p50 183s) = 6. Cabe na janela de 20 min sem heartbeat.
+MAX_PENDING_PER_RUN = max(1, min(6, int(os.getenv("NFCE_MAX_PENDING_PER_RUN", "6"))))
 # Piso de 1 min 30 s e teto de 2 min entre downloads. Abaixo disso a SVRS
 # devolve página sem XML e o lote inteiro parece "falha".
 SVRS_INTERVAL_MIN_SECONDS = 90
@@ -95,6 +94,7 @@ class Job:
     zip_path: Path | None = None
     callback_token: str | None = None
     external_run_id: str | None = None
+    empresa_id: str = ""
 
     def public(self) -> dict[str, Any]:
         return {
@@ -258,6 +258,130 @@ def clamp_download_interval(seconds: int) -> int:
     return max(SVRS_INTERVAL_MIN_SECONDS, min(SVRS_INTERVAL_MAX_SECONDS, value))
 
 
+class SvrsRateLimiter:
+    """Relógio único. SOAP e o par de download não dividem o mesmo espaçamento.
+
+    O teste injeta clock e sleep. Produção usa time.monotonic e time.sleep.
+    """
+
+    def __init__(
+        self,
+        soap_seconds: float = 0.1,
+        download_seconds: float = 90,
+        clock: Any = None,
+        sleep: Any = None,
+    ) -> None:
+        self.soap_seconds = max(0.0, float(soap_seconds))
+        self.download_seconds = max(0.0, float(download_seconds))
+        self._clock = clock or time.monotonic
+        self._sleep = sleep or time.sleep
+        self._next = {"soap": 0.0, "download": 0.0}
+
+    def wait(self, channel: str) -> float:
+        spacing = self.soap_seconds if channel == "soap" else self.download_seconds
+        now = float(self._clock())
+        delay = self._next.get(channel, 0.0) - now
+        if delay > 0:
+            self._sleep(delay)
+            now = float(self._clock())
+        else:
+            delay = 0.0
+        self._next[channel] = now + spacing
+        return delay
+
+
+def discovery_action(status: str, artificial: str, real_key: str) -> tuple[str, str]:
+    """absent avança o cursor. found só avança depois do ack. hold não passa do número."""
+    if status == "217":
+        return "absent", ""
+    if status == "100" and len(artificial) == 44:
+        return "found", artificial
+    if status == "613" and len(real_key) == 44 and real_key != artificial:
+        return "found", real_key
+    return "hold", ""
+
+
+def apply_discovery_step(
+    safe_aamm: str,
+    safe_nnf: int,
+    aamm: str,
+    number: int,
+    status: str,
+    artificial: str,
+    real_key: str,
+    acked: bool,
+) -> tuple[str, int, str, str]:
+    """Cursor novo, ação e chave. Sem ack, o cursor fica no valor anterior."""
+    action, key = discovery_action(status, artificial, real_key)
+    if action == "hold" or not acked:
+        return safe_aamm, safe_nnf, action, key
+    return aamm, number, action, key
+
+
+def discovery_scan_complete(reason: str) -> bool:
+    """A empresa só sai da fila quando a varredura fecha no gap. Teto e pausa continuam."""
+    return reason == "gap"
+
+
+def download_retries_immediately(kind: str, attempt: int) -> bool:
+    """attempt começa em 0. Limite da SVRS e XML ausente não repetem na hora."""
+    limit = 3 if kind in {"timeout", "http"} else 1
+    return attempt + 1 < limit
+
+
+def callback_backoff_seconds(attempt: int, jitter_seconds: float = 0) -> float:
+    return (0.5 * (2 ** attempt)) + max(0.0, jitter_seconds)
+
+
+_LOG_SECRET = re.compile(
+    r"senha|password|pfx|private|jwt|service_role|authorization|token|secret|apikey",
+    re.I,
+)
+
+
+def log_attempt(
+    *,
+    run_id: str = "",
+    empresa_id: str = "",
+    aamm: str = "",
+    nnf: int | None = None,
+    chave: str = "",
+    etapa: str,
+    tentativa: int,
+    duracao_ms: int,
+    http: int | None = None,
+    categoria: str,
+    retry: bool = False,
+    proxima_tentativa: str = "",
+) -> dict[str, Any]:
+    """Registro da tentativa. Senha, PFX, JWT e token não entram."""
+    raw = {
+        "run_id": run_id,
+        "empresa_id": empresa_id,
+        "aamm": aamm,
+        "nnf": nnf,
+        "chave": chave,
+        "etapa": etapa,
+        "tentativa": tentativa,
+        "duracao_ms": duracao_ms,
+        "http": http,
+        "categoria": categoria,
+        "retry": retry,
+        "proxima_tentativa": proxima_tentativa,
+    }
+    record: dict[str, Any] = {}
+    for key, value in raw.items():
+        if _LOG_SECRET.search(key):
+            continue
+        text = "" if value is None else str(value)
+        if "BEGIN " in text or text.startswith("eyJ") or "Bearer " in text:
+            record[key] = ""
+            continue
+        record[key] = value
+    logging.getLogger("nfce_download").info(json.dumps(record, ensure_ascii=False))
+    return record
+
+
 _RATE_LIMIT_HINTS = (
     "muitas consultas",
     "muitas requisi",
@@ -370,6 +494,9 @@ def _callback(job: Job, event: str, **payload: Any) -> None:
     last_error = ""
     timeout = 12 if event == "progress" else REQUEST_TIMEOUT
     attempts = 1 if event == "progress" else 3
+    started = time.perf_counter()
+    http_status: int | None = None
+    categoria = "CALLBACK_ERROR"
     for attempt in range(attempts):
         try:
             response = requests.post(
@@ -378,7 +505,22 @@ def _callback(job: Job, event: str, **payload: Any) -> None:
                 headers=_anon_headers(),
                 timeout=timeout,
             )
+            http_status = response.status_code
             if response.ok:
+                categoria = "SUCCESS"
+                log_attempt(
+                    run_id=job.external_run_id or "",
+                    empresa_id=job.empresa_id,
+                    aamm=str(payload.get("aamm") or ""),
+                    nnf=payload.get("number") if isinstance(payload.get("number"), int) else None,
+                    chave=str(payload.get("key") or ""),
+                    etapa="callback",
+                    tentativa=attempt + 1,
+                    duracao_ms=int((time.perf_counter() - started) * 1000),
+                    http=http_status,
+                    categoria=categoria,
+                    retry=attempt > 0,
+                )
                 return
             try:
                 body = response.json()
@@ -392,7 +534,20 @@ def _callback(job: Job, event: str, **payload: Any) -> None:
         except requests.RequestException as exc:
             last_error = f"Callback NFC-e indisponível: {exc}"
         if attempt < attempts - 1:
-            time.sleep((0.5 * (2 ** attempt)) + (secrets.randbelow(250) / 1000))
+            time.sleep(callback_backoff_seconds(attempt, secrets.randbelow(250) / 1000))
+    log_attempt(
+        run_id=job.external_run_id or "",
+        empresa_id=job.empresa_id,
+        aamm=str(payload.get("aamm") or ""),
+        nnf=payload.get("number") if isinstance(payload.get("number"), int) else None,
+        chave=str(payload.get("key") or ""),
+        etapa="callback",
+        tentativa=attempts,
+        duracao_ms=int((time.perf_counter() - started) * 1000),
+        http=http_status,
+        categoria=categoria,
+        retry=attempts > 1,
+    )
     if event == "progress":
         return
     raise RuntimeError(last_error or "Callback NFC-e falhou sem resposta.")
@@ -464,6 +619,47 @@ def _consult(session: requests.Session, cfg: dict[str, Any], number: int, aamm: 
     return status, reason, real_key
 
 
+def _consult_logged(
+    session: requests.Session,
+    cfg: dict[str, Any],
+    number: int,
+    aamm: str,
+    run_id: str,
+    empresa_id: str,
+) -> tuple[str, str, str]:
+    started = time.perf_counter()
+    http_status: int | None = None
+    categoria = "UNKNOWN"
+    try:
+        status, reason, real_key = _consult(session, cfg, number, aamm)
+        categoria = status or "UNKNOWN"
+        return status, reason, real_key
+    except requests.HTTPError as exc:
+        http_status = exc.response.status_code if exc.response is not None else None
+        categoria = "REMOTE_5XX" if http_status and http_status >= 500 else "HTTP"
+        raise
+    except requests.Timeout:
+        categoria = "TIMEOUT"
+        raise
+    except requests.RequestException:
+        categoria = "NETWORK_ERROR"
+        raise
+    finally:
+        log_attempt(
+            run_id=run_id,
+            empresa_id=empresa_id,
+            aamm=aamm,
+            nnf=number,
+            chave=access_key(cfg, number, aamm),
+            etapa="soap",
+            tentativa=1,
+            duracao_ms=int((time.perf_counter() - started) * 1000),
+            http=http_status,
+            categoria=categoria,
+            retry=False,
+        )
+
+
 def _new_svrs_session(cert_path: Path, key_path: Path, verify_path: str) -> requests.Session:
     """Cria uma Session independente para uso seguro por uma thread."""
     session = requests.Session()
@@ -493,38 +689,67 @@ def _portal_http_failure(response: requests.Response) -> tuple[str, str] | None:
 
 
 def _download_one(
-    cert_path: Path, key_path: Path, verify_path: str, item: dict[str, Any]
+    cert_path: Path,
+    key_path: Path,
+    verify_path: str,
+    item: dict[str, Any],
+    limiter: SvrsRateLimiter | None = None,
+    run_id: str = "",
+    empresa_id: str = "",
 ) -> tuple[dict[str, Any], str | None, str, str]:
-    """Uma tentativa por chave. Rede/timeout ganha uma segunda chance no mesmo intervalo.
+    """Até 3 tentativas em timeout/rede. Limite da SVRS não repete na hora.
 
-    Limite da SVRS não é retentado na hora: repetir na sequência piora o bloqueio.
+    O limitador espaça cada par GET+POST. GET e POST da mesma chave não esperam.
     """
     session = _new_svrs_session(cert_path, key_path, verify_path)
     interval = clamp_download_interval(int(item.get("_download_interval_seconds", SVRS_INTERVAL_MIN_SECONDS)))
+    active = limiter or SvrsRateLimiter(soap_seconds=0.1, download_seconds=interval)
     try:
-        for attempt in range(2):
+        kind = "no_xml"
+        message = download_failure_message("no_xml")
+        for attempt in range(3):
+            active.wait("download")
+            started = time.perf_counter()
+            http_status: int | None = None
             try:
-                xml, kind, message = _download(session, item["chave_real"])
+                xml, kind, message, http_status = _download(session, item["chave_real"])
                 if xml:
-                    return item, xml, "", "ok"
-                if kind == "rate_limit" or attempt == 1 or kind in {"unavailable", "no_xml"}:
-                    return item, None, message, kind
+                    kind = "ok"
             except requests.Timeout:
-                if attempt == 1:
-                    return item, None, download_failure_message("timeout"), "timeout"
+                xml, kind, message = None, "timeout", download_failure_message("timeout")
             except requests.RequestException as exc:
-                if attempt == 1:
-                    text = str(exc)
-                    if "429" in text or "503" in text:
-                        return item, None, download_failure_message("rate_limit"), "rate_limit"
-                    return item, None, download_failure_message("http"), "http"
-            time.sleep(interval)
-        return item, None, download_failure_message("no_xml"), "no_xml"
+                text = str(exc)
+                if "429" in text or "503" in text:
+                    xml, kind, message = None, "rate_limit", download_failure_message("rate_limit")
+                else:
+                    xml, kind, message = None, "http", download_failure_message("http")
+            proxima = ""
+            if kind == "rate_limit":
+                proxima = (datetime.now(timezone.utc) + timedelta(seconds=interval)).isoformat()
+            log_attempt(
+                run_id=run_id,
+                empresa_id=empresa_id,
+                aamm=str(item.get("AAMM") or ""),
+                nnf=int(item["nNF"]) if item.get("nNF") is not None else None,
+                chave=str(item.get("chave_real") or ""),
+                etapa="download",
+                tentativa=attempt + 1,
+                duracao_ms=int((time.perf_counter() - started) * 1000),
+                http=http_status,
+                categoria=kind,
+                retry=download_retries_immediately(kind, attempt),
+                proxima_tentativa=proxima,
+            )
+            if xml:
+                return item, xml, "", "ok"
+            if not download_retries_immediately(kind, attempt):
+                return item, None, message, kind
+        return item, None, message, kind
     finally:
         session.close()
 
 
-def _download(session: requests.Session, key: str) -> tuple[str | None, str, str]:
+def _download(session: requests.Session, key: str) -> tuple[str | None, str, str, int | None]:
     get_response = session.get(
         SVRS_DOWNLOAD_GET_URL,
         params={"OrigemSite": "2", "Ambiente": "1", "ChaveAcessoDfe": key},
@@ -533,7 +758,7 @@ def _download(session: requests.Session, key: str) -> tuple[str | None, str, str
     )
     blocked = _portal_http_failure(get_response)
     if blocked:
-        return None, blocked[0], blocked[1]
+        return None, blocked[0], blocked[1], get_response.status_code
     hidden: dict[str, str] = {}
     for tag in re.findall(r"<input\b[^>]*>", get_response.text, re.I):
         if not re.search(r'\btype=["\']?hidden["\']?', tag, re.I):
@@ -557,13 +782,13 @@ def _download(session: requests.Session, key: str) -> tuple[str | None, str, str
     )
     blocked = _portal_http_failure(post_response)
     if blocked:
-        return None, blocked[0], blocked[1]
+        return None, blocked[0], blocked[1], post_response.status_code
     xml = extract_downloaded_xml(post_response.text)
     if xml:
-        return xml, "ok", ""
+        return xml, "ok", "", post_response.status_code
     page = f"{get_response.text}\n{post_response.text}"
     kind = classify_portal_body(post_response.status_code, page)
-    return None, kind, download_failure_message(kind, post_response.status_code)
+    return None, kind, download_failure_message(kind, post_response.status_code), post_response.status_code
 
 
 def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, options: dict[str, Any]) -> None:
@@ -588,6 +813,10 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         )
         pending_only = bool(options.get("pending_only"))
         paused_for_svrs = False
+        limiter = SvrsRateLimiter(
+            soap_seconds=float(options.get("query_interval_ms", 100)) / 1000,
+            download_seconds=interval_seconds,
+        )
         xml_dir = job.directory / "xml"
         xml_dir.mkdir(exist_ok=True)
 
@@ -638,7 +867,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 }
 
                 item, xml, last_download_error, failure_kind = _download_one(
-                    cert_path, key_path, verify_path, item
+                    cert_path, key_path, verify_path, item, limiter,
+                    run_id=job.external_run_id or "",
+                    empresa_id=job.empresa_id,
                 )
 
                 if xml:
@@ -729,7 +960,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                             f"{pending_index}/{pending_total}"
                         ),
                     )
-                    time.sleep(interval_seconds)
 
             _callback(
                 job,
@@ -760,12 +990,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             )
 
             if pending_only or paused_for_svrs:
-                start_aamm = str(options.get("start_aamm") or cfg["aamm"])
-                start_nnf = int(
-                    options.get("start_number")
-                    if options.get("start_number") is not None
-                    else cfg["number"]
-                )
                 _callback(
                     job,
                     "completed",
@@ -775,8 +999,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     pending_saved=pending_saved,
                     pending_failed=pending_failed,
                     pause_for_svrs=paused_for_svrs,
-                    cursor_aamm=start_aamm,
-                    cursor_nnf=start_nnf,
+                    include_cursor=False,
                     message=(
                         (
                             f"Pausa por limite da SVRS · {pending_saved} salvas. "
@@ -807,6 +1030,22 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 )
                 return
 
+        if pending_only:
+            _callback(
+                job,
+                "completed",
+                consulted=0,
+                found=0,
+                downloaded=pending_saved,
+                pending_saved=pending_saved,
+                pending_failed=pending_failed,
+                pause_for_svrs=paused_for_svrs,
+                include_cursor=False,
+                message="Nenhuma pendência pronta neste momento. A fila segue quando a próxima tentativa chegar.",
+            )
+            _update(job, status="completed", message="Pendências aguardando a próxima tentativa", progress=100, downloaded=pending_saved)
+            return
+
         found: list[dict[str, Any]] = []
         current_month = str(options.get("start_aamm") or cfg["aamm"])
         start_number = int(options.get("start_number") if options.get("start_number") is not None else cfg["number"])
@@ -814,8 +1053,28 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         consecutive_217, gap_start, last_probe = 0, None, number - 1
         max_numbers = options["max_numbers"]
         last_progress_at = 0.0
-        last_consulted_aamm = current_month
-        last_consulted_nnf = start_number
+        # Cursor já gravado. Só anda depois de ausência (217) ou de ack HTTP 200 da chave.
+        safe_aamm = current_month
+        safe_nnf = start_number
+
+        def acknowledge(aamm: str, n_nf: int, status: str, real_key: str) -> bool:
+            """Grava a chave na fila antes de o chamador mover o cursor. hold/falha = False."""
+            artificial = access_key(cfg, n_nf, aamm)
+            action, found_key = discovery_action(status, artificial, real_key)
+            if action == "absent":
+                return True
+            if action != "found":
+                return False
+            _callback(
+                job, "discovered",
+                key=found_key, aamm=aamm, number=n_nf,
+                consulted=len(records), found=len(found) + 1,
+            )
+            found.append({
+                "AAMM": aamm, "nNF": n_nf, "cStat": status,
+                "xMotivo": "", "chave_real": found_key, "download_status": "NA_FILA",
+            })
+            return True
 
         def report_progress(message: str, force: bool = False) -> None:
             nonlocal last_progress_at
@@ -840,6 +1099,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             )
 
         report_progress(f"Consultando {current_month} a partir da nNF {number}", force=True)
+        scan_reason = "cap"
         while len(records) < max_numbers:
             _update(
                 job,
@@ -848,22 +1108,31 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 current_competence=current_month,
                 progress=min(65, 2 + int(len(records) / max_numbers * 63)),
             )
-            status, reason, real_key = _consult(session, cfg, number, current_month)
-            last_consulted_aamm = current_month
-            last_consulted_nnf = number
+            limiter.wait("soap")
+            status, reason, real_key = _consult_logged(
+                session, cfg, number, current_month,
+                job.external_run_id or "", job.empresa_id,
+            )
             report_progress(f"Consultando {current_month} nNF {number}")
             record = {"AAMM": current_month, "nNF": number, "cStat": status, "xMotivo": reason, "chave_real": real_key}
             records.append(record)
-            if status == "613" and real_key:
-                found.append(record)
+            artificial = access_key(cfg, number, current_month)
+            try:
+                acked = acknowledge(current_month, number, status, real_key)
+            except Exception:
+                acked = False
+            safe_aamm, safe_nnf, action, _found_key = apply_discovery_step(
+                safe_aamm, safe_nnf, current_month, number, status,
+                artificial, real_key, acked,
+            )
+            if action == "found" and _found_key:
+                record["chave_real"] = _found_key
+            if action == "hold" or not acked:
+                scan_reason = "hold" if action == "hold" else "ack"
+                break
+            if action != "absent":
                 consecutive_217, gap_start, last_probe = 0, None, number
                 number += 1
-                time.sleep(options["query_interval_ms"] / 1000)
-                continue
-            if status != "217":
-                consecutive_217, gap_start = 0, None
-                number += 1
-                time.sleep(options["query_interval_ms"] / 1000)
                 continue
             gap_start = number if gap_start is None else gap_start
             consecutive_217 += 1
@@ -876,108 +1145,53 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     for probe in range(probe_start, probe_end + 1):
                         if len(records) >= max_numbers:
                             break
-                        status2, reason2, real2 = _consult(session, cfg, probe, following)
+                        limiter.wait("soap")
+                        status2, reason2, real2 = _consult_logged(
+                            session, cfg, probe, following,
+                            job.external_run_id or "", job.empresa_id,
+                        )
                         probe_record = {"AAMM": following, "nNF": probe, "cStat": status2, "xMotivo": reason2, "chave_real": real2}
                         records.append(probe_record)
-                        if status2 == "613" and real2:
-                            found.append(probe_record)
-                            last_consulted_aamm, last_consulted_nnf = following, probe
+                        probe_key_artificial = access_key(cfg, probe, following)
+                        action2, _ignored = discovery_action(status2, probe_key_artificial, real2)
+                        if action2 == "absent":
+                            continue
+                        if action2 == "hold":
+                            break
+                        try:
+                            probe_acked = acknowledge(following, probe, status2, real2)
+                        except Exception:
+                            probe_acked = False
+                        safe_aamm, safe_nnf, action2, _probe_key = apply_discovery_step(
+                            safe_aamm, safe_nnf, following, probe, status2,
+                            probe_key_artificial, real2, probe_acked,
+                        )
+                        if not probe_acked:
+                            break
+                        if action2 == "found":
                             current_month, number = following, probe + 1
                             consecutive_217, gap_start, last_probe, switched = 0, None, probe, True
                             break
-                        time.sleep(options["query_interval_ms"] / 1000)
                     last_probe = probe_end
                     if switched:
                         continue
             if consecutive_217 >= options["stop_gap"]:
+                scan_reason = "gap"
                 break
             number += 1
-            time.sleep(options["query_interval_ms"] / 1000)
 
-        _update(job, consulted=len(records), found=len(found), message=f"Baixando {len(found)} XML(s)", progress=68)
+        _update(
+            job, consulted=len(records), found=len(found),
+            message=f"{len(found)} chave(s) na fila. O download corre em outro job.",
+            progress=68,
+        )
         _callback(
             job, "progress",
             consulted=len(records), found=len(found), downloaded=pending_saved,
-            message=f"Baixando {len(found)} XML(s) da varredura",
-            mode="download",
+            message=f"{len(found)} chave(s) enfileiradas. Download fica para o próximo job.",
+            mode="discovery",
         )
-        xml_dir = job.directory / "xml"
-        xml_dir.mkdir(exist_ok=True)
         downloaded = pending_saved
-        processed_downloads = 0
-        # Download estritamente serial: nenhuma próxima requisição começa antes
-        # de terminar o intervalo configurado.
-        if found:
-            for original_index, item in enumerate(found, 1):
-                item["_download_interval_seconds"] = interval_seconds
-                try:
-                    item, xml, last_download_error, failure_kind = _download_one(
-                        cert_path, key_path, verify_path, item
-                    )
-                except Exception as exc:
-                    xml, last_download_error, failure_kind = None, str(exc), "http"
-
-                processed_downloads += 1
-                if xml:
-                    full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
-                    _callback(
-                        job, "file", key=item["chave_real"], aamm=item["AAMM"],
-                        number=item["nNF"], emitted_at=_xml_emission_date(xml),
-                        advance_cursor=False,
-                        consulted=len(records), found=len(found), item_index=original_index,
-                        xml_base64=base64.b64encode(full_xml.encode("utf-8")).decode("ascii"),
-                    )
-                    (xml_dir / f'{item["chave_real"]}-procNFe.xml').write_text(
-                        full_xml, encoding="utf-8"
-                    )
-                    item["download_status"] = "OK"
-                    downloaded += 1
-                else:
-                    item["download_status"] = "LIMITE_SVRS" if failure_kind == "rate_limit" else "NAO_EXTRAIDO"
-                    failure_reason = last_download_error or download_failure_message(failure_kind)
-                    item["xMotivo"] = (
-                        f'{item.get("xMotivo", "")} | download: {failure_reason[:300]}'
-                    )
-                    _callback(
-                        job, "download_failed", key=item["chave_real"], aamm=item["AAMM"],
-                        number=item["nNF"], error=failure_reason, error_kind=failure_kind,
-                        consulted=len(records), found=len(found), item_index=original_index,
-                    )
-                    if failure_kind == "rate_limit":
-                        paused_for_svrs = True
-                        _update(
-                            job,
-                            message=(
-                                "Pausa: a SVRS limitou as consultas. "
-                                "As NFC-e restantes continuam na fila."
-                            ),
-                        )
-                        break
-
-                message = (
-                    f"Baixando XMLs: {processed_downloads}/{len(found)} processados · "
-                    f"{downloaded} salvos"
-                )
-                _update(
-                    job, downloaded=downloaded, message=message,
-                    progress=68 + int(processed_downloads / max(1, len(found)) * 27),
-                )
-                if processed_downloads == len(found) or processed_downloads % 10 == 0:
-                    _callback(
-                        job, "progress", consulted=len(records), found=len(found),
-                        downloaded=downloaded, message=message,
-                    )
-
-                if processed_downloads < len(found) and interval_seconds:
-                    _update(
-                        job,
-                        message=(
-                            f"Aguardando {format_wait(interval_seconds)} para o próximo XML · "
-                            f"{processed_downloads}/{len(found)} processados · "
-                            f"{downloaded} salvos"
-                        ),
-                    )
-                    time.sleep(interval_seconds)
         summary = io.StringIO()
         writer = csv.DictWriter(summary, fieldnames=["AAMM", "nNF", "cStat", "xMotivo", "chave_real", "download_status"], delimiter=";")
         writer.writeheader()
@@ -989,6 +1203,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             archive.writestr("resumo.csv", summary.getvalue().encode("utf-8-sig"))
             for xml_path in xml_dir.glob("*.xml"):
                 archive.write(xml_path, arcname=f"XML/{xml_path.name}")
+        if scan_reason in {"hold", "ack"}:
+            paused_for_svrs = True
         completion_message = "Processamento concluído"
         if paused_for_svrs:
             completion_message = (
@@ -998,12 +1214,12 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         elif pending_saved or pending_failed:
             completion_message = (
                 f"Concluído · pendências {pending_saved} salvas/"
-                f"{pending_failed} falhas · varredura {len(found)} encontradas/"
-                f"{max(0, downloaded - pending_saved)} salvas"
+                f"{pending_failed} falhas · varredura {len(found)} na fila"
             )
         _callback(
             job, "completed", consulted=len(records), found=len(found), downloaded=downloaded,
-            cursor_aamm=last_consulted_aamm, cursor_nnf=last_consulted_nnf,
+            cursor_aamm=safe_aamm, cursor_nnf=safe_nnf, include_cursor=True,
+            scan_complete=discovery_scan_complete(scan_reason),
             pending_saved=pending_saved, pending_failed=pending_failed,
             pause_for_svrs=paused_for_svrs,
             message=completion_message,
@@ -1139,6 +1355,7 @@ async def create_internal_job(
     pendentes_json: str = Form("[]"),
     intervalo_download_segundos: int = Form(90),
     somente_pendentes: str = Form("false"),
+    empresa_id: str = Form(""),
 ) -> dict[str, Any]:
     _cleanup_expired()
     _validate_internal_run(run_id, run_token)
@@ -1184,9 +1401,12 @@ async def create_internal_job(
     job_id = secrets.token_urlsafe(24)
     directory = WORK_ROOT / job_id
     directory.mkdir(mode=0o700)
+    empresa = empresa_id.strip()
+    if empresa and not re.fullmatch(r"[0-9a-fA-F-]{36}", empresa):
+        empresa = ""
     job = Job(
         id=job_id, owner_id=f"run:{run_id}", directory=directory,
-        callback_token=run_token, external_run_id=run_id,
+        callback_token=run_token, external_run_id=run_id, empresa_id=empresa,
     )
     with _jobs_lock:
         _jobs[job_id] = job
