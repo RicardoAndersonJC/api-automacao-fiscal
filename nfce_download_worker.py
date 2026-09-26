@@ -64,9 +64,8 @@ _executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("NFCE_WORKERS", 
 DOWNLOAD_CONCURRENCY = 1
 # floor(1200s / p50 183s) = 6. Cabe na janela de 20 min sem heartbeat.
 MAX_PENDING_PER_RUN = max(1, min(6, int(os.getenv("NFCE_MAX_PENDING_PER_RUN", "6"))))
-# Piso de 1 min 30 s e teto de 2 min entre downloads. Abaixo disso a SVRS
-# devolve página sem XML e o lote inteiro parece "falha".
-SVRS_INTERVAL_MIN_SECONDS = 90
+# Espera entre downloads desligada neste teste. Recusa do portal continua pausando o lote.
+SVRS_INTERVAL_MIN_SECONDS = 0
 SVRS_INTERVAL_MAX_SECONDS = 120
 WORKER_BUSY_DETAIL = (
     "O worker já está ocupado com outros downloads de NFC-e. "
@@ -250,12 +249,12 @@ def format_wait(seconds: int) -> str:
 
 
 def clamp_download_interval(seconds: int) -> int:
-    """Mantém o espaço entre downloads da SVRS entre 1 min 30 s e 2 min."""
+    """0 baixa a chave seguinte na hora. O teto corta um intervalo absurdo."""
     try:
         value = int(seconds)
     except (TypeError, ValueError):
-        value = SVRS_INTERVAL_MIN_SECONDS
-    return max(SVRS_INTERVAL_MIN_SECONDS, min(SVRS_INTERVAL_MAX_SECONDS, value))
+        value = 0
+    return max(0, min(SVRS_INTERVAL_MAX_SECONDS, value))
 
 
 class SvrsRateLimiter:
