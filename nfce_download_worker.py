@@ -59,14 +59,16 @@ ICP_BRASIL_CA_SHA256 = "6E0BFF069A26994C15DE2C4888CC54AF84882E5495B7FBF66BE9CCFF
 router = APIRouter(prefix="/nfce/download-jobs", tags=["NFC-e"])
 _jobs_lock = threading.Lock()
 _jobs: dict[str, "Job"] = {}
-# Um job por processo: dois downloads simultâneos somariam taxa no portal.
+# Um download por vez. Quem roda uma empresa não soma taxa no portal.
 _executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("NFCE_WORKERS", "1"))))
 DOWNLOAD_CONCURRENCY = 1
 # floor(1200s / p50 183s) = 6. Cabe na janela de 20 min sem heartbeat.
 MAX_PENDING_PER_RUN = max(1, min(6, int(os.getenv("NFCE_MAX_PENDING_PER_RUN", "6"))))
-# Piso de 1 min 30 s entre downloads. Abaixo disso o portal devolve página sem XML.
-SVRS_INTERVAL_MIN_SECONDS = 90
+# Piso de 50 s entre downloads. Limite não confirmado pela documentação oficial.
+SVRS_INTERVAL_MIN_SECONDS = 50
 SVRS_INTERVAL_MAX_SECONDS = 120
+PORTAL_EMPTY_RETRY_SECONDS = 50
+PORTAL_EMPTY_RETRY_LIMIT = 3
 WORKER_BUSY_DETAIL = (
     "O worker já está ocupado com outros downloads de NFC-e. "
     "Aguarde o lote atual; esta empresa volta sozinha para a fila."
@@ -94,6 +96,7 @@ class Job:
     callback_token: str | None = None
     external_run_id: str | None = None
     empresa_id: str = ""
+    organizacao_id: str = ""
 
     def public(self) -> dict[str, Any]:
         return {
@@ -249,7 +252,7 @@ def format_wait(seconds: int) -> str:
 
 
 def clamp_download_interval(seconds: int) -> int:
-    """Mantém o espaço entre downloads da SVRS entre 1 min 30 s e 2 min."""
+    """Mantém o espaço entre downloads da SVRS entre 50 s e 2 min."""
     try:
         value = int(seconds)
     except (TypeError, ValueError):
@@ -274,19 +277,26 @@ class SvrsRateLimiter:
         self.download_seconds = max(0.0, float(download_seconds))
         self._clock = clock or time.monotonic
         self._sleep = sleep or time.sleep
+        self._lock = threading.Lock()
         self._next = {"soap": 0.0, "download": 0.0}
 
     def wait(self, channel: str) -> float:
         spacing = self.soap_seconds if channel == "soap" else self.download_seconds
-        now = float(self._clock())
-        delay = self._next.get(channel, 0.0) - now
+        with self._lock:
+            now = float(self._clock())
+            delay = self._next.get(channel, 0.0) - now
+            if delay < 0:
+                delay = 0.0
+            self._next[channel] = now + delay + spacing
         if delay > 0:
             self._sleep(delay)
-            now = float(self._clock())
-        else:
-            delay = 0.0
-        self._next[channel] = now + spacing
         return delay
+
+    def arm_same_key_retry(self, seconds: float) -> None:
+        """A próxima espera do download desta chave fica em `seconds`, não em 90 s."""
+        with self._lock:
+            now = float(self._clock())
+            self._next["download"] = now + max(0.0, float(seconds))
 
 
 def discovery_action(status: str, artificial: str, real_key: str) -> tuple[str, str]:
@@ -330,6 +340,41 @@ def download_retries_immediately(kind: str, attempt: int) -> bool:
     """attempt começa em 0. Limite da SVRS e XML ausente não repetem na hora."""
     limit = 3 if kind in {"timeout", "http"} else 1
     return attempt + 1 < limit
+
+
+def download_retries_same_key(kind: str, attempt: int) -> bool:
+    """Página sem XML ou limite: a mesma chave volta depois de 60 s, até 3 vezes."""
+    if kind not in {"rate_limit", "no_xml"}:
+        return False
+    return attempt + 1 < PORTAL_EMPTY_RETRY_LIMIT
+
+
+_shared_limiter: SvrsRateLimiter | None = None
+_shared_limiter_guard = threading.Lock()
+
+
+def shared_rate_limiter(soap_seconds: float, download_seconds: float) -> SvrsRateLimiter:
+    """Um relógio para o processo. O job seguinte não começa do zero."""
+    global _shared_limiter
+    with _shared_limiter_guard:
+        if _shared_limiter is None:
+            _shared_limiter = SvrsRateLimiter(
+                soap_seconds=soap_seconds,
+                download_seconds=download_seconds,
+            )
+        else:
+            _shared_limiter.soap_seconds = max(_shared_limiter.soap_seconds, float(soap_seconds))
+            _shared_limiter.download_seconds = max(
+                _shared_limiter.download_seconds,
+                float(download_seconds),
+            )
+        return _shared_limiter
+
+
+def reset_shared_rate_limiter() -> None:
+    global _shared_limiter
+    with _shared_limiter_guard:
+        _shared_limiter = None
 
 
 def callback_backoff_seconds(attempt: int, jitter_seconds: float = 0) -> float:
@@ -427,7 +472,7 @@ def download_failure_message(kind: str, status_code: int = 0) -> str:
     if kind == "rate_limit":
         return (
             "Limite da SVRS: muitas consultas em sequência. "
-            "Esta NFC-e continua na fila. O lote pausa 1 min 30 s para não tomar bloqueio."
+            "Esta NFC-e continua na fila. O lote pausa 50 s para não tomar bloqueio."
         )
     if kind == "unavailable":
         return (
@@ -437,7 +482,7 @@ def download_failure_message(kind: str, status_code: int = 0) -> str:
     if kind == "timeout":
         return (
             "A SVRS não respondeu a tempo. "
-            "A chave continua na fila e será tentada de novo com intervalo de 1 min 30 s."
+            "A chave continua na fila e será tentada de novo com intervalo de 50 s."
         )
     if kind == "http":
         code = f" HTTP {status_code}" if status_code else ""
@@ -701,7 +746,7 @@ def _download_one(
     empresa_id: str = "",
     notify=None,
 ) -> tuple[dict[str, Any], str | None, str, str]:
-    """Até 3 tentativas em timeout/rede. Limite da SVRS não repete na hora.
+    """Até 3 tentativas. Página sem XML repete a mesma chave depois de 60 s.
 
     O limitador espaça cada par GET+POST. GET e POST da mesma chave não esperam.
     """
@@ -712,8 +757,12 @@ def _download_one(
         kind = "no_xml"
         message = download_failure_message("no_xml")
         for attempt in range(3):
+            if attempt:
+                active.arm_same_key_retry(PORTAL_EMPTY_RETRY_SECONDS)
+                if notify:
+                    notify(attempt)
             waited = active.wait("download")
-            if notify and (attempt > 0 or waited > 0):
+            if notify and attempt == 0 and waited > 0:
                 notify(attempt)
             started = time.perf_counter()
             http_status: int | None = None
@@ -743,13 +792,17 @@ def _download_one(
                 duracao_ms=int((time.perf_counter() - started) * 1000),
                 http=http_status,
                 categoria=kind,
-                retry=download_retries_immediately(kind, attempt),
+                retry=(
+                    download_retries_immediately(kind, attempt)
+                    or download_retries_same_key(kind, attempt)
+                ),
                 proxima_tentativa=proxima,
             )
             if xml:
                 return item, xml, "", "ok"
-            if not download_retries_immediately(kind, attempt):
-                return item, None, message, kind
+            if download_retries_immediately(kind, attempt) or download_retries_same_key(kind, attempt):
+                continue
+            return item, None, message, kind
         return item, None, message, kind
     finally:
         session.close()
@@ -819,9 +872,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         )
         pending_only = bool(options.get("pending_only"))
         paused_for_svrs = False
-        limiter = SvrsRateLimiter(
-            soap_seconds=float(options.get("query_interval_ms", 100)) / 1000,
-            download_seconds=interval_seconds,
+        limiter = shared_rate_limiter(
+            float(options.get("query_interval_ms", 100)) / 1000,
+            interval_seconds,
         )
         xml_dir = job.directory / "xml"
         xml_dir.mkdir(exist_ok=True)
@@ -873,6 +926,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 }
 
                 def notify_attempt(attempt: int) -> None:
+                    espera = PORTAL_EMPTY_RETRY_SECONDS if attempt else interval_seconds
                     _callback(
                         job,
                         "progress",
@@ -884,7 +938,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         pending_remaining=pending_remaining,
                         mode="pending_recovery",
                         message=(
-                            f"Aguardando {format_wait(interval_seconds)} · pendência "
+                            f"Aguardando {format_wait(espera)} · pendência "
                             f"{pending_index}/{pending_total} · tentativa {attempt + 1}"
                         ),
                     )
@@ -920,10 +974,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     pending_saved += 1
                 else:
                     failure_reason = last_download_error or download_failure_message(failure_kind)
-                    if failure_kind == "rate_limit":
-                        paused_for_svrs = True
-                    else:
-                        pending_failed += 1
+                    pending_failed += 1
                     _callback(
                         job,
                         "download_failed",
@@ -937,16 +988,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         item_index=pending_index,
                         mode="pending_recovery",
                     )
-                    if paused_for_svrs:
-                        _update(
-                            job,
-                            message=(
-                                "Pausa: a SVRS limitou as consultas. "
-                                f"{pending_saved} salvas neste lote. "
-                                "O restante continua na fila daqui a 1 min 30 s."
-                            ),
-                        )
-                        break
 
                 message = (
                     f"Recuperando pendências: {pending_index}/{pending_total} · "
@@ -1037,7 +1078,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     message=(
                         (
                             f"Pausa por limite da SVRS · {pending_saved} salvas. "
-                            "As demais NFC-e continuam na fila e seguem em 1 min 30 s."
+                            "As demais NFC-e continuam na fila e seguem em 50 s."
                         )
                         if paused_for_svrs
                         else (
@@ -1247,7 +1288,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         if paused_for_svrs:
             completion_message = (
                 f"Pausa por limite da SVRS · {downloaded} XML salvos. "
-                "O restante continua na fila e segue em 1 min 30 s."
+                "O restante continua na fila e segue em 50 s."
             )
         elif pending_saved or pending_failed:
             completion_message = (
@@ -1391,9 +1432,10 @@ async def create_internal_job(
     inicio_nnf: int = Form(...),
     data_referencia: str = Form(...),
     pendentes_json: str = Form("[]"),
-    intervalo_download_segundos: int = Form(90),
+    intervalo_download_segundos: int = Form(50),
     somente_pendentes: str = Form("false"),
     empresa_id: str = Form(""),
+    organizacao_id: str = Form(""),
 ) -> dict[str, Any]:
     _cleanup_expired()
     _validate_internal_run(run_id, run_token)
@@ -1426,6 +1468,11 @@ async def create_internal_job(
         normalized_pending.append({"chave": key, "aamm": aamm, "nnf": nnf})
     with _jobs_lock:
         active_jobs = [item for item in _jobs.values() if item.status in {"queued", "running"}]
+        org = organizacao_id.strip()
+        if org and not re.fullmatch(r"[0-9a-fA-F-]{36}", org):
+            org = ""
+        if org and any(item.organizacao_id == org for item in active_jobs):
+            raise HTTPException(status_code=429, detail=WORKER_BUSY_DETAIL)
         if len(active_jobs) >= MAX_QUEUED_JOBS:
             raise HTTPException(status_code=429, detail=WORKER_BUSY_DETAIL)
     seed_bytes = await xml_semente.read(MAX_UPLOAD_BYTES + 1)
@@ -1445,8 +1492,14 @@ async def create_internal_job(
     job = Job(
         id=job_id, owner_id=f"run:{run_id}", directory=directory,
         callback_token=run_token, external_run_id=run_id, empresa_id=empresa,
+        organizacao_id=org,
     )
     with _jobs_lock:
+        active_now = [item for item in _jobs.values() if item.status in {"queued", "running"}]
+        if org and any(item.organizacao_id == org for item in active_now):
+            raise HTTPException(status_code=429, detail=WORKER_BUSY_DETAIL)
+        if len(active_now) >= MAX_QUEUED_JOBS:
+            raise HTTPException(status_code=429, detail=WORKER_BUSY_DETAIL)
         _jobs[job_id] = job
     if not (0 <= intervalo_download_segundos <= 300):
         raise HTTPException(status_code=400, detail="Intervalo de download inválido.")
@@ -1486,7 +1539,7 @@ async def create_job(
     lacuna_parada: int = Form(80),
     max_numeracoes: int = Form(1000),
     intervalo_consulta_ms: int = Form(100),
-    intervalo_download_segundos: int = Form(90),
+    intervalo_download_segundos: int = Form(50),
     authorization: str | None = Header(None),
 ) -> dict[str, Any]:
     _cleanup_expired()
