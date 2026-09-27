@@ -64,10 +64,10 @@ _executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("NFCE_WORKERS", 
 DOWNLOAD_CONCURRENCY = 1
 # floor(1200s / p50 183s) = 6. Cabe na janela de 20 min sem heartbeat.
 MAX_PENDING_PER_RUN = max(1, min(6, int(os.getenv("NFCE_MAX_PENDING_PER_RUN", "6"))))
-# Piso de 50 s entre downloads. Limite não confirmado pela documentação oficial.
-SVRS_INTERVAL_MIN_SECONDS = 50
+# Piso de 1 min entre downloads. Limite não confirmado pela documentação oficial.
+SVRS_INTERVAL_MIN_SECONDS = 60
 SVRS_INTERVAL_MAX_SECONDS = 120
-PORTAL_EMPTY_RETRY_SECONDS = 50
+PORTAL_EMPTY_RETRY_SECONDS = 60
 PORTAL_EMPTY_RETRY_LIMIT = 3
 WORKER_BUSY_DETAIL = (
     "O worker já está ocupado com outros downloads de NFC-e. "
@@ -252,7 +252,7 @@ def format_wait(seconds: int) -> str:
 
 
 def clamp_download_interval(seconds: int) -> int:
-    """Mantém o espaço entre downloads da SVRS entre 50 s e 2 min."""
+    """Mantém o espaço entre downloads da SVRS entre 1 min e 2 min."""
     try:
         value = int(seconds)
     except (TypeError, ValueError):
@@ -472,7 +472,7 @@ def download_failure_message(kind: str, status_code: int = 0) -> str:
     if kind == "rate_limit":
         return (
             "Limite da SVRS: muitas consultas em sequência. "
-            "Esta NFC-e continua na fila. O lote pausa 50 s para não tomar bloqueio."
+            "Esta NFC-e continua na fila. O lote pausa 1 min para não tomar bloqueio."
         )
     if kind == "unavailable":
         return (
@@ -482,7 +482,7 @@ def download_failure_message(kind: str, status_code: int = 0) -> str:
     if kind == "timeout":
         return (
             "A SVRS não respondeu a tempo. "
-            "A chave continua na fila e será tentada de novo com intervalo de 50 s."
+            "A chave continua na fila e será tentada de novo com intervalo de 1 min."
         )
     if kind == "http":
         code = f" HTTP {status_code}" if status_code else ""
@@ -1078,7 +1078,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     message=(
                         (
                             f"Pausa por limite da SVRS · {pending_saved} salvas. "
-                            "As demais NFC-e continuam na fila e seguem em 50 s."
+                            "As demais NFC-e continuam na fila e seguem em 1 min."
                         )
                         if paused_for_svrs
                         else (
@@ -1288,7 +1288,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         if paused_for_svrs:
             completion_message = (
                 f"Pausa por limite da SVRS · {downloaded} XML salvos. "
-                "O restante continua na fila e segue em 50 s."
+                "O restante continua na fila e segue em 1 min."
             )
         elif pending_saved or pending_failed:
             completion_message = (
@@ -1432,7 +1432,7 @@ async def create_internal_job(
     inicio_nnf: int = Form(...),
     data_referencia: str = Form(...),
     pendentes_json: str = Form("[]"),
-    intervalo_download_segundos: int = Form(50),
+    intervalo_download_segundos: int = Form(60),
     somente_pendentes: str = Form("false"),
     empresa_id: str = Form(""),
     organizacao_id: str = Form(""),
@@ -1539,7 +1539,7 @@ async def create_job(
     lacuna_parada: int = Form(80),
     max_numeracoes: int = Form(1000),
     intervalo_consulta_ms: int = Form(100),
-    intervalo_download_segundos: int = Form(50),
+    intervalo_download_segundos: int = Form(60),
     authorization: str | None = Header(None),
 ) -> dict[str, Any]:
     _cleanup_expired()
