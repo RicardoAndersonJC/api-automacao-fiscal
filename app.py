@@ -27,6 +27,7 @@ from nfce_download_worker import (
     MAX_PENDING_PER_RUN,
     discovery_scan_complete,
     router as nfce_download_router,
+    shared_outbound_transport,
 )
 
 logger = logging.getLogger("api-automacao-fiscal")
@@ -901,7 +902,8 @@ def processar_consulta(
 
 @app.get("/")
 @app.get("/health")
-def health() -> dict[str, bool | str | int]:
+def health() -> dict[str, Any]:
+    outbound = shared_outbound_transport().public_status()
     return {
         "ok": True,
         "git": os.environ.get("RENDER_GIT_COMMIT", ""),
@@ -909,6 +911,10 @@ def health() -> dict[str, bool | str | int]:
         "nfce_scan_gap_only": bool(
             discovery_scan_complete("gap") and not discovery_scan_complete("cap")
         ),
+        "nfce_proxy_enabled": outbound["enabled"],
+        "nfce_proxy_routes": outbound["routes"],
+        "nfce_outbound_id": outbound["outbound_id"],
+        "nfce_outbound_health": outbound["outbound_health"],
     }
 
 

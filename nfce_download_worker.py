@@ -783,6 +783,16 @@ class OutboundTransportManager:
             self.routes[self.index].health = "healthy"
             self.routes[self.index].unhealthy_until = 0.0
 
+    def public_status(self) -> dict[str, Any]:
+        """Estado operacional sem URL, usuario ou senha do proxy."""
+        route = self.current()
+        return {
+            "enabled": self.enabled,
+            "routes": len(self.routes) if self.enabled else 0,
+            "outbound_id": route.outbound_id if self.enabled else "direct",
+            "outbound_health": route.health,
+        }
+
 
 _shared_transport: OutboundTransportManager | None = None
 _shared_transport_guard = threading.Lock()

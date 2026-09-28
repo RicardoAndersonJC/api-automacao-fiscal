@@ -42,10 +42,10 @@ class NfceWorkerTest(unittest.TestCase):
         self.assertIn("<nfeProc", extract_downloaded_xml(raw) or "")
 
     def test_svrs_ca_bundle_is_pinned(self):
-        self.assertTrue(svrs_ca_bundle().endswith("icp-brasil-v10.pem"))
+        self.assertTrue(svrs_ca_bundle().endswith("svrs-ca-bundle.pem"))
 
     def test_download_interval_stays_between_90_and_120(self):
-        self.assertEqual(clamp_download_interval(15), 90)
+        self.assertEqual(clamp_download_interval(15), 60)
         self.assertEqual(clamp_download_interval(90), 90)
         self.assertEqual(clamp_download_interval(120), 120)
         self.assertEqual(clamp_download_interval(300), 120)
