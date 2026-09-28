@@ -19,6 +19,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import shutil
@@ -31,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from xml.etree import ElementTree as ET
 
 import requests
@@ -68,6 +69,13 @@ MAX_PENDING_PER_RUN = max(1, min(6, int(os.getenv("NFCE_MAX_PENDING_PER_RUN", "6
 SVRS_INTERVAL_MIN_SECONDS = 60
 SVRS_INTERVAL_MAX_SECONDS = 120
 PORTAL_EMPTY_RETRY_SECONDS = 60
+# Piso operacional configurado. Limite não confirmado pela documentação oficial.
+SEFAZ_COOLDOWN_SECONDS = 60
+SEFAZ_BACKOFF_BASE_SECONDS = 1.0
+SEFAZ_BACKOFF_MAX_SECONDS = 30.0
+SEFAZ_MAX_RETRIES_CAP = 3
+CIRCUIT_FAILURE_THRESHOLD = 5
+CANCELLED_QUEUE_ERROR = "[fora-da-fila] Fila cancelada"
 PORTAL_EMPTY_RETRY_LIMIT = 3
 WORKER_BUSY_DETAIL = (
     "O worker já está ocupado com outros downloads de NFC-e. "
@@ -260,10 +268,127 @@ def clamp_download_interval(seconds: int) -> int:
     return max(SVRS_INTERVAL_MIN_SECONDS, min(SVRS_INTERVAL_MAX_SECONDS, value))
 
 
-class SvrsRateLimiter:
-    """Relógio único. SOAP e o par de download não dividem o mesmo espaçamento.
+def sefaz_cooldown_seconds() -> float:
+    try:
+        value = float(os.getenv("SEFAZ_COOLDOWN_SECONDS", str(SEFAZ_COOLDOWN_SECONDS)))
+    except (TypeError, ValueError):
+        value = float(SEFAZ_COOLDOWN_SECONDS)
+    return max(1.0, value)
 
+
+def sefaz_backoff_base() -> float:
+    try:
+        value = float(os.getenv("SEFAZ_BACKOFF_BASE", str(SEFAZ_BACKOFF_BASE_SECONDS)))
+    except (TypeError, ValueError):
+        value = SEFAZ_BACKOFF_BASE_SECONDS
+    return max(0.1, value)
+
+
+def sefaz_backoff_max() -> float:
+    try:
+        value = float(os.getenv("SEFAZ_BACKOFF_MAX", str(SEFAZ_BACKOFF_MAX_SECONDS)))
+    except (TypeError, ValueError):
+        value = SEFAZ_BACKOFF_MAX_SECONDS
+    return max(sefaz_backoff_base(), value)
+
+
+def sefaz_max_retries() -> int:
+    """Teto 3. Não aumenta o máximo que já estava em produção."""
+    try:
+        value = int(os.getenv("SEFAZ_MAX_RETRIES", str(SEFAZ_MAX_RETRIES_CAP)))
+    except (TypeError, ValueError):
+        value = SEFAZ_MAX_RETRIES_CAP
+    return max(1, min(SEFAZ_MAX_RETRIES_CAP, value))
+
+
+def transient_backoff_seconds(attempt: int, jitter_seconds: float | None = None) -> float:
+    """Backoff exponencial da tentativa transitória. attempt 0 é a primeira repetição."""
+    if jitter_seconds is None:
+        jitter_seconds = random.uniform(0, sefaz_backoff_base())
+    raw = (sefaz_backoff_base() * (2 ** max(0, int(attempt)))) + max(0.0, float(jitter_seconds))
+    return min(sefaz_backoff_max(), raw)
+
+
+def failure_policy(kind: str) -> str:
+    """cooldown, backoff, same_key ou permanent. Limite do portal não entra no retry."""
+    if kind == "rate_limit":
+        return "cooldown"
+    if kind in {"timeout", "http", "proxy", "network"}:
+        return "backoff"
+    if kind == "no_xml":
+        return "same_key"
+    if kind in {"certificate", "cnpj", "unavailable", "circuit_open"}:
+        return "permanent" if kind in {"certificate", "cnpj", "unavailable"} else "backoff"
+    return "permanent"
+
+
+def certificate_mismatch_stops(cert_cnpj: str, emit_cnpj: str) -> bool:
+    return bool(cert_cnpj) and cert_cnpj != emit_cnpj
+
+
+def client_error_is_permanent(kind: str) -> bool:
+    return kind in {"certificate", "cnpj"}
+
+
+def discovery_download_plan(
+    *,
+    found: bool,
+    xml_already_saved: bool,
+    downloads_used: int,
+    batch_limit: int = MAX_PENDING_PER_RUN,
+) -> str:
+    """continue, skip_saved, keep_pending ou download."""
+    if not found:
+        return "continue"
+    if xml_already_saved:
+        return "skip_saved"
+    if downloads_used >= batch_limit:
+        return "keep_pending"
+    return "download"
+
+
+def should_request_xml(*, xml_already_saved: bool) -> bool:
+    return not xml_already_saved
+
+
+def parked_note_is_eligible(*, ultimo_erro: str | None, xml_exists: bool) -> bool:
+    """Cancelamento do operador sem XML volta à fila. Falha permanente e XML salvo não voltam."""
+    if xml_exists:
+        return False
+    text = str(ultimo_erro or "")
+    if "após 3 tentativas" in text or "apos 3 tentativas" in text:
+        return False
+    return text == CANCELLED_QUEUE_ERROR
+
+
+def handle_discovered_key(
+    *,
+    xml_already_saved: bool,
+    downloads_used: int,
+    batch_limit: int,
+    download,
+) -> str:
+    """skip_saved, keep_pending, pause ou download. download() devolve ok, pause ou failed."""
+    plan = discovery_download_plan(
+        found=True,
+        xml_already_saved=xml_already_saved,
+        downloads_used=downloads_used,
+        batch_limit=batch_limit,
+    )
+    if plan != "download":
+        return plan
+    status = download()
+    if status == "pause":
+        return "pause"
+    return "download"
+
+
+class SvrsRateLimiter:
+    """Relógio único do processo. SOAP e download não dividem o mesmo espaçamento.
+
+    O canal de download tem available, cooldown e half_open.
     O teste injeta clock e sleep. Produção usa time.monotonic e time.sleep.
+    Vários processos Render exigiriam coordenação no banco. Hoje há um processo.
     """
 
     def __init__(
@@ -272,15 +397,92 @@ class SvrsRateLimiter:
         download_seconds: float = 90,
         clock: Any = None,
         sleep: Any = None,
+        cooldown_seconds: float | None = None,
     ) -> None:
         self.soap_seconds = max(0.0, float(soap_seconds))
         self.download_seconds = max(0.0, float(download_seconds))
+        self.cooldown_seconds = (
+            float(cooldown_seconds) if cooldown_seconds is not None else sefaz_cooldown_seconds()
+        )
         self._clock = clock or time.monotonic
         self._sleep = sleep or time.sleep
         self._lock = threading.Lock()
         self._next = {"soap": 0.0, "download": 0.0}
+        self._download_state = "available"
+        self._cooldown_until = 0.0
+        self._probe_issued = False
+
+    def download_state(self) -> str:
+        with self._lock:
+            self._roll_download_state_locked(float(self._clock()))
+            return self._download_state
+
+    def download_admission(self) -> bool:
+        """False enquanto o cooldown não venceu ou a sonda half_open já saiu."""
+        with self._lock:
+            now = float(self._clock())
+            self._roll_download_state_locked(now)
+            if self._download_state == "cooldown":
+                return False
+            if self._download_state == "half_open" and self._probe_issued:
+                return False
+            return True
+
+    def _roll_download_state_locked(self, now: float) -> None:
+        if self._download_state == "cooldown" and now >= self._cooldown_until:
+            self._download_state = "half_open"
+            self._probe_issued = False
+
+    def note_remote_limit(self) -> None:
+        with self._lock:
+            now = float(self._clock())
+            self._download_state = "cooldown"
+            self._cooldown_until = now + self.cooldown_seconds
+            self._probe_issued = False
+            self._next["download"] = self._cooldown_until
+
+    def note_download_ok(self) -> None:
+        with self._lock:
+            if self._download_state == "half_open":
+                self._download_state = "available"
+                self._probe_issued = False
+
+    def begin_download(self) -> str:
+        """call libera uma requisição. skip não chama o portal."""
+        mode = "allow"
+        with self._lock:
+            now = float(self._clock())
+            self._roll_download_state_locked(now)
+            if self._download_state == "cooldown":
+                delay = max(0.0, self._cooldown_until - now)
+                mode = "cooldown"
+            elif self._download_state == "half_open" and self._probe_issued:
+                return "skip"
+            elif self._download_state == "half_open":
+                self._probe_issued = True
+                delay = 0.0
+                mode = "probe"
+            else:
+                delay = self._next.get("download", 0.0) - now
+                if delay < 0:
+                    delay = 0.0
+                self._next["download"] = now + delay + self.download_seconds
+                mode = "allow"
+        if delay > 0:
+            self._sleep(delay)
+            if mode == "cooldown":
+                with self._lock:
+                    self._roll_download_state_locked(float(self._clock()))
+                    self._download_state = "half_open"
+                    self._probe_issued = True
+        return "call"
 
     def wait(self, channel: str) -> float:
+        if channel == "download" and self.download_state() == "cooldown":
+            decision = self.begin_download()
+            if decision == "skip":
+                return 0.0
+            return 0.0
         spacing = self.soap_seconds if channel == "soap" else self.download_seconds
         with self._lock:
             now = float(self._clock())
@@ -293,10 +495,13 @@ class SvrsRateLimiter:
         return delay
 
     def arm_same_key_retry(self, seconds: float) -> None:
-        """A próxima espera do download desta chave fica em `seconds`, não em 90 s."""
+        """A próxima espera do download desta chave fica em `seconds`, sem furar o cooldown."""
         with self._lock:
             now = float(self._clock())
-            self._next["download"] = now + max(0.0, float(seconds))
+            target = now + max(0.0, float(seconds))
+            if self._download_state == "cooldown":
+                target = max(target, self._cooldown_until)
+            self._next["download"] = target
 
 
 def discovery_action(status: str, artificial: str, real_key: str) -> tuple[str, str]:
@@ -343,8 +548,8 @@ def download_retries_immediately(kind: str, attempt: int) -> bool:
 
 
 def download_retries_same_key(kind: str, attempt: int) -> bool:
-    """Página sem XML ou limite: a mesma chave volta depois de 60 s, até 3 vezes."""
-    if kind not in {"rate_limit", "no_xml"}:
+    """Página sem XML: a mesma chave volta depois de 60 s, até 3 vezes. Limite entra em cooldown."""
+    if kind != "no_xml":
         return False
     return attempt + 1 < PORTAL_EMPTY_RETRY_LIMIT
 
@@ -377,6 +582,226 @@ def reset_shared_rate_limiter() -> None:
         _shared_limiter = None
 
 
+class TransportCircuitBreaker:
+    """Aberto só por falha de transporte. Limite do portal não abre o circuito."""
+
+    def __init__(
+        self,
+        threshold: int = CIRCUIT_FAILURE_THRESHOLD,
+        cooldown_seconds: float | None = None,
+        clock: Any = None,
+    ) -> None:
+        self.threshold = max(1, int(threshold))
+        self.cooldown_seconds = (
+            float(cooldown_seconds) if cooldown_seconds is not None else sefaz_cooldown_seconds()
+        )
+        self._clock = clock or time.monotonic
+        self._lock = threading.Lock()
+        self.state = "closed"
+        self.failures = 0
+        self.open_until = 0.0
+        self.probe_used = False
+
+    def allow_call(self) -> bool:
+        with self._lock:
+            now = float(self._clock())
+            if self.state == "open":
+                if now < self.open_until:
+                    return False
+                self.state = "half_open"
+                self.probe_used = False
+            if self.state == "half_open":
+                if self.probe_used:
+                    return False
+                self.probe_used = True
+                return True
+            return True
+
+    def note_success(self) -> None:
+        with self._lock:
+            self.state = "closed"
+            self.failures = 0
+            self.probe_used = False
+
+    def note_transport_failure(self) -> None:
+        with self._lock:
+            now = float(self._clock())
+            if self.state == "half_open":
+                self.state = "open"
+                self.open_until = now + self.cooldown_seconds
+                self.probe_used = False
+                return
+            self.failures += 1
+            if self.failures >= self.threshold:
+                self.state = "open"
+                self.open_until = now + self.cooldown_seconds
+
+
+_shared_circuit: TransportCircuitBreaker | None = None
+_shared_circuit_guard = threading.Lock()
+
+
+def shared_transport_circuit() -> TransportCircuitBreaker:
+    global _shared_circuit
+    with _shared_circuit_guard:
+        if _shared_circuit is None:
+            _shared_circuit = TransportCircuitBreaker()
+        return _shared_circuit
+
+
+def reset_shared_transport_circuit() -> None:
+    global _shared_circuit
+    with _shared_circuit_guard:
+        _shared_circuit = None
+
+
+@dataclass
+class OutboundRoute:
+    outbound_id: str
+    proxy_url: str | None = None
+    username: str = ""
+    password: str = ""
+    health: str = "healthy"
+    unhealthy_until: float = 0.0
+
+
+class OutboundTransportManager:
+    """Saída de rede. PROXY_ENABLED=false usa a conexão direta do processo.
+
+    Falha de proxy pode trocar de saída. Resposta de limite da SVRS não troca.
+    """
+
+    def __init__(
+        self,
+        routes: list[OutboundRoute],
+        enabled: bool = False,
+        cooldown_seconds: float | None = None,
+        clock: Any = None,
+    ) -> None:
+        self.routes = routes or [OutboundRoute("direct", None)]
+        self.enabled = enabled and any(route.proxy_url for route in self.routes)
+        self.cooldown_seconds = (
+            float(cooldown_seconds) if cooldown_seconds is not None else sefaz_cooldown_seconds()
+        )
+        self._clock = clock or time.monotonic
+        self._lock = threading.Lock()
+        self.index = 0
+
+    @classmethod
+    def from_env(cls, environ: dict[str, str] | None = None) -> "OutboundTransportManager":
+        env = environ if environ is not None else os.environ
+        enabled = str(env.get("PROXY_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "sim"}
+        if not enabled:
+            return cls([OutboundRoute("direct", None)], enabled=False)
+        specs = [("outbound-1", "PROXY_URL", "PROXY_USERNAME", "PROXY_PASSWORD")]
+        specs += [
+            (f"outbound-{number}", f"PROXY_URL_{number}", f"PROXY_USERNAME_{number}", f"PROXY_PASSWORD_{number}")
+            for number in (2, 3)
+        ]
+        routes: list[OutboundRoute] = []
+        for outbound_id, url_key, user_key, password_key in specs:
+            proxy_url = str(env.get(url_key) or "").strip()
+            if not proxy_url:
+                continue
+            routes.append(
+                OutboundRoute(
+                    outbound_id,
+                    proxy_url,
+                    str(env.get(user_key) or ""),
+                    str(env.get(password_key) or ""),
+                )
+            )
+        if not routes:
+            return cls([OutboundRoute("direct", None)], enabled=False)
+        return cls(routes, enabled=True)
+
+    def current(self) -> OutboundRoute:
+        with self._lock:
+            self._refresh_locked(float(self._clock()))
+            return self.routes[self.index]
+
+    def _refresh_locked(self, now: float) -> None:
+        for route in self.routes:
+            if route.health == "unhealthy" and now >= route.unhealthy_until:
+                route.health = "healthy"
+        if self.routes[self.index].health == "healthy":
+            return
+        for step in range(1, len(self.routes) + 1):
+            candidate = (self.index + step) % len(self.routes)
+            if self.routes[candidate].health == "healthy":
+                self.index = candidate
+                return
+
+    def _proxy_auth_url(self, route: OutboundRoute) -> str:
+        raw = str(route.proxy_url or "")
+        if not route.username:
+            return raw
+        parsed = urlparse(raw)
+        host = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port else ""
+        scheme = parsed.scheme or "http"
+        user = quote(route.username, safe="")
+        password = quote(route.password, safe="")
+        return f"{scheme}://{user}:{password}@{host}{port}"
+
+    def requests_proxies(self) -> dict[str, str] | None:
+        if not self.enabled:
+            return None
+        route = self.current()
+        if not route.proxy_url:
+            return None
+        url = self._proxy_auth_url(route)
+        return {"http": url, "https": url}
+
+    def apply(self, session: requests.Session) -> None:
+        """Define o proxy da sessão. Não altera session.verify."""
+        session.proxies.clear()
+        proxies = self.requests_proxies()
+        if proxies:
+            session.proxies.update(proxies)
+
+    def note_infrastructure_failure(self) -> bool:
+        with self._lock:
+            now = float(self._clock())
+            current = self.routes[self.index]
+            current.health = "unhealthy"
+            current.unhealthy_until = now + self.cooldown_seconds
+            origin = self.index
+            for step in range(1, len(self.routes) + 1):
+                candidate = (origin + step) % len(self.routes)
+                if candidate != origin and self.routes[candidate].health == "healthy":
+                    self.index = candidate
+                    return True
+            return False
+
+    def note_remote_limit(self) -> None:
+        """Limite da SVRS não troca a saída."""
+        return None
+
+    def note_success(self) -> None:
+        with self._lock:
+            self.routes[self.index].health = "healthy"
+            self.routes[self.index].unhealthy_until = 0.0
+
+
+_shared_transport: OutboundTransportManager | None = None
+_shared_transport_guard = threading.Lock()
+
+
+def shared_outbound_transport() -> OutboundTransportManager:
+    global _shared_transport
+    with _shared_transport_guard:
+        if _shared_transport is None:
+            _shared_transport = OutboundTransportManager.from_env()
+        return _shared_transport
+
+
+def reset_shared_outbound_transport() -> None:
+    global _shared_transport
+    with _shared_transport_guard:
+        _shared_transport = None
+
+
 def callback_backoff_seconds(attempt: int, jitter_seconds: float = 0) -> float:
     return (0.5 * (2 ** attempt)) + max(0.0, jitter_seconds)
 
@@ -385,6 +810,17 @@ _LOG_SECRET = re.compile(
     r"senha|password|pfx|private|jwt|service_role|authorization|token|secret|apikey",
     re.I,
 )
+
+
+def _redact_log_value(value: Any) -> Any:
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    text = str(value)
+    if "BEGIN " in text or text.startswith("eyJ") or "Bearer " in text:
+        return ""
+    if "://" in text and "@" in text:
+        return "[redacted-url]"
+    return value
 
 
 def log_attempt(
@@ -401,8 +837,18 @@ def log_attempt(
     categoria: str,
     retry: bool = False,
     proxima_tentativa: str = "",
+    fase: str = "",
+    resultado: str = "",
+    backoff: str = "",
+    cooldown: str = "",
+    circuit_state: str = "",
+    proxy_enabled: bool | None = None,
+    outbound_id: str = "",
+    outbound_health: str = "",
+    failover: bool = False,
+    cstat: str = "",
 ) -> dict[str, Any]:
-    """Registro da tentativa. Senha, PFX, JWT e token não entram."""
+    """Registro da tentativa. Senha, PFX, JWT, token e URL com credencial não entram."""
     raw = {
         "run_id": run_id,
         "empresa_id": empresa_id,
@@ -410,22 +856,29 @@ def log_attempt(
         "nnf": nnf,
         "chave": chave,
         "etapa": etapa,
+        "fase": fase or etapa,
         "tentativa": tentativa,
         "duracao_ms": duracao_ms,
         "http": http,
+        "status_http": http,
+        "cstat": cstat,
         "categoria": categoria,
+        "resultado": resultado or categoria,
         "retry": retry,
+        "backoff": backoff,
+        "cooldown": cooldown,
+        "circuit_state": circuit_state,
         "proxima_tentativa": proxima_tentativa,
+        "proxy_enabled": proxy_enabled,
+        "outbound_id": outbound_id,
+        "outbound_health": outbound_health,
+        "failover": failover,
     }
     record: dict[str, Any] = {}
     for key, value in raw.items():
         if _LOG_SECRET.search(key):
             continue
-        text = "" if value is None else str(value)
-        if "BEGIN " in text or text.startswith("eyJ") or "Bearer " in text:
-            record[key] = ""
-            continue
-        record[key] = value
+        record[key] = _redact_log_value(value)
     logging.getLogger("nfce_download").info(json.dumps(record, ensure_ascii=False))
     return record
 
@@ -457,14 +910,14 @@ _UNAVAILABLE_HINTS = (
 
 
 def classify_portal_body(status_code: int, text: str) -> str:
-    """Classifica a página da SVRS: rate_limit, unavailable ou no_xml."""
-    if status_code in {429, 503}:
-        return "rate_limit"
+    """rate_limit no 429 ou no HTML de bloqueio. 503 sem esse texto é falha transitória."""
     sample = html.unescape(text or "")[:8000].lower()
-    if any(hint in sample for hint in _RATE_LIMIT_HINTS):
+    if status_code == 429 or any(hint in sample for hint in _RATE_LIMIT_HINTS):
         return "rate_limit"
     if any(hint in sample for hint in _UNAVAILABLE_HINTS):
         return "unavailable"
+    if status_code >= 500:
+        return "http"
     return "no_xml"
 
 
@@ -489,6 +942,16 @@ def download_failure_message(kind: str, status_code: int = 0) -> str:
         return (
             f"A SVRS retornou erro{code}. "
             "A chave continua na fila para o próximo lote."
+        )
+    if kind == "circuit_open":
+        return (
+            "Consulta à SVRS em pausa depois de falhas de rede seguidas. "
+            "Esta NFC-e continua na fila."
+        )
+    if kind == "proxy":
+        return (
+            "A saída de rede configurada falhou antes de alcançar a SVRS. "
+            "Esta NFC-e continua na fila."
         )
     return (
         "O portal da SVRS respondeu, mas não trouxe o XML desta chave. "
@@ -674,23 +1137,49 @@ def _consult_logged(
     aamm: str,
     run_id: str,
     empresa_id: str,
+    circuit: TransportCircuitBreaker | None = None,
+    transport: OutboundTransportManager | None = None,
 ) -> tuple[str, str, str]:
     started = time.perf_counter()
     http_status: int | None = None
     categoria = "UNKNOWN"
+    failover = False
+    route = transport.current() if transport else None
     try:
+        if circuit and not circuit.allow_call():
+            categoria = "circuit_open"
+            return "", "circuit_open", ""
         status, reason, real_key = _consult(session, cfg, number, aamm)
         categoria = status or "UNKNOWN"
+        if circuit:
+            circuit.note_success()
+        if transport:
+            transport.note_success()
         return status, reason, real_key
+    except requests.exceptions.ProxyError:
+        categoria = "proxy"
+        failover = bool(transport and transport.note_infrastructure_failure())
+        if failover and transport:
+            transport.apply(session)
+            route = transport.current()
+        if circuit:
+            circuit.note_transport_failure()
+        return "", "proxy", ""
     except requests.HTTPError as exc:
         http_status = exc.response.status_code if exc.response is not None else None
         categoria = "REMOTE_5XX" if http_status and http_status >= 500 else "HTTP"
+        if circuit and http_status and http_status >= 500:
+            circuit.note_transport_failure()
         raise
     except requests.Timeout:
         categoria = "TIMEOUT"
+        if circuit:
+            circuit.note_transport_failure()
         raise
     except requests.RequestException:
         categoria = "NETWORK_ERROR"
+        if circuit:
+            circuit.note_transport_failure()
         raise
     finally:
         log_attempt(
@@ -699,20 +1188,33 @@ def _consult_logged(
             aamm=aamm,
             nnf=number,
             chave=access_key(cfg, number, aamm),
-            etapa="soap",
+            etapa="consulta",
             tentativa=1,
             duracao_ms=int((time.perf_counter() - started) * 1000),
             http=http_status,
             categoria=categoria,
-            retry=False,
+            retry=failover,
+            cstat=categoria if categoria.isdigit() else "",
+            circuit_state=circuit.state if circuit else "",
+            proxy_enabled=bool(transport and transport.enabled),
+            outbound_id=route.outbound_id if route else "direct",
+            outbound_health=route.health if route else "healthy",
+            failover=failover,
         )
 
 
-def _new_svrs_session(cert_path: Path, key_path: Path, verify_path: str) -> requests.Session:
-    """Cria uma Session independente para uso seguro por uma thread."""
+def _new_svrs_session(
+    cert_path: Path,
+    key_path: Path,
+    verify_path: str,
+    transport: OutboundTransportManager | None = None,
+) -> requests.Session:
+    """Session com certificado cliente e verify no bundle. Proxy só se estiver ligado."""
     session = requests.Session()
     session.cert = (str(cert_path), str(key_path))
     session.verify = verify_path
+    if transport is not None:
+        transport.apply(session)
     return session
 
 
@@ -729,7 +1231,7 @@ def _portal_http_failure(response: requests.Response) -> tuple[str, str] | None:
     if response.status_code < 400:
         return None
     kind = classify_portal_body(response.status_code, response.text)
-    if kind == "rate_limit" or response.status_code in {429, 503}:
+    if kind == "rate_limit" or response.status_code == 429:
         return "rate_limit", download_failure_message("rate_limit", response.status_code)
     if kind == "unavailable":
         return "unavailable", download_failure_message("unavailable")
@@ -745,42 +1247,105 @@ def _download_one(
     run_id: str = "",
     empresa_id: str = "",
     notify=None,
+    session: requests.Session | None = None,
+    transport: OutboundTransportManager | None = None,
+    circuit: TransportCircuitBreaker | None = None,
 ) -> tuple[dict[str, Any], str | None, str, str]:
-    """Até 3 tentativas. Página sem XML repete a mesma chave depois de 60 s.
+    """Até 3 tentativas. Limite do portal entra em cooldown. Página sem XML repete a chave.
 
     O limitador espaça cada par GET+POST. GET e POST da mesma chave não esperam.
+    verify permanece no bundle passado em verify_path.
     """
-    session = _new_svrs_session(cert_path, key_path, verify_path)
+    owns_session = session is None
+    active_session = session or _new_svrs_session(cert_path, key_path, verify_path, transport)
     interval = clamp_download_interval(int(item.get("_download_interval_seconds", SVRS_INTERVAL_MIN_SECONDS)))
     active = limiter or SvrsRateLimiter(soap_seconds=0.1, download_seconds=interval)
+    breaker = circuit
+    route = transport.current() if transport else None
     try:
         kind = "no_xml"
         message = download_failure_message("no_xml")
-        for attempt in range(3):
-            if attempt:
+        for attempt in range(sefaz_max_retries()):
+            if breaker and not breaker.allow_call():
+                kind = "circuit_open"
+                message = download_failure_message("circuit_open")
+                log_attempt(
+                    run_id=run_id,
+                    empresa_id=empresa_id,
+                    aamm=str(item.get("AAMM") or ""),
+                    nnf=int(item["nNF"]) if item.get("nNF") is not None else None,
+                    chave=str(item.get("chave_real") or ""),
+                    etapa="download",
+                    tentativa=attempt + 1,
+                    duracao_ms=0,
+                    http=None,
+                    categoria=kind,
+                    retry=False,
+                    circuit_state=breaker.state,
+                    proxy_enabled=bool(transport and transport.enabled),
+                    outbound_id=route.outbound_id if route else "direct",
+                    outbound_health=route.health if route else "healthy",
+                )
+                return item, None, message, kind
+            if attempt and kind == "no_xml":
                 active.arm_same_key_retry(PORTAL_EMPTY_RETRY_SECONDS)
                 if notify:
                     notify(attempt)
-            waited = active.wait("download")
-            if notify and attempt == 0 and waited > 0:
+            elif attempt and failure_policy(kind) == "backoff":
+                delay = transient_backoff_seconds(attempt - 1)
+                active.arm_same_key_retry(delay)
+                if notify:
+                    notify(attempt)
+            slot = active.begin_download()
+            if slot == "skip":
+                active.note_remote_limit()
+                kind = "rate_limit"
+                message = download_failure_message("rate_limit")
+                return item, None, message, kind
+            if notify and attempt == 0:
                 notify(attempt)
             started = time.perf_counter()
             http_status: int | None = None
+            failover = False
             try:
-                xml, kind, message, http_status = _download(session, item["chave_real"])
+                xml, kind, message, http_status = _download(active_session, item["chave_real"])
                 if xml:
                     kind = "ok"
             except requests.Timeout:
                 xml, kind, message = None, "timeout", download_failure_message("timeout")
+                if breaker:
+                    breaker.note_transport_failure()
+            except requests.exceptions.ProxyError:
+                xml, kind, message = None, "proxy", download_failure_message("proxy")
+                failover = bool(transport and transport.note_infrastructure_failure())
+                if failover and transport:
+                    transport.apply(active_session)
+                    route = transport.current()
+                if breaker:
+                    breaker.note_transport_failure()
             except requests.RequestException as exc:
                 text = str(exc)
-                if "429" in text or "503" in text:
+                if "429" in text:
                     xml, kind, message = None, "rate_limit", download_failure_message("rate_limit")
                 else:
                     xml, kind, message = None, "http", download_failure_message("http")
+                    if breaker:
+                        breaker.note_transport_failure()
+            if kind == "ok":
+                if breaker:
+                    breaker.note_success()
+                active.note_download_ok()
+                if transport:
+                    transport.note_success()
+            elif kind == "rate_limit":
+                active.note_remote_limit()
+                if transport:
+                    transport.note_remote_limit()
+            elif kind == "http" and breaker and http_status is not None and http_status >= 500:
+                breaker.note_transport_failure()
             proxima = ""
             if kind == "rate_limit":
-                proxima = (datetime.now(timezone.utc) + timedelta(seconds=interval)).isoformat()
+                proxima = (datetime.now(timezone.utc) + timedelta(seconds=active.cooldown_seconds)).isoformat()
             log_attempt(
                 run_id=run_id,
                 empresa_id=empresa_id,
@@ -795,17 +1360,30 @@ def _download_one(
                 retry=(
                     download_retries_immediately(kind, attempt)
                     or download_retries_same_key(kind, attempt)
+                    or (kind == "proxy" and failover)
                 ),
                 proxima_tentativa=proxima,
+                backoff=str(transient_backoff_seconds(attempt, 0)) if failure_policy(kind) == "backoff" else "",
+                cooldown=active.download_state() if kind == "rate_limit" else "",
+                circuit_state=breaker.state if breaker else "",
+                proxy_enabled=bool(transport and transport.enabled),
+                outbound_id=route.outbound_id if route else "direct",
+                outbound_health=route.health if route else "healthy",
+                failover=failover,
             )
             if xml:
                 return item, xml, "", "ok"
+            if kind == "rate_limit":
+                return item, None, message, kind
+            if kind == "proxy" and failover:
+                continue
             if download_retries_immediately(kind, attempt) or download_retries_same_key(kind, attempt):
                 continue
             return item, None, message, kind
         return item, None, message, kind
     finally:
-        session.close()
+        if owns_session:
+            active_session.close()
 
 
 def _download(session: requests.Session, key: str) -> tuple[str | None, str, str, int | None]:
@@ -860,11 +1438,15 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         if aamm_order(cfg["aamm"]) > aamm_order(current_aamm()):
             raise ValueError("A competência do XML semente está no futuro.")
         cert_path, key_path, cert_cnpj = _certificate_files(pfx_bytes, password, job.directory)
-        if cert_cnpj and cert_cnpj != cfg["cnpj"]:
+        if certificate_mismatch_stops(cert_cnpj, cfg["cnpj"]):
             raise ValueError("O CNPJ do certificado é diferente do emitente do XML.")
 
         verify_path = svrs_ca_bundle()
-        session = _new_svrs_session(cert_path, key_path, verify_path)
+        transport = shared_outbound_transport()
+        circuit = shared_transport_circuit()
+        session = _new_svrs_session(cert_path, key_path, verify_path, transport)
+        saved_keys = {str(key) for key in (options.get("saved_keys") or []) if str(key)}
+        run_slots = 0
         records: list[dict[str, Any]] = []
         pending_items = list(options.get("pending_items") or [])
         interval_seconds = clamp_download_interval(
@@ -948,6 +1530,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     run_id=job.external_run_id or "",
                     empresa_id=job.empresa_id,
                     notify=notify_attempt,
+                    session=session,
+                    transport=transport,
+                    circuit=circuit,
                 )
 
                 if xml:
@@ -972,9 +1557,12 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         full_xml, encoding="utf-8"
                     )
                     pending_saved += 1
+                    run_slots += 1
+                    saved_keys.add(str(item["chave_real"]))
                 else:
                     failure_reason = last_download_error or download_failure_message(failure_kind)
                     pending_failed += 1
+                    run_slots += 1
                     _callback(
                         job,
                         "download_failed",
@@ -1017,7 +1605,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     message=message,
                 )
 
-                if pending_index < pending_total and interval_seconds:
+                if failure_kind in {"rate_limit", "circuit_open", "proxy"}:
+                    paused_for_svrs = True
+                    break
+
+                if pending_index < pending_total and interval_seconds and not paused_for_svrs:
                     wait_message = (
                         f"Aguardando {format_wait(interval_seconds)} · pendência "
                         f"{pending_index}/{pending_total}"
@@ -1064,7 +1656,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 ),
             )
 
-            if pending_only or paused_for_svrs:
+            if pending_only or paused_for_svrs or run_slots >= MAX_PENDING_PER_RUN:
                 _callback(
                     job,
                     "completed",
@@ -1152,6 +1744,82 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             })
             return True
 
+        halt_reason: str | None = None
+
+        def download_found(aamm: str, n_nf: int, found_key: str) -> None:
+            """Baixa na mesma execução enquanto o lote tiver vaga. Sem vaga, a chave fica pending."""
+            nonlocal halt_reason, pending_saved, pending_failed, paused_for_svrs, run_slots
+
+            def do_download() -> str:
+                nonlocal pending_saved, pending_failed, paused_for_svrs, run_slots
+                item = {
+                    "AAMM": aamm,
+                    "nNF": n_nf,
+                    "chave_real": found_key,
+                    "_download_interval_seconds": interval_seconds,
+                }
+                _item, xml, error, kind = _download_one(
+                    cert_path,
+                    key_path,
+                    verify_path,
+                    item,
+                    limiter,
+                    run_id=job.external_run_id or "",
+                    empresa_id=job.empresa_id,
+                    session=session,
+                    transport=transport,
+                    circuit=circuit,
+                )
+                run_slots += 1
+                if xml:
+                    full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+                    _callback(
+                        job,
+                        "file",
+                        key=found_key,
+                        aamm=aamm,
+                        number=n_nf,
+                        emitted_at=_xml_emission_date(xml),
+                        advance_cursor=False,
+                        consulted=len(records),
+                        found=len(found),
+                        mode="discovery",
+                        xml_base64=base64.b64encode(full_xml.encode("utf-8")).decode("ascii"),
+                    )
+                    (xml_dir / f"{found_key}-procNFe.xml").write_text(full_xml, encoding="utf-8")
+                    pending_saved += 1
+                    saved_keys.add(found_key)
+                    return "ok"
+                pending_failed += 1
+                _callback(
+                    job,
+                    "download_failed",
+                    key=found_key,
+                    aamm=aamm,
+                    number=n_nf,
+                    error=error or download_failure_message(kind),
+                    error_kind=kind,
+                    consulted=len(records),
+                    found=len(found),
+                    mode="discovery",
+                )
+                if kind in {"rate_limit", "circuit_open", "proxy"}:
+                    paused_for_svrs = True
+                    return "pause"
+                return "failed"
+
+            outcome = handle_discovered_key(
+                xml_already_saved=found_key in saved_keys,
+                downloads_used=run_slots,
+                batch_limit=MAX_PENDING_PER_RUN,
+                download=do_download,
+            )
+            if outcome == "keep_pending":
+                halt_reason = "batch"
+            elif outcome == "pause":
+                halt_reason = "hold"
+                paused_for_svrs = True
+
         def report_progress(message: str, force: bool = False) -> None:
             nonlocal last_progress_at
             now = time.time()
@@ -1188,6 +1856,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             status, reason, real_key = _consult_logged(
                 session, cfg, number, current_month,
                 job.external_run_id or "", job.empresa_id,
+                circuit, transport,
             )
             report_progress(f"Consultando {current_month} nNF {number}")
             record = {"AAMM": current_month, "nNF": number, "cStat": status, "xMotivo": reason, "chave_real": real_key}
@@ -1203,6 +1872,10 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             )
             if action == "found" and _found_key:
                 record["chave_real"] = _found_key
+                download_found(current_month, number, _found_key)
+            if halt_reason:
+                scan_reason = halt_reason
+                break
             if action == "hold" or not acked:
                 scan_reason = "hold" if action == "hold" else "ack"
                 break
@@ -1227,6 +1900,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         status2, reason2, real2 = _consult_logged(
                             session, cfg, probe, following,
                             job.external_run_id or "", job.empresa_id,
+                            circuit, transport,
                         )
                         probe_record = {"AAMM": following, "nNF": probe, "cStat": status2, "xMotivo": reason2, "chave_real": real2}
                         records.append(probe_record)
@@ -1246,12 +1920,19 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         )
                         if not probe_acked:
                             break
+                        if action2 == "found" and _probe_key:
+                            download_found(following, probe, _probe_key)
+                        if halt_reason:
+                            break
                         if action2 == "found":
                             current_month, number = following, probe + 1
                             consecutive_217, gap_start, last_probe, switched = 0, None, probe, True
                             probed_this_gap = False
                             break
                     last_probe = probe_end
+                    if halt_reason:
+                        scan_reason = halt_reason
+                        break
                     if switched:
                         continue
             if consecutive_217 >= options["stop_gap"]:
@@ -1261,13 +1942,21 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
 
         _update(
             job, consulted=len(records), found=len(found),
-            message=f"{len(found)} chave(s) na fila. O download corre em outro job.",
+            message=(
+                f"{pending_saved} XML salvos nesta execução · {len(found)} chave(s) encontradas"
+                if pending_saved
+                else f"{len(found)} chave(s) encontradas. As que ficaram sem vaga seguem na fila."
+            ),
             progress=68,
         )
         _callback(
             job, "progress",
             consulted=len(records), found=len(found), downloaded=pending_saved,
-            message=f"{len(found)} chave(s) enfileiradas. Download fica para o próximo job.",
+            message=(
+                f"{pending_saved} XML salvos nesta execução · {len(found)} chave(s) encontradas"
+                if pending_saved
+                else f"{len(found)} chave(s) encontradas. As que ficaram sem vaga seguem na fila."
+            ),
             mode="discovery",
         )
         downloaded = pending_saved
