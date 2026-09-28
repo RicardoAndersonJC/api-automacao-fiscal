@@ -6,6 +6,7 @@ import requests
 
 from nfce_download_worker import (
     CANCELLED_QUEUE_ERROR,
+    MAX_PENDING_PER_RUN,
     OutboundRoute,
     OutboundTransportManager,
     SvrsRateLimiter,
@@ -84,6 +85,9 @@ class NfceWorkerTest(unittest.TestCase):
         page = "<html>NFC-e cancelada. Documento inexistente.</html>"
         self.assertEqual(classify_portal_body(200, page), "unavailable")
         self.assertIn("cancelada ou indisponível", download_failure_message("unavailable"))
+
+    def test_pending_batch_is_unlimited(self):
+        self.assertEqual(MAX_PENDING_PER_RUN, 0)
 
     def test_cstat_100_enqueues_the_consulted_key(self):
         consulted = "1" * 44

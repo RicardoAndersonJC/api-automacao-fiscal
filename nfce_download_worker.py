@@ -63,6 +63,8 @@ _jobs: dict[str, "Job"] = {}
 # Um download por vez. Quem roda uma empresa não soma taxa no portal.
 _executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("NFCE_WORKERS", "1"))))
 DOWNLOAD_CONCURRENCY = 1
+# Compatibilidade com o health-check da API. Zero significa sem limite por lote.
+MAX_PENDING_PER_RUN = 0
 # Piso de 1 min entre downloads. Limite não confirmado pela documentação oficial.
 SVRS_INTERVAL_MIN_SECONDS = 60
 SVRS_INTERVAL_MAX_SECONDS = 120
