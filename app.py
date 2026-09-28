@@ -561,7 +561,11 @@ def processar_consulta(
         competencia = None
         persistir_nsu = False
     else:
-        competencia = garantir_competencia(competencia or "")
+        if data_inicio and data_fim:
+            periodo_inicio, periodo_fim = garantir_periodo_recuperacao(data_inicio, data_fim)
+            competencia = garantir_competencia(competencia or periodo_fim.strftime("%Y-%m"))
+        else:
+            competencia = garantir_competencia(competencia or "")
 
     cert_path = None
     key_path = None
@@ -671,14 +675,14 @@ def processar_consulta(
 
                 data_doc = extrair_data_documento(resumo.get("dh_emi"))
                 competencia_destino = comp_doc or "_SEM_COMPETENCIA_"
+                usa_janela_por_data = periodo_inicio is not None and periodo_fim is not None
                 fora_do_escopo = (
-                    modo_recuperacao
+                    usa_janela_por_data
                     and data_doc is not None
-                    and periodo_inicio is not None
-                    and periodo_fim is not None
                     and not (periodo_inicio <= data_doc <= periodo_fim)
                 ) or (
-                    not modo_recuperacao
+                    not usa_janela_por_data
+                    and not modo_recuperacao
                     and not mesmo_mes(resumo.get("dh_emi"), competencia)
                 )
                 if fora_do_escopo:
@@ -750,7 +754,7 @@ def processar_consulta(
                         "chave": chave,
                         "competencia": comp_doc,
                         "acao": "ignorado" if somente_completas else "salvo",
-                        "motivo": None if not somente_completas else "Não é XML completo",
+                        "motivo": None if not somente_completas else "N\u00e3o \u00e9 XML completo",
                     }
                 )
 
@@ -826,11 +830,11 @@ def processar_consulta(
                         comp_doc = extrair_competencia_de_data(resumo.get("dh_emi"))
 
                         data_doc = extrair_data_documento(resumo.get("dh_emi"))
+                        usa_janela = periodo_inicio is not None and periodo_fim is not None
                         dentro_do_escopo = (
-                            periodo_inicio is not None
-                            and periodo_fim is not None
+                            usa_janela
                             and (data_doc is None or periodo_inicio <= data_doc <= periodo_fim)
-                        ) if modo_recuperacao else mesmo_mes(resumo.get("dh_emi"), competencia)
+                        ) if usa_janela else mesmo_mes(resumo.get("dh_emi"), competencia)
                         if categoria != "completo" or not dentro_do_escopo:
                             continue
 
