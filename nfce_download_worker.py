@@ -63,8 +63,6 @@ _jobs: dict[str, "Job"] = {}
 # Um download por vez. Quem roda uma empresa não soma taxa no portal.
 _executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("NFCE_WORKERS", "1"))))
 DOWNLOAD_CONCURRENCY = 1
-# floor(1200s / p50 183s) = 6. Cabe na janela de 20 min sem heartbeat.
-MAX_PENDING_PER_RUN = max(1, min(6, int(os.getenv("NFCE_MAX_PENDING_PER_RUN", "6"))))
 # Piso de 1 min entre downloads. Limite não confirmado pela documentação oficial.
 SVRS_INTERVAL_MIN_SECONDS = 60
 SVRS_INTERVAL_MAX_SECONDS = 120
@@ -334,16 +332,12 @@ def discovery_download_plan(
     *,
     found: bool,
     xml_already_saved: bool,
-    downloads_used: int,
-    batch_limit: int = MAX_PENDING_PER_RUN,
 ) -> str:
-    """continue, skip_saved, keep_pending ou download."""
+    """continue, skip_saved ou download; não limita a quantidade por execução."""
     if not found:
         return "continue"
     if xml_already_saved:
         return "skip_saved"
-    if downloads_used >= batch_limit:
-        return "keep_pending"
     return "download"
 
 
@@ -364,16 +358,12 @@ def parked_note_is_eligible(*, ultimo_erro: str | None, xml_exists: bool) -> boo
 def handle_discovered_key(
     *,
     xml_already_saved: bool,
-    downloads_used: int,
-    batch_limit: int,
     download,
 ) -> str:
-    """skip_saved, keep_pending, pause ou download. download() devolve ok, pause ou failed."""
+    """skip_saved, pause ou download. download() devolve ok, pause ou failed."""
     plan = discovery_download_plan(
         found=True,
         xml_already_saved=xml_already_saved,
-        downloads_used=downloads_used,
-        batch_limit=batch_limit,
     )
     if plan != "download":
         return plan
@@ -446,6 +436,8 @@ class SvrsRateLimiter:
             if self._download_state == "half_open":
                 self._download_state = "available"
                 self._probe_issued = False
+                now = float(self._clock())
+                self._next["download"] = now + self.download_seconds
 
     def begin_download(self) -> str:
         """call libera uma requisição. skip não chama o portal."""
@@ -1438,7 +1430,26 @@ def _download(session: requests.Session, key: str) -> tuple[str | None, str, str
     return None, kind, download_failure_message(kind, post_response.status_code), post_response.status_code
 
 
+def _live_jobs_locked() -> list[Job]:
+    """Job sem atualização há 8 min não ocupa vaga. O download real avisa a cada XML."""
+    now = time.time()
+    live: list[Job] = []
+    for item in _jobs.values():
+        if item.status not in {"queued", "running"}:
+            continue
+        if now - float(item.updated_at) > 8 * 60:
+            item.status = "failed"
+            item.error = "Sem sinal do worker; a vaga foi liberada."
+            item.message = "Vaga liberada"
+            item.updated_at = now
+            continue
+        live.append(item)
+    return live
+
+
 def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, options: dict[str, Any]) -> None:
+    if job.status == "failed":
+        return
     cert_path: Path | None = None
     key_path: Path | None = None
     session: requests.Session | None = None
@@ -1456,7 +1467,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         circuit = shared_transport_circuit()
         session = _new_svrs_session(cert_path, key_path, verify_path, transport)
         saved_keys = {str(key) for key in (options.get("saved_keys") or []) if str(key)}
-        run_slots = 0
         records: list[dict[str, Any]] = []
         pending_items = list(options.get("pending_items") or [])
         interval_seconds = clamp_download_interval(
@@ -1473,23 +1483,16 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
 
         # Reprocessa primeiro a fila persistente enviada pela Edge Function.
         # Pendências NÃO contam como "encontradas" da varredura e NÃO avançam o cursor.
-        # Lote limitado: a Edge reinicia a empresa até esgotar a fila.
+        # Processa todas as pendências prontas. Só uma resposta de contenção da
+        # SVRS pausa a execução; não existe mais corte artificial em 6 notas.
         pending_saved = 0
         pending_failed = 0
         if pending_items:
-            pending_queue = list(pending_items)[:MAX_PENDING_PER_RUN]
+            pending_queue = list(pending_items)
             pending_total = len(pending_queue)
-            pending_remaining = max(0, len(pending_items) - pending_total)
             _update(
                 job,
-                message=(
-                    f"Recuperando {pending_total} pendência(s)"
-                    + (
-                        f" ({pending_remaining} ficam para a próxima execução)"
-                        if pending_remaining
-                        else ""
-                    )
-                ),
+                message=f"Recuperando {pending_total} pendência(s) até esgotar a fila",
                 progress=2,
             )
             _callback(
@@ -1499,12 +1502,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 found=0,
                 downloaded=0,
                 pending_total=pending_total,
-                pending_remaining=pending_remaining,
                 mode="pending_recovery",
-                message=(
-                    f"Recuperando pendências: 0/{pending_total} · "
-                    f"{pending_remaining} restantes na fila"
-                ),
+                message=f"Recuperando pendências: 0/{pending_total}",
             )
 
             for pending_index, pending in enumerate(pending_queue, 1):
@@ -1527,7 +1526,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         downloaded=pending_saved,
                         pending_total=pending_total,
                         pending_failed=pending_failed,
-                        pending_remaining=pending_remaining,
                         mode="pending_recovery",
                         message=(
                             f"Aguardando {format_wait(espera)} · pendência "
@@ -1567,12 +1565,10 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         full_xml, encoding="utf-8"
                     )
                     pending_saved += 1
-                    run_slots += 1
                     saved_keys.add(str(item["chave_real"]))
                 else:
                     failure_reason = last_download_error or download_failure_message(failure_kind)
                     pending_failed += 1
-                    run_slots += 1
                     _callback(
                         job,
                         "download_failed",
@@ -1590,11 +1586,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 message = (
                     f"Recuperando pendências: {pending_index}/{pending_total} · "
                     f"{pending_saved} salvas · {pending_failed} falhas"
-                    + (
-                        f" · {pending_remaining} na fila"
-                        if pending_remaining
-                        else ""
-                    )
                 )
                 _update(
                     job,
@@ -1610,7 +1601,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     downloaded=pending_saved,
                     pending_total=pending_total,
                     pending_failed=pending_failed,
-                    pending_remaining=pending_remaining,
                     mode="pending_recovery",
                     message=message,
                 )
@@ -1633,7 +1623,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         downloaded=pending_saved,
                         pending_total=pending_total,
                         pending_failed=pending_failed,
-                        pending_remaining=pending_remaining,
                         mode="pending_recovery",
                         message=wait_message,
                     )
@@ -1646,7 +1635,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 downloaded=pending_saved,
                 pending_total=pending_total,
                 pending_failed=pending_failed,
-                pending_remaining=pending_remaining,
                 mode="pending_recovery",
                 message=(
                     (
@@ -1655,18 +1643,24 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     )
                     if paused_for_svrs
                     else (
-                        f"Pendências do lote: {pending_saved} salvas · "
+                        f"Pendências processadas: {pending_saved} salvas · "
                         f"{pending_failed} sem XML"
-                        + (
-                            f" · {pending_remaining} ficam para a próxima execução"
-                            if pending_remaining or pending_only
-                            else " · seguindo para varredura"
-                        )
                     )
                 ),
             )
 
-            if pending_only or paused_for_svrs or run_slots >= MAX_PENDING_PER_RUN:
+            if pending_only or paused_for_svrs:
+                _update(
+                    job,
+                    status="completed",
+                    message=(
+                        "Pausa por limite da SVRS"
+                        if paused_for_svrs
+                        else "Todas as pendências prontas foram processadas"
+                    ),
+                    progress=100,
+                    downloaded=pending_saved,
+                )
                 _callback(
                     job,
                     "completed",
@@ -1684,30 +1678,15 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         )
                         if paused_for_svrs
                         else (
-                            f"Lote de pendências: {pending_saved} salvas · "
+                            f"Pendências processadas: {pending_saved} salvas · "
                             f"{pending_failed} sem XML"
-                            + (
-                                f" · {pending_remaining} restantes na fila"
-                                if pending_remaining
-                                else ""
-                            )
                         )
                     ),
-                )
-                _update(
-                    job,
-                    status="completed",
-                    message=(
-                        "Pausa por limite da SVRS"
-                        if paused_for_svrs
-                        else "Pendências do lote processadas"
-                    ),
-                    progress=100,
-                    downloaded=pending_saved,
                 )
                 return
 
         if pending_only:
+            _update(job, status="completed", message="Pendências aguardando a próxima tentativa", progress=100, downloaded=pending_saved)
             _callback(
                 job,
                 "completed",
@@ -1720,7 +1699,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 include_cursor=False,
                 message="Nenhuma pendência pronta neste momento. A fila segue quando a próxima tentativa chegar.",
             )
-            _update(job, status="completed", message="Pendências aguardando a próxima tentativa", progress=100, downloaded=pending_saved)
             return
 
         found: list[dict[str, Any]] = []
@@ -1757,11 +1735,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         halt_reason: str | None = None
 
         def download_found(aamm: str, n_nf: int, found_key: str) -> None:
-            """Baixa na mesma execução enquanto o lote tiver vaga. Sem vaga, a chave fica pending."""
-            nonlocal halt_reason, pending_saved, pending_failed, paused_for_svrs, run_slots
+            """Baixa toda chave encontrada; só pausa se a SVRS pedir contenção."""
+            nonlocal halt_reason, pending_saved, pending_failed, paused_for_svrs
 
             def do_download() -> str:
-                nonlocal pending_saved, pending_failed, paused_for_svrs, run_slots
+                nonlocal pending_saved, pending_failed, paused_for_svrs
                 item = {
                     "AAMM": aamm,
                     "nNF": n_nf,
@@ -1780,7 +1758,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     transport=transport,
                     circuit=circuit,
                 )
-                run_slots += 1
                 if xml:
                     full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
                     _callback(
@@ -1820,13 +1797,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
 
             outcome = handle_discovered_key(
                 xml_already_saved=found_key in saved_keys,
-                downloads_used=run_slots,
-                batch_limit=MAX_PENDING_PER_RUN,
                 download=do_download,
             )
-            if outcome == "keep_pending":
-                halt_reason = "batch"
-            elif outcome == "pause":
+            if outcome == "pause":
                 halt_reason = "hold"
                 paused_for_svrs = True
 
@@ -1994,14 +1967,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 f"Concluído · pendências {pending_saved} salvas/"
                 f"{pending_failed} falhas · varredura {len(found)} na fila"
             )
-        _callback(
-            job, "completed", consulted=len(records), found=len(found), downloaded=downloaded,
-            cursor_aamm=safe_aamm, cursor_nnf=safe_nnf, include_cursor=True,
-            scan_complete=discovery_scan_complete(scan_reason, len(found)),
-            pending_saved=pending_saved, pending_failed=pending_failed,
-            pause_for_svrs=paused_for_svrs,
-            message=completion_message,
-        )
         _update(
             job,
             status="completed",
@@ -2011,6 +1976,14 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             found=len(found),
             downloaded=downloaded,
             zip_path=zip_path,
+        )
+        _callback(
+            job, "completed", consulted=len(records), found=len(found), downloaded=downloaded,
+            cursor_aamm=safe_aamm, cursor_nnf=safe_nnf, include_cursor=True,
+            scan_complete=discovery_scan_complete(scan_reason, len(found)),
+            pending_saved=pending_saved, pending_failed=pending_failed,
+            pause_for_svrs=paused_for_svrs,
+            message=completion_message,
         )
     except Exception as exc:
         _update(job, status="failed", message="Falha no processamento", error=str(exc), progress=100)
@@ -2166,7 +2139,7 @@ async def create_internal_job(
         seen_pending.add(key)
         normalized_pending.append({"chave": key, "aamm": aamm, "nnf": nnf})
     with _jobs_lock:
-        active_jobs = [item for item in _jobs.values() if item.status in {"queued", "running"}]
+        active_jobs = _live_jobs_locked()
         org = organizacao_id.strip()
         if org and not re.fullmatch(r"[0-9a-fA-F-]{36}", org):
             org = ""
@@ -2249,7 +2222,7 @@ async def create_job(
         )
     owner_id = _authenticate(authorization)
     with _jobs_lock:
-        active_jobs = [item for item in _jobs.values() if item.status in {"queued", "running"}]
+        active_jobs = _live_jobs_locked()
         if any(item.owner_id == owner_id for item in active_jobs):
             raise HTTPException(status_code=409, detail="Você já possui uma busca NFC-e em andamento.")
         if len(active_jobs) >= MAX_QUEUED_JOBS:
