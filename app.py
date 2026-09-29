@@ -249,6 +249,18 @@ def montar_xml_dist(cnpj: str, ult_nsu: str, cuf: str, ambiente: str) -> str:
 </distDFeInt>"""
 
 
+def montar_xml_cons_nsu(cnpj: str, nsu: str, cuf: str, ambiente: str) -> str:
+    tp_amb = "1" if ambiente == "producao" else "2"
+    return f"""<distDFeInt xmlns="{NFE_NS}" versao="1.01">
+    <tpAmb>{tp_amb}</tpAmb>
+    <cUFAutor>{cuf}</cUFAutor>
+    <CNPJ>{cnpj}</CNPJ>
+    <consNSU>
+        <NSU>{str(nsu).zfill(15)}</NSU>
+    </consNSU>
+</distDFeInt>"""
+
+
 def montar_envelope_dist(xml: str) -> str:
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -1055,6 +1067,147 @@ async def baixar_nfe(
             },
             status_code=500,
         )
+    finally:
+        try:
+            if cert_path and os.path.exists(cert_path):
+                os.remove(cert_path)
+        except Exception:
+            pass
+
+
+def processar_cons_nsu(
+    ambiente: str,
+    caminho_pfx: str,
+    senha: str,
+    cnpj: str,
+    cuf: str,
+    nsu: str,
+) -> dict[str, Any]:
+    """Consulta pontual consNSU — não altera ultNSU local da API."""
+    ambiente = garantir_ambiente(ambiente)
+    cnpj = garantir_cnpj(cnpj)
+    nsu_fmt = str(nsu).zfill(15)
+    if not re.fullmatch(r"\d{15}", nsu_fmt):
+        raise ValueError("NSU invalido. Use 15 digitos.")
+
+    cert_path = None
+    key_path = None
+    session = None
+    try:
+        cert_path, key_path, _, _ = extrair_certificado(caminho_pfx, senha)
+        session = requests.Session()
+        session.cert = (cert_path, key_path)
+        session.verify = True
+
+        xml_req = montar_xml_cons_nsu(cnpj, nsu_fmt, cuf, ambiente)
+        envelope = montar_envelope_dist(xml_req)
+        response = session.post(
+            ENDPOINT_DIST[ambiente],
+            data=envelope.encode("utf-8"),
+            headers={"Content-Type": "application/soap+xml; charset=utf-8"},
+            timeout=60,
+        )
+        response.raise_for_status()
+
+        ret = extrair_ret_dist(response.text)
+        cstat = ret.findtext(f"{{{NFE_NS}}}cStat", default="") or ""
+        xmotivo = ret.findtext(f"{{{NFE_NS}}}xMotivo", default="") or ""
+
+        lote = ret.find(f"{{{NFE_NS}}}loteDistDFeInt")
+        doc_zips = lote.findall(f"{{{NFE_NS}}}docZip") if lote is not None else []
+
+        documentos: list[dict[str, Any]] = []
+        arquivos: list[dict[str, Any]] = []
+        for doc_zip in doc_zips:
+            nsu_doc = doc_zip.attrib.get("NSU") or nsu_fmt
+            schema = doc_zip.attrib.get("schema", "")
+            try:
+                xml_doc = descompactar_doczip(doc_zip.text or "")
+            except Exception as exc:
+                documentos.append({
+                    "nsu": nsu_doc,
+                    "tipo": "erro",
+                    "schema": schema,
+                    "acao": "erro",
+                    "motivo": f"Falha ao descompactar docZip: {exc}",
+                })
+                continue
+            resumo = resumir_documento(xml_doc, schema)
+            tp_evento = None
+            if schema.startswith(SCHEMA_EVENTO_PREFIXES) or resumo.get("schema_categoria") == "evento":
+                try:
+                    root = ET.fromstring(xml_doc)
+                    tp_evento = root.findtext(f".//{{{NFE_NS}}}tpEvento")
+                except Exception:
+                    tp_evento = None
+            categoria = resumo.get("schema_categoria") or "outro"
+            chave = resumo.get("chave")
+            documentos.append({
+                "nsu": nsu_doc,
+                "tipo": categoria,
+                "schema": schema,
+                "chave": chave,
+                "tpEvento": tp_evento,
+                "acao": "recebido",
+            })
+            if chave:
+                doc_info = {"xml": xml_doc, "schema": schema}
+                comp = extrair_competencia_de_data(resumo.get("dh_emi")) or "_SEM_COMPETENCIA_"
+                caminho = salvar_documento(cnpj, comp, doc_info, resumo)
+                if caminho:
+                    arquivos.append(serializar_arquivo_xml(caminho))
+
+        return {
+            "success": True,
+            "cStat": cstat,
+            "xMotivo": xmotivo,
+            "nsu": nsu_fmt,
+            "documentos": documentos,
+            "arquivos": arquivos,
+        }
+    finally:
+        if session is not None:
+            session.close()
+        for path in (cert_path, key_path):
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+
+@app.post("/cons-nsu-nfe-json")
+async def cons_nsu_nfe_json(
+    ambiente: str = Form("producao"),
+    senha: str = Form(...),
+    cnpj: str = Form(...),
+    cuf: str = Form("27"),
+    nsu: str = Form(...),
+    certificado: UploadFile = File(...),
+):
+    cert_path = None
+    try:
+        pfx_bytes = await certificado.read()
+        if not pfx_bytes:
+            raise ValueError("Certificado PFX nao enviado.")
+        with tempfile.NamedTemporaryFile(prefix="cert_cons_nsu_", suffix=".pfx", delete=False) as f:
+            cert_path = f.name
+            f.write(pfx_bytes)
+        resultado = processar_cons_nsu(
+            ambiente=ambiente,
+            caminho_pfx=cert_path,
+            senha=senha,
+            cnpj=cnpj,
+            cuf=cuf,
+            nsu=nsu,
+        )
+        return JSONResponse(resultado)
+    except ValueError as exc:
+        logger.warning("cons-nsu-nfe-json rejeitado: %s", exc)
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.exception("cons-nsu-nfe-json falhou")
+        return JSONResponse({"success": False, "error": f"Falha interna consNSU: {exc}"}, status_code=500)
     finally:
         try:
             if cert_path and os.path.exists(cert_path):
