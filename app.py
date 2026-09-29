@@ -36,6 +36,7 @@ NFE_NS = "http://www.portalfiscal.inf.br/nfe"
 SOAP12_NS = "http://www.w3.org/2003/05/soap-envelope"
 WSDL_DIST_NS = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe"
 WSDL_EVENTO_NS = "http://www.portalfiscal.inf.br/nfe/wsdl/RecepcaoEvento4"
+WSDL_CONSULTA_NS = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4"
 
 TP_EVENTO_CIENCIA = "210210"
 SCHEMA_RESUMO_PREFIX = "resNFe"
@@ -50,6 +51,25 @@ ENDPOINT_DIST = {
 ENDPOINT_EVENTO = {
     "homologacao": "https://hom1.nfe.fazenda.gov.br/RecepcaoEvento4/RecepcaoEvento4.asmx",
     "producao": "https://www.nfe.fazenda.gov.br/NFeRecepcaoEvento4/NFeRecepcaoEvento4.asmx",
+}
+
+# Autorizadores da NF-e 4.00. A consulta e' definida pela UF emissora presente
+# nos dois primeiros digitos da chave, nao pela UF do destinatario.
+ENDPOINT_CONSULTA_PRODUCAO = {
+    **{uf: "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx" for uf in (
+        "11", "12", "14", "15", "16", "17", "23", "24", "25", "27", "28", "32", "33", "42", "53"
+    )},
+    "13": "https://nfe.sefaz.am.gov.br/services2/services/NfeConsulta4",
+    "21": "https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx",
+    "26": "https://nfe.sefaz.pe.gov.br/nfe-service/services/NFeConsultaProtocolo4",
+    "29": "https://nfe.sefaz.ba.gov.br/webservices/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx",
+    "31": "https://nfe.fazenda.mg.gov.br/nfe2/services/NFeConsultaProtocolo4",
+    "35": "https://nfe.fazenda.sp.gov.br/ws/nfeconsultaprotocolo4.asmx",
+    "41": "https://nfe.sefa.pr.gov.br/nfe/NFeConsultaProtocolo4",
+    "43": "https://nfe.sefazrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+    "50": "https://nfe.sefaz.ms.gov.br/ws/NFeConsultaProtocolo4",
+    "51": "https://homologacao.sefaz.mt.gov.br/nfews/v2/services/NfeConsulta4",
+    "52": "https://nfe.sefaz.go.gov.br/nfe/services/NFeConsultaProtocolo4",
 }
 
 BASE_DIR = os.path.abspath("./dados")
@@ -257,6 +277,40 @@ def montar_envelope_evento(xml: str) -> str:
     </nfeRecepcaoEventoNF>
   </soap12:Body>
 </soap12:Envelope>"""
+
+
+def montar_xml_consulta_protocolo(chave: str, ambiente: str) -> str:
+    chave = re.sub(r"\D", "", chave or "")
+    if not re.fullmatch(r"\d{44}", chave):
+        raise ValueError("Chave NF-e invalida para consulta de protocolo.")
+    tp_amb = "1" if ambiente == "producao" else "2"
+    return f'''<consSitNFe xmlns="{NFE_NS}" versao="4.00">
+  <tpAmb>{tp_amb}</tpAmb><xServ>CONSULTAR</xServ><chNFe>{chave}</chNFe>
+</consSitNFe>'''
+
+
+def montar_envelope_consulta_protocolo(xml: str) -> str:
+    return f'''<?xml version="1.0" encoding="utf-8"?>
+<soap12:Envelope xmlns:soap12="{SOAP12_NS}"><soap12:Body>
+  <nfeConsultaNF xmlns="{WSDL_CONSULTA_NS}"><nfeDadosMsg xmlns="{WSDL_CONSULTA_NS}">{xml}</nfeDadosMsg></nfeConsultaNF>
+</soap12:Body></soap12:Envelope>'''
+
+
+def consultar_protocolo_por_chave(session: requests.Session, chave: str, ambiente: str) -> dict[str, Any]:
+    chave = re.sub(r"\D", "", chave or "")
+    endpoint = ENDPOINT_CONSULTA_PRODUCAO.get(chave[:2]) if ambiente == "producao" else None
+    if not endpoint:
+        return {"chave": chave, "ok": False, "erro": "UF emissora sem endpoint de consulta configurado."}
+    try:
+        response = session.post(endpoint, data=montar_envelope_consulta_protocolo(montar_xml_consulta_protocolo(chave, ambiente)).encode("utf-8"), headers={"Content-Type": "application/soap+xml; charset=utf-8"}, timeout=60)
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+        ret = next((item for item in root.iter() if item.tag.rsplit("}", 1)[-1] == "retConsSitNFe"), root)
+        cstat = next((item.text for item in ret.iter() if item.tag.rsplit("}", 1)[-1] == "cStat"), "")
+        motivo = next((item.text for item in ret.iter() if item.tag.rsplit("}", 1)[-1] == "xMotivo"), "")
+        return {"chave": chave, "ok": True, "cStat": str(cstat or ""), "xMotivo": str(motivo or ""), "cancelada": str(cstat or "") == "101"}
+    except Exception as exc:
+        return {"chave": chave, "ok": False, "erro": str(exc)}
 
 
 def descompactar_doczip(texto_b64: str) -> str:
@@ -1007,6 +1061,59 @@ async def baixar_nfe(
                 os.remove(cert_path)
         except Exception:
             pass
+
+
+@app.post("/consultar-nfe-situacoes")
+async def consultar_nfe_situacoes(
+    ambiente: str = Form("producao"),
+    senha: str = Form(...),
+    chaves: str = Form(...),
+    certificado: UploadFile = File(...),
+):
+    """Consulta a situacao atual por chave sem usar ou alterar o NSU."""
+    pfx_path = cert_path = key_path = None
+    session = None
+    try:
+        ambiente = garantir_ambiente(ambiente)
+        try:
+            parsed = json.loads(chaves)
+        except json.JSONDecodeError as exc:
+            raise ValueError("chaves deve ser uma lista JSON.") from exc
+        if not isinstance(parsed, list) or not parsed:
+            raise ValueError("Informe ao menos uma chave.")
+        unique = list(dict.fromkeys(re.sub(r"\D", "", str(chave)) for chave in parsed))
+        if len(unique) > 30 or any(not re.fullmatch(r"\d{44}", chave) for chave in unique):
+            raise ValueError("Envie de 1 a 30 chaves NF-e validas por lote.")
+        pfx_bytes = await certificado.read()
+        if not pfx_bytes:
+            raise ValueError("Certificado PFX nao enviado.")
+        with tempfile.NamedTemporaryFile(prefix="cert_consulta_", suffix=".pfx", delete=False) as f:
+            pfx_path = f.name
+            f.write(pfx_bytes)
+        cert_path, key_path, _, _ = extrair_certificado(pfx_path, senha)
+        session = requests.Session()
+        session.cert = (cert_path, key_path)
+        session.verify = True
+        resultados = []
+        for index, chave in enumerate(unique):
+            if index:
+                time.sleep(1.2)
+            resultados.append(consultar_protocolo_por_chave(session, chave, ambiente))
+        return JSONResponse({"success": True, "resultados": resultados})
+    except ValueError as exc:
+        logger.warning("consultar-nfe-situacoes rejeitado: %s", exc)
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.exception("consultar-nfe-situacoes falhou")
+        return JSONResponse({"success": False, "error": f"Falha interna ao consultar NFe: {exc}"}, status_code=500)
+    finally:
+        if session is not None:
+            session.close()
+        for path in (pfx_path, cert_path, key_path):
+            try:
+                if path and os.path.exists(path): os.remove(path)
+            except Exception:
+                pass
 
 
 @app.post("/baixar-zip")
