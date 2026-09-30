@@ -1018,7 +1018,7 @@ async def baixar_nfe(
     competencia: str | None = Form(None),
     max_lotes: int = Form(10),
     somente_completas: str = Form("true"),
-    manifestar_ciencia: str = Form("false"),
+    manifestar_ciencia: str = Form("true"),
     start_nsu: str | None = Form(None),
     modo_recuperacao: str = Form("false"),
     data_inicio: str | None = Form(None),
