@@ -1340,6 +1340,38 @@ async def cons_nsu_nfe_json(
             pass
 
 
+def manifestar_chave_pontual(
+    ambiente: str,
+    caminho_pfx: str,
+    senha: str,
+    cnpj: str,
+    chave: str,
+) -> dict[str, Any]:
+    ambiente = garantir_ambiente(ambiente)
+    cnpj = garantir_cnpj(cnpj)
+    chave_fmt = re.sub(r"\D", "", chave or "")
+    if not re.fullmatch(r"\d{44}", chave_fmt):
+        raise ValueError("Chave NF-e invalida. Use 44 digitos.")
+    cert_path = key_path = None
+    session = None
+    try:
+        cert_path, key_path, cert_pem, key_pem = extrair_certificado(caminho_pfx, senha)
+        session = requests.Session()
+        session.cert = (cert_path, key_path)
+        session.verify = True
+        ret = manifestar(session, cert_pem, key_pem, cnpj, chave_fmt, ambiente)
+        return {"success": bool(ret.get("ok")), **ret}
+    finally:
+        if session is not None:
+            session.close()
+        for path in (cert_path, key_path):
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+
 @app.post("/cons-chave-nfe-json")
 async def cons_chave_nfe_json(
     ambiente: str = Form("producao"),
@@ -1372,6 +1404,37 @@ async def cons_chave_nfe_json(
     except Exception as exc:
         logger.exception("cons-chave-nfe-json falhou")
         return JSONResponse({"success": False, "error": f"Falha interna consChNFe: {exc}"}, status_code=500)
+    finally:
+        try:
+            if cert_path and os.path.exists(cert_path):
+                os.remove(cert_path)
+        except Exception:
+            pass
+
+
+@app.post("/manifestar-chave-nfe-json")
+async def manifestar_chave_nfe_json(
+    ambiente: str = Form("producao"),
+    senha: str = Form(...),
+    cnpj: str = Form(...),
+    chave: str = Form(...),
+    certificado: UploadFile = File(...),
+):
+    cert_path = None
+    try:
+        pfx_bytes = await certificado.read()
+        if not pfx_bytes:
+            raise ValueError("Certificado PFX nao enviado.")
+        with tempfile.NamedTemporaryFile(prefix="cert_manif_", suffix=".pfx", delete=False) as f:
+            cert_path = f.name
+            f.write(pfx_bytes)
+        return JSONResponse(manifestar_chave_pontual(ambiente, cert_path, senha, cnpj, chave))
+    except ValueError as exc:
+        logger.warning("manifestar-chave-nfe-json rejeitado: %s", exc)
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.exception("manifestar-chave-nfe-json falhou")
+        return JSONResponse({"success": False, "error": f"Falha interna manifestacao: {exc}"}, status_code=500)
     finally:
         try:
             if cert_path and os.path.exists(cert_path):
