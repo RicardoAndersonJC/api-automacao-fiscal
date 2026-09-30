@@ -741,16 +741,16 @@ def processar_consulta(
 
                 data_doc = extrair_data_documento(resumo.get("dh_emi"))
                 competencia_destino = comp_doc or "_SEM_COMPETENCIA_"
+                # distNSU e uma fila sequencial: depois de avancar o cursor,
+                # a SEFAZ nao reenviara um documento descartado por competencia.
+                # Fora da recuperacao, a competencia organiza/exibe o resultado,
+                # mas nunca elimina um documento recebido.
                 usa_janela_por_data = periodo_inicio is not None and periodo_fim is not None
                 fora_do_escopo = (
                     usa_janela_por_data
                     and data_doc is not None
                     and not (periodo_inicio <= data_doc <= periodo_fim)
-                ) or (
-                    not usa_janela_por_data
-                    and not modo_recuperacao
-                    and not mesmo_mes(resumo.get("dh_emi"), competencia)
-                )
+                ) if modo_recuperacao else False
                 if fora_do_escopo:
                     if modo_recuperacao:
                         ignorados_fora_janela += 1
