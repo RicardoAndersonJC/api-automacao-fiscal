@@ -334,7 +334,9 @@ def failure_policy(kind: str) -> str:
 
 
 def certificate_mismatch_stops(cert_cnpj: str, emit_cnpj: str) -> bool:
-    return bool(cert_cnpj) and cert_cnpj != emit_cnpj
+    if not cert_cnpj or cert_cnpj == emit_cnpj:
+        return False
+    return not (len(cert_cnpj) == len(emit_cnpj) == 14 and cert_cnpj[:8] == emit_cnpj[:8])
 
 
 def client_error_is_permanent(kind: str) -> bool:
@@ -1568,7 +1570,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             raise ValueError("A competência do XML semente está no futuro.")
         cert_path, key_path, cert_cnpj = _certificate_files(pfx_bytes, password, job.directory)
         if certificate_mismatch_stops(cert_cnpj, cfg["cnpj"]):
-            raise ValueError("O CNPJ do certificado é diferente do emitente do XML.")
+            raise ValueError("A raiz do CNPJ do certificado é diferente da raiz do emitente do XML.")
 
         verify_path = svrs_ca_bundle()
         transport = shared_outbound_transport()

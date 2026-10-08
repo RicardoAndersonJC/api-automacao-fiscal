@@ -442,6 +442,12 @@ class NfceWorkerTest(unittest.TestCase):
         self.assertFalse(download_retries_immediately("certificate", 0))
         self.assertEqual(failure_policy("cnpj"), "permanent")
 
+    def test_matrix_certificate_preserves_branch_emitter(self):
+        self.assertFalse(certificate_mismatch_stops("12345678000100", "12345678000200"))
+        self.assertFalse(certificate_mismatch_stops("12345678000200", "12345678000100"))
+        self.assertTrue(certificate_mismatch_stops("99345678000100", "12345678000200"))
+        self.assertTrue(certificate_mismatch_stops("12345678", "12345678000200"))
+
     def test_proxy_disabled_keeps_direct_connection(self):
         manager = OutboundTransportManager.from_env({"PROXY_ENABLED": "false", "PROXY_URL": "http://proxy.example:8080"})
         self.assertFalse(manager.enabled)
