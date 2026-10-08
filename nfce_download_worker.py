@@ -954,6 +954,8 @@ def _log_remote_response(response: requests.Response, phase: str, started: float
         "captcha_present": "captcha" in sample,
         "certificate_required": "exige certificado digital" in sample,
         "processing_error": "erro no processamento" in sample,
+        "xml_markup_present": any(marker in text for marker in (
+            "<nfeProc", "<NFe", "&lt;nfeProc", "&lt;NFe")),
     }
     log_attempt(
         **(context or {}), etapa=phase, duracao_ms=int((time.perf_counter() - started) * 1000),
@@ -1037,16 +1039,22 @@ def download_failure_message(kind: str, status_code: int = 0) -> str:
 
 
 def extract_downloaded_xml(text: str) -> str | None:
-    cleaned = html.unescape(text.replace(r'\"', '"').replace(r"\/", "/"))
-    for opening, closing in (("<nfeProc", "</nfeProc>"), ("<NFe", "</NFe>")):
-        start, end = cleaned.find(opening), cleaned.rfind(closing)
-        if start >= 0 and end > start:
-            candidate = cleaned[start : end + len(closing)].strip()
-            try:
-                ET.fromstring(candidate)
-                return candidate
-            except ET.ParseError:
-                continue
+    cleaned = text.replace(r'\"', '"').replace(r"\/", "/")
+    # Validate before decoding: XML entities such as &amp; must stay intact.
+    for _ in range(3):
+        for opening, closing in (("<nfeProc", "</nfeProc>"), ("<NFe", "</NFe>")):
+            start, end = cleaned.find(opening), cleaned.rfind(closing)
+            if start >= 0 and end > start:
+                candidate = cleaned[start : end + len(closing)].strip()
+                try:
+                    ET.fromstring(candidate)
+                    return candidate
+                except ET.ParseError:
+                    continue
+        decoded = html.unescape(cleaned)
+        if decoded == cleaned:
+            break
+        cleaned = decoded
     return None
 
 

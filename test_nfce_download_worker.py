@@ -8,6 +8,13 @@ import nfce_download_worker as worker
 
 
 class RemoteResponseLoggingTests(unittest.TestCase):
+    def test_xml_entities_are_preserved_in_raw_and_html_encoded_xml(self):
+        xml = '<nfeProc><NFe><xNome>LYRA &amp; PAES</xNome><xProd>A &lt; B</xProd></NFe></nfeProc>'
+        self.assertEqual(worker.extract_downloaded_xml(xml), xml)
+        encoded = worker.html.escape(xml)
+        self.assertEqual(worker.extract_downloaded_xml('<pre>' + encoded + '</pre>'), xml)
+        self.assertEqual(worker.extract_downloaded_xml(worker.html.escape(encoded)), xml)
+
     def test_captcha_response_logs_evidence_without_form_secrets(self):
         response = requests.Response()
         response.status_code = 200
