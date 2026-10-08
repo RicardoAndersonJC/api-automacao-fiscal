@@ -18,11 +18,30 @@ class RemoteResponseLoggingTests(unittest.TestCase):
             worker._log_remote_response(response, "portal_get", worker.time.perf_counter(),
                                         {"tentativa": 1, "empresa_id": "company"})
         logged = output.call_args.args[0]
-        self.assertIn('"categoria": "rate_limit"', logged)
-        self.assertIn("recaptcha", logged)
+        self.assertIn('"categoria": "no_xml"', logged)
+        self.assertIn('captcha_present', logged)
         self.assertIn('"status_http": 200', logged)
         self.assertNotIn("private-value", logged)
         self.assertNotIn("token=secret", logged)
+
+    def test_captcha_script_is_not_evidence_of_rate_limit(self):
+        self.assertEqual(worker.classify_portal_body(
+            200, '<script src="https://www.google.com/recaptcha/api.js"></script>'), "no_xml")
+        self.assertEqual(worker.classify_portal_body(429, ""), "rate_limit")
+
+    def test_get_captcha_does_not_override_post_result(self):
+        get_response = requests.Response()
+        get_response.status_code = 200
+        get_response.url = worker.SVRS_DOWNLOAD_GET_URL
+        get_response._content = b'<script src="recaptcha/api.js"></script>'
+        post_response = requests.Response()
+        post_response.status_code = 200
+        post_response.url = worker.SVRS_DOWNLOAD_POST_URL
+        post_response._content = b'<html><title>Erro no processamento do Portal</title></html>'
+        with patch.object(worker._logger, "info"), patch.object(requests.Session, "get", return_value=get_response), \
+                patch.object(requests.Session, "post", return_value=post_response):
+            _, kind, _, _ = worker._download(requests.Session(), "1" * 44)
+        self.assertEqual(kind, "no_xml")
 
     def test_soap_logs_status_and_reason(self):
         response = requests.Response()

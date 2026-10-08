@@ -31,6 +31,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -900,12 +901,43 @@ def log_attempt(
     return record
 
 
+class _PortalDiagnostics(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_title = False
+        self.title: list[str] = []
+        self.forms: list[dict[str, str]] = []
+        self.fields: set[str] = set()
+
+    def handle_starttag(self, tag, attrs):
+        values = dict(attrs)
+        if tag == "title":
+            self.in_title = True
+        elif tag == "form":
+            action = urlparse(values.get("action") or "")
+            self.forms.append({"method": (values.get("method") or "get").lower(),
+                               "action_path": action.path[:200]})
+        elif tag in {"input", "select", "textarea"} and values.get("name"):
+            self.fields.add(values["name"][:100])
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self.in_title = False
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title.append(data)
+
+
 def _log_remote_response(response: requests.Response, phase: str, started: float,
                          context: dict[str, Any] | None = None) -> None:
     text = response.text
     sample = html.unescape(text or "")[:8000].lower()
     status, reason, _ = extract_status(text) if phase == "consulta_soap" else ("", "", "")
     endpoint = urlparse(response.url or "")
+    page = _PortalDiagnostics()
+    if phase.startswith("portal_"):
+        page.feed(text)
     # Only allowlisted evidence is emitted; never log HTML forms, cookies or XML bodies.
     evidence = {
         "endpoint": f"{endpoint.hostname or ''}{endpoint.path}",
@@ -916,6 +948,12 @@ def _log_remote_response(response: requests.Response, phase: str, started: float
         "unavailable_signals": [hint for hint in _UNAVAILABLE_HINTS if hint in sample],
         "xMotivo": _redact_log_value(reason[:500]),
         "has_xml": bool(extract_downloaded_xml(text)) if phase == "portal_post" else False,
+        "page_title": _redact_log_value(" ".join(page.title).strip()[:200]),
+        "forms": page.forms[:10],
+        "field_names": sorted(page.fields)[:50],
+        "captcha_present": "captcha" in sample,
+        "certificate_required": "exige certificado digital" in sample,
+        "processing_error": "erro no processamento" in sample,
     }
     log_attempt(
         **(context or {}), etapa=phase, duracao_ms=int((time.perf_counter() - started) * 1000),
@@ -929,8 +967,6 @@ _RATE_LIMIT_HINTS = (
     "muitas requisi",
     "excesso de requis",
     "too many",
-    "captcha",
-    "recaptcha",
     "bloqueio",
     "bloqueado",
     "tente novamente mais tarde",
@@ -1493,8 +1529,7 @@ def _download(session: requests.Session, key: str,
     xml = extract_downloaded_xml(post_response.text)
     if xml:
         return xml, "ok", "", post_response.status_code
-    page = f"{get_response.text}\n{post_response.text}"
-    kind = classify_portal_body(post_response.status_code, page)
+    kind = classify_portal_body(post_response.status_code, post_response.text)
     return None, kind, download_failure_message(kind, post_response.status_code), post_response.status_code
 
 
