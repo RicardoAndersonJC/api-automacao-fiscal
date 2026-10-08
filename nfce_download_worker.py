@@ -70,8 +70,9 @@ ICP_BRASIL_CA_SHA256 = "6E0BFF069A26994C15DE2C4888CC54AF84882E5495B7FBF66BE9CCFF
 router = APIRouter(prefix="/nfce/download-jobs", tags=["NFC-e"])
 _jobs_lock = threading.Lock()
 _jobs: dict[str, "Job"] = {}
-# Um download por vez. Quem roda uma empresa não soma taxa no portal.
-_executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("NFCE_WORKERS", "1"))))
+# Jobs de orgs diferentes coexistem; o limitador da SVRS continua compartilhado.
+NFCE_WORKERS = max(1, int(os.getenv("NFCE_WORKERS", "2")))
+_executor = ThreadPoolExecutor(max_workers=NFCE_WORKERS)
 DOWNLOAD_CONCURRENCY = 1
 # Compatibilidade com o health-check da API. Zero significa sem limite por lote.
 MAX_PENDING_PER_RUN = 0
@@ -453,33 +454,24 @@ class SvrsRateLimiter:
 
     def begin_download(self) -> str:
         """call libera uma requisição. skip não chama o portal."""
-        mode = "allow"
-        with self._lock:
-            now = float(self._clock())
-            self._roll_download_state_locked(now)
-            if self._download_state == "cooldown":
-                delay = max(0.0, self._cooldown_until - now)
-                mode = "cooldown"
-            elif self._download_state == "half_open" and self._probe_issued:
-                return "skip"
-            elif self._download_state == "half_open":
-                self._probe_issued = True
-                delay = 0.0
-                mode = "probe"
-            else:
-                delay = self._next.get("download", 0.0) - now
-                if delay < 0:
-                    delay = 0.0
-                self._next["download"] = now + delay + self.download_seconds
-                mode = "allow"
-        if delay > 0:
-            self._sleep(delay)
-            if mode == "cooldown":
-                with self._lock:
-                    self._roll_download_state_locked(float(self._clock()))
-                    self._download_state = "half_open"
+        while True:
+            with self._lock:
+                now = float(self._clock())
+                self._roll_download_state_locked(now)
+                if self._download_state == "cooldown":
+                    delay = max(0.0, self._cooldown_until - now)
+                elif self._download_state == "half_open":
+                    if self._probe_issued:
+                        return "skip"
                     self._probe_issued = True
-        return "call"
+                    return "call"
+                else:
+                    delay = max(0.0, self._next.get("download", 0.0) - now)
+                    if delay == 0:
+                        self._next["download"] = now + self.download_seconds
+                        return "call"
+            # Another job may have entered cooldown while this caller waited.
+            self._sleep(delay)
 
     def wait(self, channel: str) -> float:
         if channel == "download" and self.download_state() == "cooldown":
@@ -505,7 +497,7 @@ class SvrsRateLimiter:
             target = now + max(0.0, float(seconds))
             if self._download_state == "cooldown":
                 target = max(target, self._cooldown_until)
-            self._next["download"] = target
+            self._next["download"] = max(self._next["download"], target)
 
 
 def discovery_action(status: str, artificial: str, real_key: str) -> tuple[str, str]:
@@ -1566,6 +1558,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
     session: requests.Session | None = None
     try:
         _update(job, status="running", message="Validando XML e certificado", progress=1)
+        _logger.info(json.dumps({
+            "event": "nfce_job_started", "run_id": job.external_run_id,
+            "empresa_id": job.empresa_id, "organizacao_id": job.organizacao_id,
+            "workers": NFCE_WORKERS,
+        }))
         cfg = parse_seed_xml(seed_bytes)
         if aamm_order(cfg["aamm"]) > aamm_order(current_aamm()):
             raise ValueError("A competência do XML semente está no futuro.")

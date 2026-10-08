@@ -5,9 +5,46 @@ import os
 import requests
 from unittest.mock import patch
 import nfce_download_worker as worker
+import threading
 
 
 class RemoteResponseLoggingTests(unittest.TestCase):
+    def test_two_jobs_can_run_without_waiting_for_first_to_finish(self):
+        started = threading.Barrier(2)
+        def task():
+            started.wait(timeout=2)
+            return True
+        if worker.NFCE_WORKERS < 2:
+            self.skipTest("NFCE_WORKERS explicitamente configurado como 1")
+        first = worker._executor.submit(task)
+        second = worker._executor.submit(task)
+        self.assertTrue(first.result(timeout=3))
+        self.assertTrue(second.result(timeout=3))
+
+    def test_waiting_job_rechecks_cooldown_and_only_one_probe_is_allowed(self):
+        now = [0.0]
+        calls = [0]
+        def sleep(seconds):
+            now[0] += seconds
+            calls[0] += 1
+            if calls[0] == 1:
+                limiter.note_remote_limit()
+        limiter = worker.SvrsRateLimiter(download_seconds=90, cooldown_seconds=60,
+                                        clock=lambda: now[0], sleep=sleep)
+        self.assertEqual(limiter.begin_download(), "call")
+        self.assertEqual(limiter.begin_download(), "call")
+        self.assertEqual(now[0], 150)
+        self.assertEqual(limiter.begin_download(), "skip")
+
+    def test_retry_cannot_shorten_shared_download_interval(self):
+        now = [0.0]
+        limiter = worker.SvrsRateLimiter(download_seconds=90, clock=lambda: now[0],
+                                        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+        limiter.begin_download()
+        limiter.arm_same_key_retry(1)
+        limiter.begin_download()
+        self.assertEqual(now[0], 90)
+
     def test_xml_entities_are_preserved_in_raw_and_html_encoded_xml(self):
         xml = '<nfeProc><NFe><xNome>LYRA &amp; PAES</xNome><xProd>A &lt; B</xProd></NFe></nfeProc>'
         self.assertEqual(worker.extract_downloaded_xml(xml), xml)
@@ -213,7 +250,7 @@ class NfceWorkerTest(unittest.TestCase):
         self.assertFalse(download_retries_immediately("rate_limit", 0))
         self.assertFalse(download_retries_immediately("unavailable", 0))
 
-    def test_empty_page_retries_the_same_key_after_60s(self):
+    def test_empty_page_retry_preserves_the_global_interval(self):
         self.assertTrue(download_retries_same_key("no_xml", 0))
         self.assertFalse(download_retries_same_key("rate_limit", 1))
         self.assertFalse(download_retries_same_key("no_xml", 2))
@@ -229,7 +266,7 @@ class NfceWorkerTest(unittest.TestCase):
         limiter = SvrsRateLimiter(download_seconds=90, clock=clock, sleep=sleep)
         self.assertEqual(limiter.wait("download"), 0.0)
         limiter.arm_same_key_retry(60)
-        self.assertAlmostEqual(limiter.wait("download"), 60.0)
+        self.assertAlmostEqual(limiter.wait("download"), 90.0)
 
     def test_shared_limiter_keeps_one_clock(self):
         reset_shared_rate_limiter()
