@@ -22,6 +22,7 @@ import os
 import random
 import re
 import secrets
+import sys
 import shutil
 import tempfile
 import threading
@@ -36,6 +37,14 @@ from urllib.parse import quote, urlparse
 from xml.etree import ElementTree as ET
 
 import requests
+
+_logger = logging.getLogger("nfce_download")
+_logger.setLevel(logging.INFO)
+if not _logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    _logger.addHandler(_handler)
+_logger.propagate = False
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, pkcs12
@@ -851,9 +860,12 @@ def log_attempt(
     outbound_health: str = "",
     failover: bool = False,
     cstat: str = "",
+    detalhe: str = "",
 ) -> dict[str, Any]:
     """Registro da tentativa. Senha, PFX, JWT, token e URL com credencial não entram."""
     raw = {
+        "event": "nfce_attempt",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "run_id": run_id,
         "empresa_id": empresa_id,
         "aamm": aamm,
@@ -866,6 +878,7 @@ def log_attempt(
         "http": http,
         "status_http": http,
         "cstat": cstat,
+        "detalhe": detalhe,
         "categoria": categoria,
         "resultado": resultado or categoria,
         "retry": retry,
@@ -883,8 +896,32 @@ def log_attempt(
         if _LOG_SECRET.search(key):
             continue
         record[key] = _redact_log_value(value)
-    logging.getLogger("nfce_download").info(json.dumps(record, ensure_ascii=False))
+    _logger.info(json.dumps(record, ensure_ascii=False))
     return record
+
+
+def _log_remote_response(response: requests.Response, phase: str, started: float,
+                         context: dict[str, Any] | None = None) -> None:
+    text = response.text
+    sample = html.unescape(text or "")[:8000].lower()
+    status, reason, _ = extract_status(text) if phase == "consulta_soap" else ("", "", "")
+    endpoint = urlparse(response.url or "")
+    # Only allowlisted evidence is emitted; never log HTML forms, cookies or XML bodies.
+    evidence = {
+        "endpoint": f"{endpoint.hostname or ''}{endpoint.path}",
+        "content_type": response.headers.get("Content-Type", "")[:120],
+        "response_bytes": len(response.content),
+        "redirect_statuses": [item.status_code for item in response.history],
+        "block_signals": [hint for hint in _RATE_LIMIT_HINTS if hint in sample],
+        "unavailable_signals": [hint for hint in _UNAVAILABLE_HINTS if hint in sample],
+        "xMotivo": _redact_log_value(reason[:500]),
+        "has_xml": bool(extract_downloaded_xml(text)) if phase == "portal_post" else False,
+    }
+    log_attempt(
+        **(context or {}), etapa=phase, duracao_ms=int((time.perf_counter() - started) * 1000),
+        http=response.status_code, categoria=status or classify_portal_body(response.status_code, text),
+        cstat=status, detalhe=json.dumps(evidence, ensure_ascii=False),
+    )
 
 
 _RATE_LIMIT_HINTS = (
@@ -1117,14 +1154,17 @@ def _update(job: Job, **values: Any) -> None:
         job.updated_at = time.time()
 
 
-def _consult(session: requests.Session, cfg: dict[str, Any], number: int, aamm: str) -> tuple[str, str, str]:
+def _consult(session: requests.Session, cfg: dict[str, Any], number: int, aamm: str,
+             log_context: dict[str, Any] | None = None) -> tuple[str, str, str]:
     artificial = access_key(cfg, number, aamm)
+    started = time.perf_counter()
     response = session.post(
         SVRS_CONSULTA_URL,
         data=soap_request(artificial).encode("utf-8"),
         headers={"Content-Type": f'application/soap+xml; charset=utf-8; action="{SOAP_ACTION}"'},
         timeout=REQUEST_TIMEOUT,
     )
+    _log_remote_response(response, "consulta_soap", started, log_context or {"tentativa": 1, "chave": artificial})
     response.raise_for_status()
     status, reason, _ = extract_status(response.text)
     real_key = next(
@@ -1147,20 +1187,26 @@ def _consult_logged(
     started = time.perf_counter()
     http_status: int | None = None
     categoria = "UNKNOWN"
+    error_type = ""
     failover = False
     route = transport.current() if transport else None
     try:
         if circuit and not circuit.allow_call():
             categoria = "circuit_open"
             return "", "circuit_open", ""
-        status, reason, real_key = _consult(session, cfg, number, aamm)
+        status, reason, real_key = _consult(session, cfg, number, aamm, {
+            "run_id": run_id, "empresa_id": empresa_id, "aamm": aamm,
+            "nnf": number, "chave": access_key(cfg, number, aamm), "tentativa": 1,
+            "outbound_id": route.outbound_id if route else "direct",
+        })
         categoria = status or "UNKNOWN"
         if circuit:
             circuit.note_success()
         if transport:
             transport.note_success()
         return status, reason, real_key
-    except requests.exceptions.ProxyError:
+    except requests.exceptions.ProxyError as exc:
+        error_type = type(exc).__name__
         categoria = "proxy"
         failover = bool(transport and transport.note_infrastructure_failure())
         if failover and transport:
@@ -1170,17 +1216,20 @@ def _consult_logged(
             circuit.note_transport_failure()
         return "", "proxy", ""
     except requests.HTTPError as exc:
+        error_type = type(exc).__name__
         http_status = exc.response.status_code if exc.response is not None else None
         categoria = "REMOTE_5XX" if http_status and http_status >= 500 else "HTTP"
         if circuit and http_status and http_status >= 500:
             circuit.note_transport_failure()
         raise
-    except requests.Timeout:
+    except requests.Timeout as exc:
+        error_type = type(exc).__name__
         categoria = "TIMEOUT"
         if circuit:
             circuit.note_transport_failure()
         raise
-    except requests.RequestException:
+    except requests.RequestException as exc:
+        error_type = type(exc).__name__
         categoria = "NETWORK_ERROR"
         if circuit:
             circuit.note_transport_failure()
@@ -1197,6 +1246,7 @@ def _consult_logged(
             duracao_ms=int((time.perf_counter() - started) * 1000),
             http=http_status,
             categoria=categoria,
+            detalhe=error_type,
             retry=failover,
             cstat=categoria if categoria.isdigit() else "",
             circuit_state=circuit.state if circuit else "",
@@ -1310,16 +1360,24 @@ def _download_one(
                 notify(attempt)
             started = time.perf_counter()
             http_status: int | None = None
+            error_type = ""
             failover = False
             try:
-                xml, kind, message, http_status = _download(active_session, item["chave_real"])
+                xml, kind, message, http_status = _download(active_session, item["chave_real"], {
+                    "run_id": run_id, "empresa_id": empresa_id,
+                    "aamm": str(item.get("AAMM") or ""), "nnf": item.get("nNF"),
+                    "chave": str(item["chave_real"]), "tentativa": attempt + 1,
+                    "outbound_id": route.outbound_id if route else "direct",
+                })
                 if xml:
                     kind = "ok"
-            except requests.Timeout:
+            except requests.Timeout as exc:
+                error_type = type(exc).__name__
                 xml, kind, message = None, "timeout", download_failure_message("timeout")
                 if breaker:
                     breaker.note_transport_failure()
-            except requests.exceptions.ProxyError:
+            except requests.exceptions.ProxyError as exc:
+                error_type = type(exc).__name__
                 xml, kind, message = None, "proxy", download_failure_message("proxy")
                 failover = bool(transport and transport.note_infrastructure_failure())
                 if failover and transport:
@@ -1328,6 +1386,7 @@ def _download_one(
                 if breaker:
                     breaker.note_transport_failure()
             except requests.RequestException as exc:
+                error_type = type(exc).__name__
                 text = str(exc)
                 if "429" in text:
                     xml, kind, message = None, "rate_limit", download_failure_message("rate_limit")
@@ -1361,6 +1420,7 @@ def _download_one(
                 duracao_ms=int((time.perf_counter() - started) * 1000),
                 http=http_status,
                 categoria=kind,
+                detalhe=error_type,
                 retry=(
                     download_retries_immediately(kind, attempt)
                     or download_retries_same_key(kind, attempt)
@@ -1390,13 +1450,17 @@ def _download_one(
             active_session.close()
 
 
-def _download(session: requests.Session, key: str) -> tuple[str | None, str, str, int | None]:
+def _download(session: requests.Session, key: str,
+              log_context: dict[str, Any] | None = None) -> tuple[str | None, str, str, int | None]:
+    context = log_context or {"chave": key, "tentativa": 1}
+    started = time.perf_counter()
     get_response = session.get(
         SVRS_DOWNLOAD_GET_URL,
         params={"OrigemSite": "2", "Ambiente": "1", "ChaveAcessoDfe": key},
         headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html,application/xml;q=0.9,*/*;q=0.8"},
         timeout=REQUEST_TIMEOUT,
     )
+    _log_remote_response(get_response, "portal_get", started, context)
     blocked = _portal_http_failure(get_response)
     if blocked:
         return None, blocked[0], blocked[1], get_response.status_code
@@ -1409,6 +1473,7 @@ def _download(session: requests.Session, key: str) -> tuple[str | None, str, str
         if name:
             hidden[name.group(1)] = value.group(1) if value else ""
     hidden.update({"sistema": "Nfce", "OrigemSite": "SiteSefaz", "Ambiente": "1", "ChaveAcessoDfe": key})
+    started = time.perf_counter()
     post_response = session.post(
         SVRS_DOWNLOAD_POST_URL,
         data=hidden,
@@ -1421,6 +1486,7 @@ def _download(session: requests.Session, key: str) -> tuple[str | None, str, str
         },
         timeout=REQUEST_TIMEOUT,
     )
+    _log_remote_response(post_response, "portal_post", started, context)
     blocked = _portal_http_failure(post_response)
     if blocked:
         return None, blocked[0], blocked[1], post_response.status_code

@@ -3,6 +3,38 @@ import unittest
 import os
 
 import requests
+from unittest.mock import patch
+import nfce_download_worker as worker
+
+
+class RemoteResponseLoggingTests(unittest.TestCase):
+    def test_captcha_response_logs_evidence_without_form_secrets(self):
+        response = requests.Response()
+        response.status_code = 200
+        response.url = "https://dfe-portal.svrs.rs.gov.br/NFCESSL/DownloadXMLDFe?token=secret"
+        response._content = b'<html>recaptcha<input name="token" value="private-value"></html>'
+        response.headers["Content-Type"] = "text/html"
+        with patch.object(worker._logger, "info") as output:
+            worker._log_remote_response(response, "portal_get", worker.time.perf_counter(),
+                                        {"tentativa": 1, "empresa_id": "company"})
+        logged = output.call_args.args[0]
+        self.assertIn('"categoria": "rate_limit"', logged)
+        self.assertIn("recaptcha", logged)
+        self.assertIn('"status_http": 200', logged)
+        self.assertNotIn("private-value", logged)
+        self.assertNotIn("token=secret", logged)
+
+    def test_soap_logs_status_and_reason(self):
+        response = requests.Response()
+        response.status_code = 200
+        response.url = worker.SVRS_CONSULTA_URL
+        response._content = b'<retConsSitNFe><cStat>217</cStat><xMotivo>NF-e nao consta</xMotivo></retConsSitNFe>'
+        with patch.object(worker._logger, "info") as output:
+            worker._log_remote_response(response, "consulta_soap", worker.time.perf_counter(),
+                                        {"tentativa": 1})
+        logged = output.call_args.args[0]
+        self.assertIn('"cstat": "217"', logged)
+        self.assertIn("NF-e nao consta", logged)
 
 from nfce_download_worker import (
     CANCELLED_QUEUE_ERROR,
