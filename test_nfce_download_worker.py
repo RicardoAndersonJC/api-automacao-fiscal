@@ -146,6 +146,7 @@ class NfceWorkerTest(unittest.TestCase):
         self.assertEqual(cfg["number"], 28049)
 
     def test_next_month(self):
+        self.assertEqual(parse_seed_xml(SEED.replace(b"2026-08-01", b"2026-09-01"))["aamm"], "2609")
         self.assertEqual(next_aamm("2612"), "2701")
 
     def test_access_key_has_valid_length(self):

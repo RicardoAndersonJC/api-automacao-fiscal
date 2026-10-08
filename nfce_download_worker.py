@@ -191,10 +191,12 @@ def parse_seed_xml(xml_bytes: bytes) -> dict[str, Any]:
         raise ValueError("CNPJ do emitente inválido no XML semente.")
     key = inf_nfe.attrib.get("Id", "")
     key = key[3:47] if key.startswith("NFe") else ""
-    emission = value(inf_nfe, "dhEmi", False)
-    if len(key) == 44 and key.isdigit():
-        aamm = key[2:6]
-    elif re.match(r"^\d{4}-\d{2}", emission):
+    emission = value(inf_nfe, "dhEmi", False) or value(inf_nfe, "dEmi", False)
+    if re.match(r"^\d{4}-(0[1-9]|1[0-2])-\d{2}(T|$)", emission):
+        try:
+            datetime.fromisoformat(emission[:10])
+        except ValueError as exc:
+            raise ValueError("Data de emissão inválida no XML.") from exc
         aamm = emission[2:4] + emission[5:7]
     else:
         raise ValueError("Não foi possível determinar a competência do XML.")
