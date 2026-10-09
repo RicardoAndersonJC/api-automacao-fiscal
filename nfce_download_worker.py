@@ -533,12 +533,8 @@ def apply_discovery_step(
 
 
 def discovery_scan_complete(reason: str, found_count: int = 0) -> bool:
-    """Gap fecha a varredura. Teto sem nenhuma chave também fecha, e a fila segue.
-    Teto com chave encontrada continua a mesma empresa. Pausa e falha de ack continuam abertas.
-    """
-    if reason == "gap":
-        return True
-    return reason == "cap" and found_count == 0
+    """Somente a sequencia de ausencias confirmadas encerra a varredura."""
+    return reason == "gap"
 
 
 def download_retries_immediately(kind: str, attempt: int) -> bool:
@@ -2004,6 +2000,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         if action2 == "absent":
                             continue
                         if action2 == "hold":
+                            halt_reason = "hold"
                             break
                         try:
                             probe_acked = acknowledge(following, probe, status2, real2)
@@ -2014,6 +2011,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                             probe_key_artificial, real2, probe_acked,
                         )
                         if not probe_acked:
+                            halt_reason = "ack"
                             break
                         if action2 == "found" and _probe_key:
                             download_found(following, probe, _probe_key)

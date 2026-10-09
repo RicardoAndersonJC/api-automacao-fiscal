@@ -238,7 +238,7 @@ class NfceWorkerTest(unittest.TestCase):
 
     def test_company_stays_open_until_the_gap_closes_the_scan(self):
         self.assertFalse(discovery_scan_complete("cap", 3))
-        self.assertTrue(discovery_scan_complete("cap", 0))
+        self.assertFalse(discovery_scan_complete("cap", 0))
         self.assertFalse(discovery_scan_complete("hold", 0))
         self.assertFalse(discovery_scan_complete("ack", 0))
         self.assertTrue(discovery_scan_complete("gap", 0))
