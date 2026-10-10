@@ -326,7 +326,7 @@ def failure_policy(kind: str) -> str:
     """cooldown, backoff, same_key ou permanent. Limite do portal não entra no retry."""
     if kind == "rate_limit":
         return "cooldown"
-    if kind in {"timeout", "http", "proxy", "network"}:
+    if kind in {"timeout", "http", "proxy", "network", "access_denied"}:
         return "backoff"
     if kind == "no_xml":
         return "same_key"
@@ -983,6 +983,10 @@ _UNAVAILABLE_HINTS = (
 def classify_portal_body(status_code: int, text: str) -> str:
     """rate_limit no 429 ou no HTML de bloqueio. 503 sem esse texto é falha transitória."""
     sample = html.unescape(text or "")[:8000].lower()
+    if status_code in {401, 403} or any(hint in sample for hint in (
+        "/erro/forbidden", "acesso negado", "access denied",
+    )):
+        return "access_denied"
     if status_code == 429 or any(hint in sample for hint in _RATE_LIMIT_HINTS):
         return "rate_limit"
     if any(hint in sample for hint in _UNAVAILABLE_HINTS):
@@ -993,6 +997,12 @@ def classify_portal_body(status_code: int, text: str) -> str:
 
 
 def download_failure_message(kind: str, status_code: int = 0) -> str:
+    if kind == "access_denied":
+        return (
+            "Acesso recusado pelo portal de download (Forbidden). "
+            "Verifique o certificado e a permissao de acesso do emitente. "
+            "A chave foi preservada; isto nao confirma ausencia de XML."
+        )
     if kind == "rate_limit":
         return (
             "Limite da SVRS: muitas consultas em sequência. "
@@ -1318,6 +1328,10 @@ def _consult_one(cert_path: Path, key_path: Path, verify_path: str, cfg: dict[st
 
 
 def _portal_http_failure(response: requests.Response) -> tuple[str, str] | None:
+    if "/erro/forbidden" in str(response.url or "").lower():
+        return "access_denied", download_failure_message("access_denied")
+    if classify_portal_body(response.status_code, response.text) == "access_denied":
+        return "access_denied", download_failure_message("access_denied")
     if response.status_code < 400:
         return None
     kind = classify_portal_body(response.status_code, response.text)

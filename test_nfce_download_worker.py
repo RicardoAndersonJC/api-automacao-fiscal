@@ -139,6 +139,22 @@ SEED = b'''<?xml version="1.0"?><nfeProc xmlns="http://www.portalfiscal.inf.br/n
 
 
 class NfceWorkerTest(unittest.TestCase):
+    def test_portal_access_denied_is_not_a_missing_invoice(self):
+        from nfce_download_worker import _portal_http_failure
+        import requests
+        for status in (401, 403):
+            self.assertEqual(classify_portal_body(status, ""), "access_denied")
+        self.assertEqual(classify_portal_body(200, '<a href="/Erro/Forbidden">erro</a>'), "access_denied")
+        response = requests.Response()
+        response.status_code = 200
+        response.url = "https://dfe-portal.svrs.rs.gov.br/Erro/Forbidden"
+        response._content = b"<html>Erro no processamento do Portal</html>"
+        kind, message = _portal_http_failure(response)
+        self.assertEqual(kind, "access_denied")
+        self.assertIn("preservada", message)
+        self.assertEqual(failure_policy(kind), "backoff")
+        self.assertFalse(download_retries_same_key(kind, 0))
+
     def test_parse_seed(self):
         cfg = parse_seed_xml(SEED)
         self.assertEqual(cfg["cnpj"], "08850821000129")
