@@ -47,6 +47,7 @@ if not _logger.handlers:
     _logger.addHandler(_handler)
 _logger.propagate = False
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, pkcs12
 from cryptography.x509.oid import NameOID
@@ -1151,6 +1152,59 @@ def _callback(job: Job, event: str, **payload: Any) -> None:
     raise RuntimeError(last_error or "Callback NFC-e falhou sem resposta.")
 
 
+def _client_certificate_chain(
+    cert: x509.Certificate, chain: list[x509.Certificate] | None
+) -> list[x509.Certificate]:
+    # Packaged public intermediates cover PFX exports that omit the issuer chain.
+    bundle = Path(__file__).with_name("nfce-client-ca-chain.pem")
+    candidates = list(chain or [])
+    if bundle.is_file():
+        candidates.extend(x509.load_pem_x509_certificates(bundle.read_bytes()))
+    result: list[x509.Certificate] = []
+    current = cert
+    seen = {cert.fingerprint(hashes.SHA256())}
+    now = datetime.now(timezone.utc)
+    while current.issuer != current.subject:
+        matches = [item for item in candidates if item.subject == current.issuer]
+        if not matches:
+            break
+        issuer = None
+        for candidate in matches:
+            try:
+                current.verify_directly_issued_by(candidate)
+                constraints = candidate.extensions.get_extension_for_class(
+                    x509.BasicConstraints
+                ).value
+                if not constraints.ca:
+                    continue
+                try:
+                    usage = candidate.extensions.get_extension_for_class(x509.KeyUsage).value
+                    if not usage.key_cert_sign:
+                        continue
+                except x509.ExtensionNotFound:
+                    pass
+                if not candidate.not_valid_before_utc <= now <= candidate.not_valid_after_utc:
+                    continue
+                issuer = candidate
+                break
+            except (ValueError, TypeError, x509.ExtensionNotFound, InvalidSignature):
+                continue
+        if issuer is None:
+            raise ValueError("Cadeia intermediaria do certificado invalida ou expirada.")
+        fingerprint = issuer.fingerprint(hashes.SHA256())
+        if fingerprint in seen:
+            raise ValueError("Ciclo na cadeia intermediaria do certificado.")
+        seen.add(fingerprint)
+        if issuer.subject == issuer.issuer:
+            issuer.verify_directly_issued_by(issuer)
+            break
+        result.append(issuer)
+        current = issuer
+        if len(result) > 10:
+            raise ValueError("Cadeia intermediaria do certificado excede o limite.")
+    return result
+
+
 def _certificate_files(pfx_bytes: bytes, password: str, directory: Path) -> tuple[Path, Path, str]:
     if len(pfx_bytes) > MAX_UPLOAD_BYTES:
         raise ValueError("Certificado excede o limite permitido.")
@@ -1180,7 +1234,7 @@ def _certificate_files(pfx_bytes: bytes, password: str, directory: Path) -> tupl
         raise ValueError("O PFX não contém certificado e chave privada.")
     cert_path, key_path = directory / "client-cert.pem", directory / "client-key.pem"
     cert_data = cert.public_bytes(Encoding.PEM)
-    for item in chain or []:
+    for item in _client_certificate_chain(cert, chain):
         cert_data += item.public_bytes(Encoding.PEM)
     cert_path.write_bytes(cert_data)
     key_path.write_bytes(key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
