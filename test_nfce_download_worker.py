@@ -553,3 +553,104 @@ class NfceWorkerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MissingNotesRecoveryTests(unittest.TestCase):
+    def run_worker(self, responses, options=None, callback_effect=None):
+        import tempfile
+        from pathlib import Path
+        from contextlib import ExitStack
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            job = worker.Job(id="test", owner_id="test", directory=Path(directory))
+            defaults = dict(start_aamm="2608", start_number=15103, max_numbers=7,
+                            month_trigger=8, month_window=30, stop_gap=80)
+            defaults.update(options or {})
+            for name, value in [("_certificate_files", (None, None, "08850821000129")),
+                                ("svrs_ca_bundle", "ca"), ("_new_svrs_session", Mock()),
+                                ("shared_rate_limiter", Mock()), ("current_aamm", "2610"),
+                                ("_download_one", ({}, "<nfeProc><NFe /></nfeProc>", "", "ok"))]:
+                stack.enter_context(patch.object(worker, name, return_value=value))
+            consult = stack.enter_context(patch.object(worker, "_consult_logged", side_effect=responses))
+            callback = stack.enter_context(patch.object(worker, "_callback", side_effect=callback_effect))
+            worker.run_job(job, SEED, b"pfx", "", defaults)
+            return job, callback.call_args_list, consult.call_args_list
+
+    def test_six_saved_then_timeout_keeps_cursor_and_requests_resume(self):
+        responses = [("100", "Autorizada", str(index) * 44) for index in range(1, 7)] + [("", "timeout", "")]
+        job, callbacks, _ = self.run_worker(responses)
+        self.assertEqual(job.status, "completed")
+        self.assertEqual(len([call for call in callbacks if call.args[1] == "file"]), 6)
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertEqual(completed["cursor_nnf"], 15109)
+        self.assertTrue(completed["pause_for_svrs"])
+        self.assertIn("Pausa temporária na SVRS", completed["message"])
+        self.assertNotIn("limite", completed["message"])
+        self.assertFalse(completed["scan_complete"])
+
+    def test_absence_must_be_acknowledged_before_cursor_moves(self):
+        def fail_absent(job, event, **payload):
+            if event == "absent":
+                raise RuntimeError("callback indisponível")
+        job, callbacks, _ = self.run_worker([("217", "Ausente", "")], callback_effect=fail_absent)
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertEqual(completed["cursor_nnf"], 15103)
+        self.assertTrue(completed["pause_for_svrs"])
+
+    def test_missing_recovery_uses_real_key_without_moving_pending_only_cursor(self):
+        real = "9" * 44
+        job, callbacks, consults = self.run_worker([("613", "Chave divergente", real)],
+            dict(pending_only=True, missing_notes=[dict(id="missing", aamm="2608", nnf=25747)]))
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(consults[0].args[2:4], (25747, "2608"))
+        discovered = [call for call in callbacks if call.args[1] == "discovered"]
+        self.assertEqual(discovered[0].kwargs["key"], real)
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertFalse(completed["include_cursor"])
+        self.assertEqual(completed["cursor_nnf"], 15103)
+
+    def test_absent_missing_note_is_retained_as_retry_without_download(self):
+        job, callbacks, _ = self.run_worker([("217", "Ausente", "")],
+            dict(pending_only=True, missing_notes=[dict(aamm="2608", nnf=25747)]))
+        self.assertEqual(len([call for call in callbacks if call.args[1] == "missing_attempt"]), 1)
+        self.assertFalse(any(call.args[1] in {"file", "discovered"} for call in callbacks))
+
+    def test_missing_payload_is_validated_and_capped(self):
+        import json
+        self.assertEqual(len(worker.normalize_missing_notes(json.dumps([dict(aamm="2608", nnf=1)] * 2))), 1)
+        for payload in ["{}", '[{"aamm":"2613","nnf":1}]', '[{"aamm":"2608","nnf":true}]', json.dumps([dict(aamm="2608", nnf=1)] * 21)]:
+            with self.assertRaises(ValueError):
+                worker.normalize_missing_notes(payload)
+
+    def test_soap_timeout_returns_hold_instead_of_losing_completed_work(self):
+        from unittest.mock import Mock
+        cfg = worker.parse_seed_xml(SEED)
+        with patch.object(worker, "_consult", side_effect=requests.ReadTimeout("read timeout=45")):
+            self.assertEqual(worker._consult_logged(Mock(), cfg, 15110, "2608", "test", "test"), ("", "timeout", ""))
+
+    def test_gap_crossing_month_recovers_in_upper_competence(self):
+        job, callbacks, consults = self.run_worker([("217", "Ausente", ""), ("613", "Real", "9" * 44)],
+            dict(pending_only=True, missing_notes=[dict(aamm="2608", aamm_final="2609", nnf=25747)]))
+        self.assertEqual([call.args[3] for call in consults], ["2608", "2609"])
+        discovered = [call for call in callbacks if call.args[1] == "discovered"][0]
+        self.assertEqual(discovered.kwargs["aamm"], "2609")
+
+    def test_month_probe_absence_is_acknowledged_before_switching(self):
+        responses = [("217", "Ausente", ""), ("217", "Ausente", ""),
+                     ("217", "Ausente", ""), ("613", "Real", "9" * 44)]
+        job, callbacks, _ = self.run_worker(responses, dict(month_trigger=2, month_window=2, max_numbers=4))
+        absent = [call.kwargs for call in callbacks if call.args[1] == "absent"]
+        self.assertIn(dict(aamm="2609", number=15104), absent)
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertEqual((completed["cursor_aamm"], completed["cursor_nnf"]), ("2609", 15105))
+
+    def test_old_gap_rotates_twelve_month_windows_between_attempts(self):
+        for attempts, expected_start, expected_end, count in [(0, "2501", "2512", 12), (1, "2601", "2602", 2), (2, "2501", "2512", 12)]:
+            with self.subTest(attempts=attempts):
+                job, callbacks, consults = self.run_worker([("217", "Ausente", "")] * count,
+                    dict(pending_only=True, missing_notes=[dict(aamm="2501", aamm_final="2602", nnf=25747, tentativas=attempts)]))
+                self.assertEqual(job.status, "completed", job.error)
+                self.assertEqual(len(consults), count)
+                self.assertEqual(consults[0].args[3], expected_start)
+                self.assertEqual(consults[-1].args[3], expected_end)
+                self.assertEqual(len([call for call in callbacks if call.args[1] == "missing_attempt"]), 1)

@@ -1098,6 +1098,7 @@ def _callback(job: Job, event: str, **payload: Any) -> None:
     categoria = "CALLBACK_ERROR"
     for attempt in range(attempts):
         try:
+
             response = requests.post(
                 f"{supabase_url}/functions/v1/nfce-download",
                 json=request_body,
@@ -1319,21 +1320,25 @@ def _consult_logged(
         error_type = type(exc).__name__
         http_status = exc.response.status_code if exc.response is not None else None
         categoria = "REMOTE_5XX" if http_status and http_status >= 500 else "HTTP"
-        if circuit and http_status and http_status >= 500:
-            circuit.note_transport_failure()
+        if http_status and (http_status >= 500 or http_status in {408, 429}):
+            if circuit:
+                circuit.note_transport_failure()
+            return "", "http_temporarily_unavailable", ""
         raise
     except requests.Timeout as exc:
         error_type = type(exc).__name__
         categoria = "TIMEOUT"
         if circuit:
             circuit.note_transport_failure()
+        return "", "timeout", ""
+    except requests.exceptions.SSLError:
         raise
     except requests.RequestException as exc:
         error_type = type(exc).__name__
         categoria = "NETWORK_ERROR"
         if circuit:
             circuit.note_transport_failure()
-        raise
+        return "", "network", ""
     finally:
         log_attempt(
             run_id=run_id,
@@ -1814,7 +1819,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 mode="pending_recovery",
                 message=(
                     (
-                        f"Pausa por limite da SVRS · {pending_saved} salvas · "
+                        f"Pausa temporária na SVRS · {pending_saved} salvas · "
                         "o restante segue no próximo lote"
                     )
                     if paused_for_svrs
@@ -1825,12 +1830,12 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 ),
             )
 
-            if pending_only or paused_for_svrs:
+            if (pending_only and not options.get("missing_notes")) or paused_for_svrs:
                 _update(
                     job,
                     status="completed",
                     message=(
-                        "Pausa por limite da SVRS"
+                        "Pausa temporária na SVRS"
                         if paused_for_svrs
                         else "Todas as pendências prontas foram processadas"
                     ),
@@ -1849,7 +1854,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     include_cursor=False,
                     message=(
                         (
-                            f"Pausa por limite da SVRS · {pending_saved} salvas. "
+                            f"Pausa temporária na SVRS · {pending_saved} salvas. "
                             "As demais NFC-e continuam na fila e seguem em 1 min."
                         )
                         if paused_for_svrs
@@ -1861,7 +1866,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 )
                 return
 
-        if pending_only:
+        if pending_only and not options.get("missing_notes"):
             _update(job, status="completed", message="Pendências aguardando a próxima tentativa", progress=100, downloaded=pending_saved)
             _callback(
                 job,
@@ -1894,6 +1899,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             artificial = access_key(cfg, n_nf, aamm)
             action, found_key = discovery_action(status, artificial, real_key)
             if action == "absent":
+                _callback(job, "absent", aamm=aamm, number=n_nf)
                 return True
             if action != "found":
                 return False
@@ -2001,9 +2007,43 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 mode="discovery",
             )
 
+        # Lacunas têm identidade numérica. Consulte SOAP antes de enfileirar a chave
+        # real; a recuperação nunca altera safe_aamm/safe_nnf nem number.
+        for missing in (options.get("missing_notes") or [])[:20]:
+            missing_aamm, missing_nnf = str(missing["aamm"]), int(missing["nnf"])
+            probe_aamm = missing_aamm
+            final_aamm = str(missing.get("aamm_final") or missing_aamm)
+            month_count = (int(final_aamm[:2]) - int(missing_aamm[:2])) * 12 + int(final_aamm[2:]) - int(missing_aamm[2:]) + 1
+            windows = (month_count + 11) // 12
+            offset = (int(missing.get("tentativas") or 0) % windows) * 12
+            for _ in range(offset):
+                probe_aamm = next_aamm(probe_aamm)
+            for _ in range(min(12, month_count - offset)):
+                limiter.wait("soap")
+                status, reason, real_key = _consult_logged(
+                    session, cfg, missing_nnf, probe_aamm,
+                    job.external_run_id or "", job.empresa_id, circuit, transport,
+                )
+                action, recovered_key = discovery_action(
+                    status, access_key(cfg, missing_nnf, probe_aamm), real_key,
+                )
+                if action != "absent" or aamm_order(probe_aamm) >= aamm_order(final_aamm):
+                    break
+                probe_aamm = next_aamm(probe_aamm)
+            if action == "found":
+                acknowledge(probe_aamm, missing_nnf, status, real_key)
+                download_found(probe_aamm, missing_nnf, recovered_key)
+            else:
+                _callback(job, "missing_attempt", aamm=missing_aamm, number=missing_nnf,
+                          error=reason or ("Nota ainda não localizada (217)" if action == "absent" else "Consulta temporariamente indisponível"))
+                if action == "hold":
+                    halt_reason = "hold"
+            if halt_reason:
+                break
+
         report_progress(f"Consultando {current_month} a partir da nNF {number}", force=True)
-        scan_reason = "cap"
-        while len(records) < max_numbers:
+        scan_reason = halt_reason or "cap"
+        while not pending_only and not halt_reason and len(records) < max_numbers:
             _update(
                 job,
                 message=f"Consultando {current_month} nNF {number}",
@@ -2066,6 +2106,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         probe_key_artificial = access_key(cfg, probe, following)
                         action2, _ignored = discovery_action(status2, probe_key_artificial, real2)
                         if action2 == "absent":
+                            try:
+                                acknowledge(following, probe, status2, real2)
+                            except Exception:
+                                halt_reason = "ack"
+                                break
                             continue
                         if action2 == "hold":
                             halt_reason = "hold"
@@ -2137,7 +2182,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         completion_message = "Processamento concluído"
         if paused_for_svrs:
             completion_message = (
-                f"Pausa por limite da SVRS · {downloaded} XML salvos. "
+                f"Pausa temporária na SVRS · {downloaded} XML salvos. "
                 "O restante continua na fila e segue em 1 min."
             )
         elif pending_saved or pending_failed:
@@ -2157,7 +2202,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         )
         _callback(
             job, "completed", consulted=len(records), found=len(found), downloaded=downloaded,
-            cursor_aamm=safe_aamm, cursor_nnf=safe_nnf, include_cursor=True,
+            cursor_aamm=safe_aamm, cursor_nnf=safe_nnf, include_cursor=not pending_only,
             scan_complete=discovery_scan_complete(scan_reason, len(found)),
             pending_saved=pending_saved, pending_failed=pending_failed,
             pause_for_svrs=paused_for_svrs,
@@ -2271,6 +2316,37 @@ def _owned_job(job_id: str, owner_id: str) -> Job:
     return job
 
 
+def normalize_missing_notes(payload: str) -> list[dict[str, Any]]:
+    """Valida lacunas separadamente da fila de chaves reais e limita o lote."""
+    try:
+        items = json.loads(payload or "[]")
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("lacunas_json inválido.") from exc
+    if not isinstance(items, list) or len(items) > 20:
+        raise ValueError("lacunas_json deve ser uma lista com até 20 itens.")
+    result = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("Lacuna inválida.")
+        aamm, nnf = str(item.get("aamm") or ""), item.get("nnf")
+        if not re.fullmatch(r"[0-9]{2}(0[1-9]|1[0-2])", aamm) or isinstance(nnf, bool) or not isinstance(nnf, int) or not 1 <= nnf <= 999999999:
+            raise ValueError("Metadados de lacuna inválidos.")
+        final_aamm = str(item.get("aamm_final") or aamm)
+        if not re.fullmatch(r"[0-9]{2}(0[1-9]|1[0-2])", final_aamm):
+            raise ValueError("Competência final da lacuna inválida.")
+        month_span = (int(final_aamm[:2]) - int(aamm[:2])) * 12 + int(final_aamm[2:]) - int(aamm[2:])
+        if month_span < 0:
+            raise ValueError("Intervalo de competências da lacuna inválido.")
+        attempts = item.get("tentativas", 0)
+        if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
+            raise ValueError("Tentativas da lacuna inválidas.")
+        if (aamm, nnf) not in seen:
+            result.append({"id": str(item.get("id") or ""), "aamm": aamm, "aamm_final": final_aamm, "nnf": nnf, "tentativas": attempts})
+            seen.add((aamm, nnf))
+    return result
+
+
 @router.post("/internal", status_code=202)
 async def create_internal_job(
     run_id: str = Form(...),
@@ -2282,6 +2358,7 @@ async def create_internal_job(
     inicio_nnf: int = Form(...),
     data_referencia: str = Form(...),
     pendentes_json: str = Form("[]"),
+    lacunas_json: str = Form("[]"),
     intervalo_download_segundos: int = Form(60),
     somente_pendentes: str = Form("false"),
     empresa_id: str = Form(""),
@@ -2299,6 +2376,10 @@ async def create_internal_job(
         raise HTTPException(status_code=400, detail="pendentes_json inválido.") from exc
     if not isinstance(pending_items, list):
         raise HTTPException(status_code=400, detail="pendentes_json deve ser uma lista.")
+    try:
+        normalized_missing = normalize_missing_notes(lacunas_json)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     normalized_pending: list[dict[str, Any]] = []
     seen_pending: set[str] = set()
     for raw in pending_items:
@@ -2363,6 +2444,7 @@ async def create_internal_job(
         "start_aamm": inicio_aamm,
         "start_number": inicio_nnf, "reference_date": data_referencia,
         "pending_items": normalized_pending,
+        "missing_notes": normalized_missing,
     }
     _executor.submit(run_job, job, seed_bytes, pfx_bytes, senha, options)
     return job.public()
