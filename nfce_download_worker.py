@@ -107,6 +107,9 @@ class Job:
     consulted: int = 0
     found: int = 0
     downloaded: int = 0
+    missing_attempted: int = 0
+    missing_recovered: int = 0
+    missing_not_located: int = 0
     current_number: int | None = None
     current_competence: str | None = None
     error: str | None = None
@@ -127,6 +130,9 @@ class Job:
             "consulted": self.consulted,
             "found": self.found,
             "downloaded": self.downloaded,
+            "missing_attempted": self.missing_attempted,
+            "missing_recovered": self.missing_recovered,
+            "missing_not_located": self.missing_not_located,
             "current_number": self.current_number,
             "current_competence": self.current_competence,
             "error": self.error,
@@ -1894,9 +1900,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         safe_aamm = current_month
         safe_nnf = start_number
 
-        def acknowledge(aamm: str, n_nf: int, status: str, real_key: str) -> bool:
+        def acknowledge(aamm: str, n_nf: int, status: str, real_key: str, consulted_cfg: dict[str, Any] | None = None) -> bool:
             """Grava a chave na fila antes de o chamador mover o cursor. hold/falha = False."""
-            artificial = access_key(cfg, n_nf, aamm)
+            artificial = access_key(consulted_cfg or cfg, n_nf, aamm)
             action, found_key = discovery_action(status, artificial, real_key)
             if action == "absent":
                 _callback(job, "absent", aamm=aamm, number=n_nf)
@@ -2009,7 +2015,10 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
 
         # Lacunas têm identidade numérica. Consulte SOAP antes de enfileirar a chave
         # real; a recuperação nunca altera safe_aamm/safe_nnf nem number.
+        missing_attempted = missing_recovered = missing_not_located = 0
+        known_pending_saved, known_pending_failed = pending_saved, pending_failed
         for missing in (options.get("missing_notes") or [])[:20]:
+            missing_attempted += 1
             missing_aamm, missing_nnf = str(missing["aamm"]), int(missing["nnf"])
             probe_aamm = missing_aamm
             final_aamm = str(missing.get("aamm_final") or missing_aamm)
@@ -2019,25 +2028,42 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             for _ in range(offset):
                 probe_aamm = next_aamm(probe_aamm)
             for _ in range(min(12, month_count - offset)):
+                consulted_cfg = cfg
                 limiter.wait("soap")
                 status, reason, real_key = _consult_logged(
-                    session, cfg, missing_nnf, probe_aamm,
+                    session, consulted_cfg, missing_nnf, probe_aamm,
                     job.external_run_id or "", job.empresa_id, circuit, transport,
                 )
+                # NFC-e can use normal emission (1) or offline contingency (9).
+                # Try the alternate only after an explicit 217, respecting the
+                # same SOAP limiter. Never retry an inconclusive transport error.
+                if status == "217" and cfg["model"] == "65" and cfg["emission_type"] in {"1", "9"}:
+                    consulted_cfg = {**cfg, "emission_type": "9" if cfg["emission_type"] == "1" else "1"}
+                    limiter.wait("soap")
+                    status, reason, real_key = _consult_logged(
+                        session, consulted_cfg, missing_nnf, probe_aamm,
+                        job.external_run_id or "", job.empresa_id, circuit, transport,
+                    )
                 action, recovered_key = discovery_action(
-                    status, access_key(cfg, missing_nnf, probe_aamm), real_key,
+                    status, access_key(consulted_cfg, missing_nnf, probe_aamm), real_key,
                 )
                 if action != "absent" or aamm_order(probe_aamm) >= aamm_order(final_aamm):
                     break
                 probe_aamm = next_aamm(probe_aamm)
             if action == "found":
-                acknowledge(probe_aamm, missing_nnf, status, real_key)
+                acknowledge(probe_aamm, missing_nnf, status, real_key, consulted_cfg)
+                saved_before_recovery = pending_saved
                 download_found(probe_aamm, missing_nnf, recovered_key)
+                missing_recovered += pending_saved - saved_before_recovery
             else:
+                if action == "absent":
+                    missing_not_located += 1
                 _callback(job, "missing_attempt", aamm=missing_aamm, number=missing_nnf,
                           error=reason or ("Nota ainda não localizada (217)" if action == "absent" else "Consulta temporariamente indisponível"))
                 if action == "hold":
                     halt_reason = "hold"
+            _update(job, missing_attempted=missing_attempted,
+                    missing_recovered=missing_recovered, missing_not_located=missing_not_located)
             if halt_reason:
                 break
 
@@ -2185,11 +2211,20 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 f"Pausa temporária na SVRS · {downloaded} XML salvos. "
                 "O restante continua na fila e segue em 1 min."
             )
-        elif pending_saved or pending_failed:
+        elif known_pending_saved or known_pending_failed:
             completion_message = (
-                f"Concluído · pendências {pending_saved} salvas/"
-                f"{pending_failed} falhas · varredura {len(found)} na fila"
+                f"Concluído · pendências de XML {known_pending_saved} salvas/"
+                f"{known_pending_failed} falhas · varredura {len(found)} chave(s) encontradas"
             )
+        if missing_attempted:
+            missing_summary = (
+                f"{missing_attempted} numerações verificadas · {missing_recovered} XML recuperados · "
+                f"{missing_not_located} não localizadas nesta tentativa"
+            )
+            awaiting_xml = missing_attempted - missing_recovered - missing_not_located
+            if awaiting_xml:
+                missing_summary += f" · {awaiting_xml} ainda aguardando XML ou consulta"
+            completion_message += " · " + missing_summary
         _update(
             job,
             status="completed",
@@ -2205,6 +2240,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             cursor_aamm=safe_aamm, cursor_nnf=safe_nnf, include_cursor=not pending_only,
             scan_complete=discovery_scan_complete(scan_reason, len(found)),
             pending_saved=pending_saved, pending_failed=pending_failed,
+            missing_attempted=missing_attempted, missing_recovered=missing_recovered,
+            missing_not_located=missing_not_located,
             pause_for_svrs=paused_for_svrs,
             message=completion_message,
         )

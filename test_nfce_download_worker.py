@@ -556,7 +556,7 @@ if __name__ == "__main__":
 
 
 class MissingNotesRecoveryTests(unittest.TestCase):
-    def run_worker(self, responses, options=None, callback_effect=None):
+    def run_worker(self, responses, options=None, callback_effect=None, downloads=None):
         import tempfile
         from pathlib import Path
         from contextlib import ExitStack
@@ -571,6 +571,8 @@ class MissingNotesRecoveryTests(unittest.TestCase):
                                 ("shared_rate_limiter", Mock()), ("current_aamm", "2610"),
                                 ("_download_one", ({}, "<nfeProc><NFe /></nfeProc>", "", "ok"))]:
                 stack.enter_context(patch.object(worker, name, return_value=value))
+            if downloads is not None:
+                stack.enter_context(patch.object(worker, "_download_one", side_effect=downloads))
             consult = stack.enter_context(patch.object(worker, "_consult_logged", side_effect=responses))
             callback = stack.enter_context(patch.object(worker, "_callback", side_effect=callback_effect))
             worker.run_job(job, SEED, b"pfx", "", defaults)
@@ -610,7 +612,7 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.assertEqual(completed["cursor_nnf"], 15103)
 
     def test_absent_missing_note_is_retained_as_retry_without_download(self):
-        job, callbacks, _ = self.run_worker([("217", "Ausente", "")],
+        job, callbacks, _ = self.run_worker([("217", "Ausente", "")] * 2,
             dict(pending_only=True, missing_notes=[dict(aamm="2608", nnf=25747)]))
         self.assertEqual(len([call for call in callbacks if call.args[1] == "missing_attempt"]), 1)
         self.assertFalse(any(call.args[1] in {"file", "discovered"} for call in callbacks))
@@ -629,9 +631,9 @@ class MissingNotesRecoveryTests(unittest.TestCase):
             self.assertEqual(worker._consult_logged(Mock(), cfg, 15110, "2608", "test", "test"), ("", "timeout", ""))
 
     def test_gap_crossing_month_recovers_in_upper_competence(self):
-        job, callbacks, consults = self.run_worker([("217", "Ausente", ""), ("613", "Real", "9" * 44)],
+        job, callbacks, consults = self.run_worker([("217", "Ausente", ""), ("217", "Ausente", ""), ("613", "Real", "9" * 44)],
             dict(pending_only=True, missing_notes=[dict(aamm="2608", aamm_final="2609", nnf=25747)]))
-        self.assertEqual([call.args[3] for call in consults], ["2608", "2609"])
+        self.assertEqual([call.args[3] for call in consults], ["2608", "2608", "2609"])
         discovered = [call for call in callbacks if call.args[1] == "discovered"][0]
         self.assertEqual(discovered.kwargs["aamm"], "2609")
 
@@ -647,10 +649,79 @@ class MissingNotesRecoveryTests(unittest.TestCase):
     def test_old_gap_rotates_twelve_month_windows_between_attempts(self):
         for attempts, expected_start, expected_end, count in [(0, "2501", "2512", 12), (1, "2601", "2602", 2), (2, "2501", "2512", 12)]:
             with self.subTest(attempts=attempts):
-                job, callbacks, consults = self.run_worker([("217", "Ausente", "")] * count,
+                job, callbacks, consults = self.run_worker([("217", "Ausente", "")] * (count * 2),
                     dict(pending_only=True, missing_notes=[dict(aamm="2501", aamm_final="2602", nnf=25747, tentativas=attempts)]))
                 self.assertEqual(job.status, "completed", job.error)
-                self.assertEqual(len(consults), count)
+                self.assertEqual(len(consults), count * 2)
                 self.assertEqual(consults[0].args[3], expected_start)
                 self.assertEqual(consults[-1].args[3], expected_end)
                 self.assertEqual(len([call for call in callbacks if call.args[1] == "missing_attempt"]), 1)
+
+    def test_missing_summary_separates_absent_keys_and_failed_xml(self):
+        notes = [dict(aamm="2608", nnf=n) for n in (25747, 25748, 25749)]
+        responses = [("613", "Real", "8" * 44), ("613", "Real", "9" * 44), ("217", "Ausente", ""), ("217", "Ausente", "")]
+        downloads = [({}, "<nfeProc><NFe /></nfeProc>", "", "ok"), ({}, None, "XML ainda indisponível", "no_xml")]
+        job, callbacks, consults = self.run_worker(responses,
+            dict(pending_only=True, missing_notes=notes), downloads=downloads)
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual((job.missing_attempted, job.missing_recovered, job.missing_not_located), (3, 1, 1))
+        self.assertIn("3 numerações verificadas · 1 XML recuperados · 1 não localizadas nesta tentativa", job.message)
+        self.assertIn("1 ainda aguardando XML ou consulta", job.message)
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertEqual(completed["missing_attempted"], 3)
+        self.assertEqual(completed["consulted"], 0)
+        self.assertFalse(completed["include_cursor"])
+        self.assertEqual(completed["cursor_nnf"], 15103)
+
+    def test_four_missing_absences_are_explicit_without_affecting_scan_counters(self):
+        notes = [dict(aamm="2608", nnf=n) for n in (60597, 60634, 60922, 61143)]
+        job, callbacks, _ = self.run_worker([("217", "Ausente", "")] * 9,
+            dict(missing_notes=notes, max_numbers=1))
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertIn("4 numerações verificadas · 0 XML recuperados · 4 não localizadas nesta tentativa", job.message)
+        self.assertEqual(job.public()["missing_attempted"], 4)
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertEqual(completed["consulted"], 1)
+        self.assertEqual(completed["cursor_nnf"], 15104)
+
+    def test_contingency_fallback_100_queues_the_confirmed_alternate_key(self):
+        job, callbacks, consults = self.run_worker([("217", "Ausente", ""), ("100", "Autorizada", "")],
+            dict(pending_only=True, missing_notes=[dict(aamm="2608", nnf=60597)]))
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual([call.args[1]["emission_type"] for call in consults], ["1", "9"])
+        expected = worker.access_key({**worker.parse_seed_xml(SEED), "emission_type": "9"}, 60597, "2608")
+        discovered = [call for call in callbacks if call.args[1] == "discovered"][0]
+        self.assertEqual(discovered.kwargs["key"], expected)
+        self.assertEqual(job.missing_recovered, 1)
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertFalse(completed["include_cursor"])
+        self.assertEqual(completed["cursor_nnf"], 15103)
+
+    def test_contingency_fallback_613_queues_real_response_key(self):
+        real = "7" * 44
+        job, callbacks, consults = self.run_worker([("217", "Ausente", ""), ("613", "Real", real)],
+            dict(pending_only=True, missing_notes=[dict(aamm="2608", nnf=60597)]))
+        self.assertEqual([call for call in callbacks if call.args[1] == "discovered"][0].kwargs["key"], real)
+        self.assertEqual(len(consults), 2)
+
+    def test_inconclusive_consultation_does_not_trigger_emission_fallback(self):
+        job, callbacks, consults = self.run_worker([("", "timeout", "")],
+            dict(pending_only=True, missing_notes=[dict(aamm="2608", nnf=60597)]))
+        self.assertEqual(len(consults), 1)
+        self.assertEqual(job.missing_not_located, 0)
+        self.assertEqual(len([call for call in callbacks if call.args[1] == "missing_attempt"]), 1)
+
+    def test_both_emission_types_absent_count_one_missing_attempt(self):
+        job, callbacks, consults = self.run_worker([("217", "Ausente", "")] * 2,
+            dict(pending_only=True, missing_notes=[dict(aamm="2608", nnf=60597)]))
+        self.assertEqual(len(consults), 2)
+        self.assertEqual(job.missing_attempted, 1)
+        self.assertEqual(job.missing_not_located, 1)
+        self.assertEqual(len([call for call in callbacks if call.args[1] == "missing_attempt"]), 1)
+
+    def test_contingency_seed_falls_back_to_normal_emission(self):
+        with patch.dict(globals(), SEED=SEED.replace(b"<tpEmis>1</tpEmis>", b"<tpEmis>9</tpEmis>")):
+            job, callbacks, consults = self.run_worker([("217", "Ausente", ""), ("100", "Autorizada", "")],
+                dict(pending_only=True, missing_notes=[dict(aamm="2608", nnf=60597)]))
+        self.assertEqual([call.args[1]["emission_type"] for call in consults], ["9", "1"])
+        self.assertEqual([call for call in callbacks if call.args[1] == "discovered"][0].kwargs["key"][34], "1")
