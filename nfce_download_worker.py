@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -421,6 +422,8 @@ class SvrsRateLimiter:
         self._clock = clock or time.monotonic
         self._sleep = sleep or time.sleep
         self._lock = threading.Lock()
+        self._download_condition = threading.Condition(self._lock)
+        self._download_tickets: deque[object] = deque()
         self._next = {"soap": 0.0, "download": 0.0}
         self._download_state = "available"
         self._cooldown_until = 0.0
@@ -463,26 +466,46 @@ class SvrsRateLimiter:
                 now = float(self._clock())
                 self._next["download"] = now + self.download_seconds
 
-    def begin_download(self) -> str:
-        """call libera uma requisição. skip não chama o portal."""
-        while True:
-            with self._lock:
-                now = float(self._clock())
-                self._roll_download_state_locked(now)
-                if self._download_state == "cooldown":
-                    delay = max(0.0, self._cooldown_until - now)
-                elif self._download_state == "half_open":
-                    if self._probe_issued:
-                        return "skip"
-                    self._probe_issued = True
-                    return "call"
+    def begin_download(self, notify_wait=None) -> str:
+        """FIFO admission, preserving spacing and the single half-open probe."""
+        ticket = object()
+        last_notification = float(self._clock()) - 30.0
+        with self._download_condition:
+            self._download_tickets.append(ticket)
+        try:
+            while True:
+                with self._download_condition:
+                    now = float(self._clock())
+                    is_head = self._download_tickets[0] is ticket
+                    delay = 0.0
+                    if is_head:
+                        self._roll_download_state_locked(now)
+                        if self._download_state == "cooldown":
+                            delay = max(0.0, self._cooldown_until - now)
+                        elif self._download_state == "half_open":
+                            if self._probe_issued:
+                                return "skip"
+                            self._probe_issued = True
+                            return "call"
+                        else:
+                            delay = max(0.0, self._next.get("download", 0.0) - now)
+                            if delay == 0:
+                                self._next["download"] = now + self.download_seconds
+                                return "call"
+                # Both heartbeat and sleep are outside the limiter lock.
+                if notify_wait and now - last_notification >= 30.0:
+                    notify_wait()
+                    last_notification = float(self._clock())
+                if is_head:
+                    self._sleep(min(delay, 30.0) if notify_wait else delay)
                 else:
-                    delay = max(0.0, self._next.get("download", 0.0) - now)
-                    if delay == 0:
-                        self._next["download"] = now + self.download_seconds
-                        return "call"
-            # Another job may have entered cooldown while this caller waited.
-            self._sleep(delay)
+                    with self._download_condition:
+                        if self._download_tickets[0] is not ticket:
+                            self._download_condition.wait(timeout=30.0)
+        finally:
+            with self._download_condition:
+                self._download_tickets.remove(ticket)
+                self._download_condition.notify_all()
 
     def wait(self, channel: str) -> float:
         if channel == "download" and self.download_state() == "cooldown":
@@ -1416,6 +1439,7 @@ def _download_one(
     run_id: str = "",
     empresa_id: str = "",
     notify=None,
+    notify_wait=None,
     session: requests.Session | None = None,
     transport: OutboundTransportManager | None = None,
     circuit: TransportCircuitBreaker | None = None,
@@ -1465,7 +1489,7 @@ def _download_one(
                 active.arm_same_key_retry(delay)
                 if notify:
                     notify(attempt)
-            slot = active.begin_download()
+            slot = active.begin_download(notify_wait=notify_wait) if notify_wait else active.begin_download()
             if slot == "skip":
                 active.note_remote_limit()
                 kind = "rate_limit"
@@ -1720,11 +1744,19 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         ),
                     )
 
+                def notify_pending_wait() -> None:
+                    message = f"Aguardando intervalo de download da SVRS · nota {item['nNF']}"
+                    _update(job, message=message, downloaded=pending_saved)
+                    _callback(job, "progress", message=message, consulted=0, found=0,
+                              downloaded=pending_saved, pending_total=pending_total,
+                              pending_failed=pending_failed, mode="pending_recovery")
+
                 item, xml, last_download_error, failure_kind = _download_one(
                     cert_path, key_path, verify_path, item, limiter,
                     run_id=job.external_run_id or "",
                     empresa_id=job.empresa_id,
                     notify=notify_attempt,
+                    notify_wait=notify_pending_wait,
                     session=session,
                     transport=transport,
                     circuit=circuit,
@@ -1934,12 +1966,23 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     "chave_real": found_key,
                     "_download_interval_seconds": interval_seconds,
                 }
+                def notify_download_wait() -> None:
+                    message = f"Aguardando intervalo de download da SVRS · nota {n_nf}"
+                    _update(job, message=message, consulted=len(records), found=len(found),
+                            downloaded=pending_saved, current_number=number,
+                            current_competence=current_month)
+                    _callback(job, "progress", message=message, consulted=len(records),
+                              found=len(found), downloaded=pending_saved,
+                              current_number=number, current_competence=current_month,
+                              mode="discovery")
+
                 _item, xml, error, kind = _download_one(
                     cert_path,
                     key_path,
                     verify_path,
                     item,
                     limiter,
+                    notify_wait=notify_download_wait,
                     run_id=job.external_run_id or "",
                     empresa_id=job.empresa_id,
                     session=session,

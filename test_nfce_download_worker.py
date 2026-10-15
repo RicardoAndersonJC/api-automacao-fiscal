@@ -725,3 +725,71 @@ class MissingNotesRecoveryTests(unittest.TestCase):
                 dict(pending_only=True, missing_notes=[dict(aamm="2608", nnf=60597)]))
         self.assertEqual([call.args[1]["emission_type"] for call in consults], ["9", "1"])
         self.assertEqual([call for call in callbacks if call.args[1] == "discovered"][0].kwargs["key"][34], "1")
+
+
+class DownloadFifoTests(unittest.TestCase):
+    def test_waiting_job_is_admitted_before_repeating_job(self):
+        now = [0.0]
+        first_sleep = threading.Event()
+        release_first = threading.Event()
+        waiter_queued = threading.Event()
+        order = []
+        sleep_calls = [0]
+        def sleep(seconds):
+            sleep_calls[0] += 1
+            if sleep_calls[0] == 1:
+                first_sleep.set()
+                if not release_first.wait(3):
+                    raise RuntimeError("test did not release head")
+            now[0] += seconds
+        limiter = worker.SvrsRateLimiter(download_seconds=60, clock=lambda: now[0], sleep=sleep)
+        self.assertEqual(limiter.begin_download(), "call")
+        def repeat():
+            limiter.begin_download()
+            order.append("first")
+            limiter.begin_download()
+            order.append("repeat")
+        def waiting():
+            limiter.begin_download(notify_wait=waiter_queued.set)
+            order.append("waiting")
+        first = threading.Thread(target=repeat)
+        second = threading.Thread(target=waiting)
+        first.start()
+        self.assertTrue(first_sleep.wait(3))
+        second.start()
+        self.assertTrue(waiter_queued.wait(3))
+        release_first.set()
+        first.join(3)
+        second.join(3)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(order, ["first", "waiting", "repeat"])
+        self.assertEqual(now[0], 180)
+
+    def test_wait_heartbeat_releases_lock_and_preserves_interval(self):
+        now = [0.0]
+        notifications = []
+        limiter = worker.SvrsRateLimiter(download_seconds=90, clock=lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+        limiter.begin_download()
+        def heartbeat():
+            self.assertTrue(limiter._lock.acquire(blocking=False))
+            limiter._lock.release()
+            notifications.append(now[0])
+        self.assertEqual(limiter.begin_download(notify_wait=heartbeat), "call")
+        self.assertEqual(now[0], 90)
+        self.assertEqual(notifications, [0, 30, 60])
+        self.assertEqual(limiter._next["download"], 180)
+
+    def test_heartbeat_exception_removes_ticket_for_following_jobs(self):
+        now = [0.0]
+        limiter = worker.SvrsRateLimiter(download_seconds=60, clock=lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+        limiter.begin_download()
+        def fail():
+            raise RuntimeError("heartbeat failed")
+        with self.assertRaises(RuntimeError):
+            limiter.begin_download(notify_wait=fail)
+        self.assertFalse(limiter._download_tickets)
+        self.assertEqual(limiter.begin_download(), "call")
+        self.assertEqual(now[0], 60)
