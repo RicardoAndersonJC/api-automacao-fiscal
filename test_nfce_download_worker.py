@@ -590,6 +590,7 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.assertNotIn("limite", completed["message"])
         self.assertFalse(completed["scan_complete"])
 
+
     def test_absence_must_be_acknowledged_before_cursor_moves(self):
         def fail_absent(job, event, **payload):
             if event == "absent":
@@ -623,6 +624,25 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         for payload in ["{}", '[{"aamm":"2613","nnf":1}]', '[{"aamm":"2608","nnf":true}]', json.dumps([dict(aamm="2608", nnf=1)] * 21)]:
             with self.assertRaises(ValueError):
                 worker.normalize_missing_notes(payload)
+
+    def test_missing_backlog_defers_new_notes_and_keeps_scan_open(self):
+        notes = [dict(aamm="2608", nnf=n) for n in range(25000, 25020)]
+        job, callbacks, consults = self.run_worker([("217", "Ausente", "")] * 40,
+            dict(missing_notes=notes, defer_discovery=True))
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(len(consults), 40)
+        self.assertEqual({call.args[2] for call in consults}, set(range(25000, 25020)))
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertTrue(completed["missing_backlog"])
+        self.assertEqual(completed["cursor_nnf"], 15103)
+        self.assertTrue(completed["include_cursor"])
+        self.assertFalse(completed["scan_complete"])
+
+    def test_last_missing_batch_runs_before_new_notes(self):
+        job, callbacks, consults = self.run_worker([("217", "Ausente", "")] * 3,
+            dict(missing_notes=[dict(aamm="2608", nnf=25000)], max_numbers=1))
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual([call.args[2] for call in consults], [25000, 25000, 15104])
 
     def test_soap_timeout_returns_hold_instead_of_losing_completed_work(self):
         from unittest.mock import Mock

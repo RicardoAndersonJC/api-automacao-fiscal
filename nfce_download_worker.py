@@ -2110,9 +2110,14 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             if halt_reason:
                 break
 
-        report_progress(f"Consultando {current_month} a partir da nNF {number}", force=True)
+        defer_discovery = options.get("defer_discovery", False)
+        report_progress(
+            "Notas faltantes primeiro · recuperação continua no próximo lote"
+            if defer_discovery else f"Consultando {current_month} a partir da nNF {number}",
+            force=True,
+        )
         scan_reason = halt_reason or "cap"
-        while not pending_only and not halt_reason and len(records) < max_numbers:
+        while not pending_only and not defer_discovery and not halt_reason and len(records) < max_numbers:
             _update(
                 job,
                 message=f"Consultando {current_month} nNF {number}",
@@ -2268,6 +2273,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             if awaiting_xml:
                 missing_summary += f" · {awaiting_xml} ainda aguardando XML ou consulta"
             completion_message += " · " + missing_summary
+        if defer_discovery and not paused_for_svrs:
+            completion_message += " · Notas faltantes primeiro; novas serão buscadas após os próximos lotes de recuperação"
         _update(
             job,
             status="completed",
@@ -2285,6 +2292,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             pending_saved=pending_saved, pending_failed=pending_failed,
             missing_attempted=missing_attempted, missing_recovered=missing_recovered,
             missing_not_located=missing_not_located,
+            missing_backlog=defer_discovery,
             pause_for_svrs=paused_for_svrs,
             message=completion_message,
         )
@@ -2441,6 +2449,7 @@ async def create_internal_job(
     lacunas_json: str = Form("[]"),
     intervalo_download_segundos: int = Form(60),
     somente_pendentes: str = Form("false"),
+    adiar_busca_novas: str = Form("false"),
     empresa_id: str = Form(""),
     organizacao_id: str = Form(""),
 ) -> dict[str, Any]:
@@ -2521,6 +2530,7 @@ async def create_internal_job(
         "query_interval_ms": int(os.getenv("NFCE_QUERY_INTERVAL_MS", "100")),
         "download_interval_seconds": clamp_download_interval(intervalo_download_segundos),
         "pending_only": pending_only,
+        "defer_discovery": str(adiar_busca_novas).strip().lower() == "true",
         "start_aamm": inicio_aamm,
         "start_number": inicio_nnf, "reference_date": data_referencia,
         "pending_items": normalized_pending,
