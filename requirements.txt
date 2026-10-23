@@ -9,3 +9,4 @@ signxml
 python-multipart
 BrazilFiscalReport==1.0.1
 XlsxWriter==3.2.5
+-r requirements-nexus-ai.txt

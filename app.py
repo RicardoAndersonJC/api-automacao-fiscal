@@ -23,6 +23,7 @@ from lxml import etree
 from signxml import XMLSigner, methods
 from nfse_zip_worker import install_nfse_zip_routes
 from nfe_danfe import install_nfe_danfe_routes
+from nexus_ai_api import install_nexus_ai_routes
 from nfce_download_worker import (
     MAX_PENDING_PER_RUN,
     discovery_scan_complete,
@@ -86,6 +87,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+install_nexus_ai_routes(app)
 
 
 def limpar_cnpj(cnpj: str) -> str:

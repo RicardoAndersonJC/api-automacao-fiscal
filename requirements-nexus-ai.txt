@@ -1,0 +1,4 @@
+# Additive dependencies for a separately validated deployment of the existing API.
+# Keep the original fiscal requirements; these do not replace them.
+httpx==0.28.1
+openai-agents==0.24.0
