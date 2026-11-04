@@ -281,6 +281,8 @@ def _upload_zip(
     object_path: str,
     local_path: Path,
     session: requests.Session | None = None,
+    *,
+    bucket: str = "nfse-exports-private",
 ) -> None:
     # Supabase recomenda TUS para arquivos acima de 6 MB. O ZIP continua sendo
     # um único objeto; somente a transferência ocorre em blocos retomáveis.
@@ -293,7 +295,7 @@ def _upload_zip(
     endpoint = f"{storage_origin}/storage/v1/upload/resumable"
     headers = _headers(key)
     metadata = {
-        "bucketName": "nfse-exports-private",
+        "bucketName": bucket,
         "objectName": object_path,
         "contentType": "application/zip",
         "cacheControl": "3600",

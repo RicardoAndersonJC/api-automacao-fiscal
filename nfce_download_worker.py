@@ -27,6 +27,7 @@ import shutil
 import tempfile
 import threading
 import time
+import unicodedata
 import zipfile
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,6 +37,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
+from uuid import UUID
 from xml.etree import ElementTree as ET
 
 import requests
@@ -75,6 +77,8 @@ _jobs: dict[str, "Job"] = {}
 # Jobs de orgs diferentes coexistem; o limitador da SVRS continua compartilhado.
 NFCE_WORKERS = max(1, int(os.getenv("NFCE_WORKERS", "2")))
 _executor = ThreadPoolExecutor(max_workers=NFCE_WORKERS)
+_export_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nfce-export")
+_export_slots = threading.BoundedSemaphore(MAX_QUEUED_JOBS + 1)
 DOWNLOAD_CONCURRENCY = 1
 # Compatibilidade com o health-check da API. Zero significa sem limite por lote.
 MAX_PENDING_PER_RUN = 0
@@ -2433,6 +2437,231 @@ def normalize_missing_notes(payload: str) -> list[dict[str, Any]]:
             result.append({"id": str(item.get("id") or ""), "aamm": aamm, "aamm_final": final_aamm, "nnf": nnf, "tentativas": attempts})
             seen.add((aamm, nnf))
     return result
+
+
+def _export_segment(value: str, fallback: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", normalized.encode("ascii", "ignore").decode())
+    return safe[:80].strip("._") or fallback
+
+
+def _export_update(
+    session: requests.Session,
+    url: str,
+    job_id: str,
+    status: str,
+    changes: dict[str, Any],
+) -> list[dict[str, Any]]:
+    response = session.patch(
+        f"{url}/rest/v1/execucoes",
+        params={
+            "id": f"eq.{job_id}",
+            "tipo": "eq.NFCE_EXPORT",
+            "status": f"eq.{status}",
+            "parametros->>export_mode": "eq.server_zip",
+        },
+        headers={"Prefer": "return=representation"},
+        json=changes,
+        timeout=(5, 20),
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _export_progress(
+    session: requests.Session,
+    url: str,
+    execution: dict[str, Any],
+    processed: int,
+) -> bool:
+    params = execution["parametros"]
+    return bool(_export_update(
+        session, url, execution["id"], "processando",
+        {
+            "progresso": min(99, round(100 * processed / max(1, params["total"]))),
+            "parametros": {
+                **params,
+                "parts": [],
+                "processed": processed,
+                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+            },
+        },
+    ))
+
+
+def _build_export_zip(
+    session: requests.Session,
+    url: str,
+    execution: dict[str, Any],
+    local_path: Path,
+) -> int | None:
+    params = execution["parametros"]
+    filters = {
+        "select": "id,nome,storage_path,empresa_id",
+        "organizacao_id": f"eq.{execution['organizacao_id']}",
+        "storage_path": "like.xml-nfce/*",
+        "created_at": f"lte.{execution['iniciado_em']}",
+        "order": "id.asc",
+        "limit": "100",
+    }
+    if execution.get("empresa_id"):
+        filters["empresa_id"] = f"eq.{execution['empresa_id']}"
+    if params.get("competencia"):
+        filters["metadata"] = f"cs.{json.dumps({'competencia': params['competencia']})}"
+
+    company_names: dict[str, str] = {}
+    processed = 0
+    last_progress = time.monotonic()
+    with zipfile.ZipFile(local_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as archive:
+        while True:
+            response = session.get(f"{url}/rest/v1/arquivos", params=filters, timeout=(5, 30))
+            response.raise_for_status()
+            rows = response.json()
+            if not rows:
+                break
+
+            missing_companies = {row["empresa_id"] for row in rows if row["empresa_id"]} - company_names.keys()
+            if missing_companies:
+                response = session.get(
+                    f"{url}/rest/v1/empresas",
+                    params={
+                        "select": "id,nome",
+                        "organizacao_id": filters["organizacao_id"],
+                        "id": f"in.({','.join(sorted(missing_companies))})",
+                    },
+                    timeout=(5, 30),
+                )
+                response.raise_for_status()
+                company_names.update({company["id"]: company["nome"] or "Empresa" for company in response.json()})
+
+            for row in rows:
+                company_id = row["empresa_id"]
+                storage_path = row["storage_path"]
+                # Member-writable arquivo records must never confer cross-org Storage access.
+                if (
+                    company_id not in company_names
+                    or not storage_path.startswith(f"xml-nfce/{company_id}/")
+                    or any(
+                        segment in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9_.-]+", segment)
+                        for segment in storage_path.split("/")
+                    )
+                ):
+                    raise ValueError("Referência de XML incompatível com a empresa")
+                company = _export_segment(company_names[company_id], "Empresa")
+                name = _export_segment(row["nome"] or "", f"{row['id']}.xml")
+                archive_name = f"{company}/{name}"
+                if archive_name in archive.NameToInfo:
+                    archive_name = f"{company}/duplicados/{row['id']}/{name}"
+                object_path = quote(storage_path, safe="/")
+                with session.get(
+                    f"{url}/storage/v1/object/fiscal-files/{object_path}",
+                    stream=True,
+                    timeout=(5, 45),
+                ) as xml:
+                    xml.raise_for_status()
+                    with archive.open(archive_name, "w") as entry:
+                        for chunk in xml.iter_content(chunk_size=64 * 1024):
+                            entry.write(chunk)
+                processed += 1
+                if time.monotonic() - last_progress >= 30:
+                    if not _export_progress(session, url, execution, processed):
+                        return None
+                    last_progress = time.monotonic()
+            filters["id"] = f"gt.{rows[-1]['id']}"
+            if not _export_progress(session, url, execution, processed):
+                return None
+            last_progress = time.monotonic()
+    if not processed:
+        raise ValueError("Nenhum XML disponível na exportação")
+    return processed
+
+
+def _run_export_zip(url: str, key: str, execution: dict[str, Any]) -> None:
+    job_id = execution["id"]
+    params = execution["parametros"]
+    archive_name = "nfce-completo.zip"
+    object_path = f"nfce-exports/{execution['organizacao_id']}/{job_id}/{archive_name}"
+    try:
+        if __package__:
+            from .nfse_zip_worker import _upload_zip
+        else:
+            from nfse_zip_worker import _upload_zip
+
+        with requests.Session() as session:
+            session.headers.update({"apikey": key, "Authorization": f"Bearer {key}"})
+            if not _export_progress(session, url, execution, 0):
+                return
+            with tempfile.TemporaryDirectory(prefix="nfce-export-", dir=WORK_ROOT) as work_dir:
+                local_path = Path(work_dir) / archive_name
+                processed = _build_export_zip(session, url, execution, local_path)
+                if processed is None or not _export_progress(session, url, execution, processed):
+                    return
+                _upload_zip(url, key, object_path, local_path, session, bucket="fiscal-files")
+                completed = _export_update(
+                    session, url, job_id, "processando",
+                    {
+                        "status": "concluido",
+                        "progresso": 100,
+                        "finalizado_em": datetime.now(timezone.utc).isoformat(),
+                        "parametros": {
+                            **params,
+                            "processed": processed,
+                            "total": processed,
+                            "parts": [{"path": object_path, "name": archive_name, "count": processed}],
+                        },
+                    },
+                )
+                if not completed:
+                    response = session.delete(f"{url}/storage/v1/object/fiscal-files/{object_path}", timeout=(5, 20))
+                    response.raise_for_status()
+    except Exception as exc:
+        # HTTP errors may contain private object names or upload URLs.
+        _logger.warning("Falha na exportação NFC-e %s (%s)", job_id, type(exc).__name__)
+        try:
+            with requests.Session() as session:
+                session.headers.update({"apikey": key, "Authorization": f"Bearer {key}"})
+                _export_update(
+                    session, url, job_id, "processando",
+                    {"status": "erro", "finalizado_em": datetime.now(timezone.utc).isoformat()},
+                )
+        except requests.RequestException:
+            _logger.warning("Falha ao registrar erro da exportação NFC-e %s", job_id)
+    finally:
+        _export_slots.release()
+
+
+@router.post("/internal/export", status_code=202)
+def create_internal_export(
+    payload: dict[str, str],
+    authorization: str | None = Header(None),
+) -> dict[str, bool]:
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    if not key or not secrets.compare_digest(_bearer_token(authorization).encode(), key.encode()):
+        raise HTTPException(status_code=401, detail="Acesso interno necessário")
+    if not url:
+        raise HTTPException(status_code=503, detail="Exportação NFC-e indisponível")
+    try:
+        job_id = str(UUID(payload.get("execucao_id", "")))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Identificador inválido") from exc
+
+    if not _export_slots.acquire(blocking=False):
+        raise HTTPException(status_code=503, detail="Fila de exportação ocupada")
+    submitted = False
+    try:
+        with requests.Session() as session:
+            session.headers.update({"apikey": key, "Authorization": f"Bearer {key}"})
+            claimed = _export_update(session, url, job_id, "pendente", {"status": "processando"})
+        if claimed:
+            _export_executor.submit(_run_export_zip, url, key, claimed[0])
+            submitted = True
+        return {"accepted": True}
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=503, detail="Não foi possível iniciar a exportação") from exc
+    finally:
+        if not submitted:
+            _export_slots.release()
 
 
 @router.post("/internal", status_code=202)
