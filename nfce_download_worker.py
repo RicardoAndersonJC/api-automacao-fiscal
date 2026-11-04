@@ -2503,7 +2503,7 @@ def _build_export_zip(
         "storage_path": "like.xml-nfce/*",
         "created_at": f"lte.{execution['iniciado_em']}",
         "order": "id.asc",
-        "limit": "100",
+        "limit": "250",
     }
     if execution.get("empresa_id"):
         filters["empresa_id"] = f"eq.{execution['empresa_id']}"
@@ -2542,14 +2542,17 @@ def _build_export_zip(
             if not rows:
                 break
 
-            missing_companies = {row["empresa_id"] for row in rows if row["empresa_id"]} - company_names.keys()
-            if missing_companies:
+            missing_companies = sorted(
+                {row["empresa_id"] for row in rows if row["empresa_id"]} - company_names.keys()
+            )
+            for start in range(0, len(missing_companies), 100):
+                company_batch = missing_companies[start:start + 100]
                 response = session.get(
                     f"{url}/rest/v1/empresas",
                     params={
                         "select": "id,nome",
                         "organizacao_id": filters["organizacao_id"],
-                        "id": f"in.({','.join(sorted(missing_companies))})",
+                        "id": f"in.({','.join(company_batch)})",
                     },
                     timeout=(5, 30),
                 )
