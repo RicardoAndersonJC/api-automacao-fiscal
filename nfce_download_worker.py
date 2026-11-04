@@ -2635,7 +2635,7 @@ def create_internal_export(
     payload: dict[str, str],
     authorization: str | None = Header(None),
 ) -> dict[str, bool]:
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
     url = os.getenv("SUPABASE_URL", "").rstrip("/")
     has_bearer = bool(authorization and authorization.lower().startswith("bearer "))
     if not key or not has_bearer or not secrets.compare_digest(_bearer_token(authorization).encode(), key.encode()):
