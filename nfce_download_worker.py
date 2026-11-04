@@ -31,6 +31,7 @@ import unicodedata
 import zipfile
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -2512,7 +2513,28 @@ def _build_export_zip(
     company_names: dict[str, str] = {}
     processed = 0
     last_progress = time.monotonic()
-    with zipfile.ZipFile(local_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as archive:
+    concurrency = 8
+
+    def download_xml(client: requests.Session, storage_path: str, destination: Path) -> None:
+        object_path = quote(storage_path, safe="/")
+        with client.get(
+            f"{url}/storage/v1/object/fiscal-files/{object_path}",
+            stream=True,
+            timeout=(5, 45),
+        ) as xml:
+            xml.raise_for_status()
+            with destination.open("wb") as output:
+                for chunk in xml.iter_content(chunk_size=64 * 1024):
+                    output.write(chunk)
+
+    with ExitStack() as resources:
+        clients = [resources.enter_context(requests.Session()) for _ in range(concurrency)]
+        for client in clients:
+            client.headers.update(session.headers)
+        pool = resources.enter_context(ThreadPoolExecutor(max_workers=concurrency))
+        archive = resources.enter_context(
+            zipfile.ZipFile(local_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True)
+        )
         while True:
             response = session.get(f"{url}/rest/v1/arquivos", params=filters, timeout=(5, 30))
             response.raise_for_status()
@@ -2534,6 +2556,7 @@ def _build_export_zip(
                 response.raise_for_status()
                 company_names.update({company["id"]: company["nome"] or "Empresa" for company in response.json()})
 
+            entries = []
             for row in rows:
                 company_id = row["empresa_id"]
                 storage_path = row["storage_path"]
@@ -2550,20 +2573,26 @@ def _build_export_zip(
                 company = _export_segment(company_names[company_id], "Empresa")
                 name = _export_segment(row["nome"] or "", f"{row['id']}.xml")
                 archive_name = f"{company}/{name}"
-                if archive_name in archive.NameToInfo:
-                    archive_name = f"{company}/duplicados/{row['id']}/{name}"
-                object_path = quote(storage_path, safe="/")
-                with session.get(
-                    f"{url}/storage/v1/object/fiscal-files/{object_path}",
-                    stream=True,
-                    timeout=(5, 45),
-                ) as xml:
-                    xml.raise_for_status()
-                    with archive.open(archive_name, "w") as entry:
-                        for chunk in xml.iter_content(chunk_size=64 * 1024):
-                            entry.write(chunk)
-                processed += 1
-                if time.monotonic() - last_progress >= 30:
+                entries.append((row["id"], storage_path, archive_name))
+
+            for start in range(0, len(entries), concurrency):
+                batch = entries[start:start + concurrency]
+                downloads = []
+                for slot, (row_id, storage_path, archive_name) in enumerate(batch):
+                    destination = local_path.parent / f"xml-{slot}.tmp"
+                    future = pool.submit(download_xml, clients[slot], storage_path, destination)
+                    downloads.append((future, destination, row_id, archive_name))
+
+                for future, destination, row_id, archive_name in downloads:
+                    future.result()
+                    if archive_name in archive.NameToInfo:
+                        company, name = archive_name.split("/", 1)
+                        archive_name = f"{company}/duplicados/{row_id}/{name}"
+                    archive.write(destination, archive_name)
+                    destination.unlink()
+                    processed += 1
+
+                if time.monotonic() - last_progress >= 5:
                     if not _export_progress(session, url, execution, processed):
                         return None
                     last_progress = time.monotonic()
