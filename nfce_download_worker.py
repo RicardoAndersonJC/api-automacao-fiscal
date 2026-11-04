@@ -2513,7 +2513,7 @@ def _build_export_zip(
     company_names: dict[str, str] = {}
     processed = 0
     last_progress = time.monotonic()
-    concurrency = 8
+    concurrency = 12
 
     def download_xml(client: requests.Session, storage_path: str, destination: Path) -> None:
         object_path = quote(storage_path, safe="/")
