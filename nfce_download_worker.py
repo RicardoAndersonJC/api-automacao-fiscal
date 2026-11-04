@@ -2637,7 +2637,12 @@ def create_internal_export(
 ) -> dict[str, bool]:
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     url = os.getenv("SUPABASE_URL", "").rstrip("/")
-    if not key or not secrets.compare_digest(_bearer_token(authorization).encode(), key.encode()):
+    has_bearer = bool(authorization and authorization.lower().startswith("bearer "))
+    if not key or not has_bearer or not secrets.compare_digest(_bearer_token(authorization).encode(), key.encode()):
+        _logger.warning(
+            "Autenticacao NFC-e export recusada: authorization_present=%s bearer_present=%s key_configured=%s",
+            bool(authorization), has_bearer, bool(key.strip()),
+        )
         raise HTTPException(status_code=401, detail="Acesso interno necessário")
     if not url:
         raise HTTPException(status_code=503, detail="Exportação NFC-e indisponível")
