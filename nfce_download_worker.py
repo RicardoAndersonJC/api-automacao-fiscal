@@ -2512,20 +2512,26 @@ def _build_export_zip(
 
     company_names: dict[str, str] = {}
     processed = 0
+    missing_xmls: list[str] = []
     last_progress = time.monotonic()
     concurrency = 12
 
-    def download_xml(client: requests.Session, storage_path: str, destination: Path) -> None:
+    def download_xml(client: requests.Session, storage_path: str, destination: Path) -> bool:
         object_path = quote(storage_path, safe="/")
         with client.get(
             f"{url}/storage/v1/object/fiscal-files/{object_path}",
             stream=True,
             timeout=(5, 45),
         ) as xml:
+            if xml.status_code == 404:
+                return False
+            if xml.status_code == 400 and xml.json().get("statusCode") in (404, "404"):
+                return False
             xml.raise_for_status()
             with destination.open("wb") as output:
                 for chunk in xml.iter_content(chunk_size=64 * 1024):
                     output.write(chunk)
+        return True
 
     with ExitStack() as resources:
         clients = [resources.enter_context(requests.Session()) for _ in range(concurrency)]
@@ -2584,13 +2590,15 @@ def _build_export_zip(
                     downloads.append((future, destination, row_id, archive_name))
 
                 for future, destination, row_id, archive_name in downloads:
-                    future.result()
+                    processed += 1
+                    if not future.result():
+                        missing_xmls.append(archive_name)
+                        continue
                     if archive_name in archive.NameToInfo:
                         company, name = archive_name.split("/", 1)
                         archive_name = f"{company}/duplicados/{row_id}/{name}"
                     archive.write(destination, archive_name)
                     destination.unlink()
-                    processed += 1
 
                 if time.monotonic() - last_progress >= 5:
                     if not _export_progress(session, url, execution, processed):
@@ -2600,9 +2608,18 @@ def _build_export_zip(
             if not _export_progress(session, url, execution, processed):
                 return None
             last_progress = time.monotonic()
+        if missing_xmls:
+            report = [
+                "Exportação parcial de XMLs NFC-e",
+                f"XMLs incluídos: {processed - len(missing_xmls)}",
+                f"XMLs ausentes no Storage: {len(missing_xmls)}",
+                "",
+                *missing_xmls,
+            ]
+            archive.writestr("AVISO-XMLS-AUSENTES.txt", "\n".join(report) + "\n")
     if not processed:
         raise ValueError("Nenhum XML disponível na exportação")
-    return processed
+    return processed - len(missing_xmls)
 
 
 def _run_export_zip(url: str, key: str, execution: dict[str, Any]) -> None:
