@@ -1763,8 +1763,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 second_transport = OutboundTransportManager.from_env({
                     "PROXY_ENABLED": "true",
                     "PROXY_URL": second_proxy_url,
-                    "PROXY_USERNAME": os.getenv("NFCE_PROXY_PILOT_USERNAME_2", ""),
-                    "PROXY_PASSWORD": os.getenv("NFCE_PROXY_PILOT_PASSWORD_2", ""),
+                    "PROXY_USERNAME": os.getenv("NFCE_PROXY_PILOT_USERNAME_2") or os.getenv("NFCE_PROXY_PILOT_USERNAME", ""),
+                    "PROXY_PASSWORD": os.getenv("NFCE_PROXY_PILOT_PASSWORD_2") or os.getenv("NFCE_PROXY_PILOT_PASSWORD", ""),
                 })
                 with ThreadPoolExecutor(max_workers=2) as pilot_pool:
                     first = pilot_pool.submit(
