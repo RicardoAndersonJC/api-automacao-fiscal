@@ -471,7 +471,7 @@ class SvrsRateLimiter:
                 now = float(self._clock())
                 self._next["download"] = now + self.download_seconds
 
-    def begin_download(self, notify_wait=None) -> str:
+    def begin_download(self, notify_wait=None, lane: str = "download") -> str:
         """FIFO admission, preserving spacing and the single half-open probe."""
         ticket = object()
         last_notification = float(self._clock()) - 30.0
@@ -493,9 +493,9 @@ class SvrsRateLimiter:
                             self._probe_issued = True
                             return "call"
                         else:
-                            delay = max(0.0, self._next.get("download", 0.0) - now)
+                            delay = max(0.0, self._next.get(lane, 0.0) - now)
                             if delay == 0:
-                                self._next["download"] = now + self.download_seconds
+                                self._next[lane] = now + self.download_seconds
                                 return "call"
                 # Both heartbeat and sleep are outside the limiter lock.
                 if notify_wait and now - last_notification >= 30.0:
@@ -529,14 +529,14 @@ class SvrsRateLimiter:
             self._sleep(delay)
         return delay
 
-    def arm_same_key_retry(self, seconds: float) -> None:
+    def arm_same_key_retry(self, seconds: float, lane: str = "download") -> None:
         """A próxima espera do download desta chave fica em `seconds`, sem furar o cooldown."""
         with self._lock:
             now = float(self._clock())
             target = now + max(0.0, float(seconds))
             if self._download_state == "cooldown":
                 target = max(target, self._cooldown_until)
-            self._next["download"] = max(self._next["download"], target)
+            self._next[lane] = max(self._next.get(lane, 0.0), target)
 
 
 def discovery_action(status: str, artificial: str, real_key: str) -> tuple[str, str]:
@@ -1448,6 +1448,7 @@ def _download_one(
     session: requests.Session | None = None,
     transport: OutboundTransportManager | None = None,
     circuit: TransportCircuitBreaker | None = None,
+    lane: str = "download",
 ) -> tuple[dict[str, Any], str | None, str, str]:
     """Até 3 tentativas. Limite do portal entra em cooldown. Página sem XML repete a chave.
 
@@ -1486,15 +1487,18 @@ def _download_one(
                 )
                 return item, None, message, kind
             if attempt and kind == "no_xml":
-                active.arm_same_key_retry(PORTAL_EMPTY_RETRY_SECONDS)
+                active.arm_same_key_retry(PORTAL_EMPTY_RETRY_SECONDS, lane=lane)
                 if notify:
                     notify(attempt)
             elif attempt and failure_policy(kind) == "backoff":
                 delay = transient_backoff_seconds(attempt - 1)
-                active.arm_same_key_retry(delay)
+                active.arm_same_key_retry(delay, lane=lane)
                 if notify:
                     notify(attempt)
-            slot = active.begin_download(notify_wait=notify_wait) if notify_wait else active.begin_download()
+            if lane != "download":
+                slot = active.begin_download(notify_wait=notify_wait, lane=lane)
+            else:
+                slot = active.begin_download(notify_wait=notify_wait) if notify_wait else active.begin_download()
             if slot == "skip":
                 active.note_remote_limit()
                 kind = "rate_limit"
@@ -1739,8 +1743,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 message=f"Recuperando pendências: 0/{pending_total}",
             )
 
-            for pending_index, pending in enumerate(pending_queue, 1):
-                item = {
+            def pending_download_item(pending):
+                return {
                     "AAMM": str(pending["aamm"]),
                     "nNF": int(pending["nnf"]),
                     "cStat": "PENDENTE",
@@ -1748,6 +1752,37 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     "chave_real": str(pending["chave"]),
                     "_download_interval_seconds": interval_seconds,
                 }
+
+            second_proxy_url = os.getenv("NFCE_PROXY_PILOT_URL_2", "").strip()
+            parallel_results = []
+            if (
+                pilot_available and pending_only and not options.get("missing_notes")
+                and len(pending_queue) == 2 and second_proxy_url
+                and second_proxy_url != pilot_proxy_url
+            ):
+                second_transport = OutboundTransportManager.from_env({
+                    "PROXY_ENABLED": "true",
+                    "PROXY_URL": second_proxy_url,
+                    "PROXY_USERNAME": os.getenv("NFCE_PROXY_PILOT_USERNAME_2", ""),
+                    "PROXY_PASSWORD": os.getenv("NFCE_PROXY_PILOT_PASSWORD_2", ""),
+                })
+                with ThreadPoolExecutor(max_workers=2) as pilot_pool:
+                    first = pilot_pool.submit(
+                        download_for_job, cert_path, key_path, verify_path,
+                        pending_download_item(pending_queue[0]), limiter,
+                        run_id=job.external_run_id or "", empresa_id=job.empresa_id,
+                        circuit=circuit,
+                    )
+                    second = pilot_pool.submit(
+                        _download_one, cert_path, key_path, verify_path,
+                        pending_download_item(pending_queue[1]), limiter,
+                        run_id=job.external_run_id or "", empresa_id=job.empresa_id,
+                        transport=second_transport, circuit=circuit, lane="pilot-download-2",
+                    )
+                    parallel_results = [first.result(), second.result()]
+
+            for pending_index, pending in enumerate(pending_queue, 1):
+                item = pending_download_item(pending)
 
                 def notify_attempt(attempt: int) -> None:
                     espera = PORTAL_EMPTY_RETRY_SECONDS if attempt else interval_seconds
@@ -1773,16 +1808,19 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                               downloaded=pending_saved, pending_total=pending_total,
                               pending_failed=pending_failed, mode="pending_recovery")
 
-                item, xml, last_download_error, failure_kind = download_for_job(
-                    cert_path, key_path, verify_path, item, limiter,
-                    run_id=job.external_run_id or "",
-                    empresa_id=job.empresa_id,
-                    notify=notify_attempt,
-                    notify_wait=notify_pending_wait,
-                    session=session,
-                    transport=transport,
-                    circuit=circuit,
-                )
+                if parallel_results:
+                    item, xml, last_download_error, failure_kind = parallel_results[pending_index - 1]
+                else:
+                    item, xml, last_download_error, failure_kind = download_for_job(
+                        cert_path, key_path, verify_path, item, limiter,
+                        run_id=job.external_run_id or "",
+                        empresa_id=job.empresa_id,
+                        notify=notify_attempt,
+                        notify_wait=notify_pending_wait,
+                        session=session,
+                        transport=transport,
+                        circuit=circuit,
+                    )
 
                 if xml:
                     full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
@@ -1848,9 +1886,10 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
 
                 if failure_kind in {"rate_limit", "circuit_open", "proxy"}:
                     paused_for_svrs = True
-                    break
+                    if not parallel_results:
+                        break
 
-                if pending_index < pending_total and interval_seconds and not paused_for_svrs:
+                if not parallel_results and pending_index < pending_total and interval_seconds and not paused_for_svrs:
                     wait_message = (
                         f"Aguardando {format_wait(interval_seconds)} · pendência "
                         f"{pending_index}/{pending_total}"
