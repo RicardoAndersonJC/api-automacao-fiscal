@@ -617,6 +617,37 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.assertEqual(sum(call.args[1] == "file" for call in callbacks), 10)
         self.assertEqual([routes[number] for number in sorted(routes)], [f"outbound-{slot}" for slot in range(1, 11)])
 
+    def test_all_companies_flushes_full_and_partial_batches_before_scan_completes(self):
+        import os
+
+        discoveries = []
+        downloads = []
+        def on_callback(job, event, **payload):
+            if event == "discovered":
+                discoveries.append(payload["key"])
+
+        def download(*args, **kwargs):
+            downloads.append((len(discoveries), kwargs["lane"]))
+            return {}, "<nfeProc><NFe /></nfeProc>", "", "ok"
+
+        env = {
+            "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+            "NFCE_PROXY_BATCH_SIZE": "2",
+            "NFCE_PROXY_PILOT_EMPRESA_ID": "another-company",
+            "NFCE_PROXY_PILOT_URL": "http://192.0.2.1:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.2:8080",
+        }
+        with patch.dict(os.environ, env):
+            job, callbacks, consults = self.run_worker(
+                [("613", "", f"{number:044d}") for number in range(1, 6)] + [("217", "", "")],
+                dict(stop_gap=1), callback_effect=on_callback, downloads=download,
+            )
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(len(consults), 6)
+        self.assertEqual(sorted(count for count, _ in downloads), [2, 2, 4, 4, 5])
+        self.assertEqual({lane for _, lane in downloads}, {"proxy-ip:192.0.2.1", "proxy-ip:192.0.2.2"})
+        self.assertTrue(callbacks[-1].kwargs["scan_complete"])
+
     def test_webshare_pilot_routes_limits_and_deduplicates_direct_addresses(self):
         rows = [
             dict(proxy_address=f"192.0.2.{index}", port=8080, valid=True, username="test", password="test")

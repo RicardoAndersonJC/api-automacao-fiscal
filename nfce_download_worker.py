@@ -830,11 +830,11 @@ _shared_transport: OutboundTransportManager | None = None
 _shared_transport_guard = threading.Lock()
 
 
-def webshare_pilot_routes(api_key: str, plan_id: str) -> list[OutboundRoute]:
+def webshare_pilot_routes(api_key: str, plan_id: str, limit: int = 10) -> list[OutboundRoute]:
     routes: list[OutboundRoute] = []
     seen_addresses: set[str] = set()
     try:
-        for page in range(1, 5):
+        for page in range(1, 1 + (limit + 24) // 25 + 3):
             params = {"mode": "direct", "page": page, "page_size": 25, "valid": "true"}
             if plan_id:
                 params["plan_id"] = plan_id
@@ -859,7 +859,7 @@ def webshare_pilot_routes(api_key: str, plan_id: str) -> list[OutboundRoute]:
                     f"outbound-{len(routes) + 1}", f"http://{address}:{port}",
                     str(proxy["username"]), str(proxy["password"]),
                 ))
-                if len(routes) == 10:
+                if len(routes) == limit:
                     return routes
             if not data.get("next"):
                 break
@@ -1728,12 +1728,19 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         circuit = shared_transport_circuit()
         session = _new_svrs_session(cert_path, key_path, verify_path, transport)
         pilot_company_id = os.getenv("NFCE_PROXY_PILOT_EMPRESA_ID", "").strip()
+        all_companies_batch = os.getenv("NFCE_PROXY_BATCH_ALL_COMPANIES") == "true"
+        batch_size = 10
+        if all_companies_batch:
+            try:
+                batch_size = max(1, min(100, int(os.getenv("NFCE_PROXY_BATCH_SIZE", "10"))))
+            except ValueError:
+                pass
         pilot_routes: list[OutboundRoute] = []
-        if pilot_company_id and job.empresa_id == pilot_company_id:
+        if all_companies_batch or (pilot_company_id and job.empresa_id == pilot_company_id):
             webshare_key = os.getenv("NFCE_PROXY_PILOT_WEBSHARE_API_KEY", "").strip()
             if webshare_key:
                 pilot_routes = webshare_pilot_routes(
-                    webshare_key, os.getenv("NFCE_PROXY_PILOT_WEBSHARE_PLAN_ID", "").strip(),
+                    webshare_key, os.getenv("NFCE_PROXY_PILOT_WEBSHARE_PLAN_ID", "").strip(), batch_size,
                 )
             if not pilot_routes:
                 seen_proxy_urls: set[str] = set()
@@ -1750,9 +1757,13 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         pilot_available = bool(pilot_routes)
         discovery_pilot = bool(
             len(pilot_routes) >= 2
-            and os.getenv("NFCE_PROXY_PILOT_DISCOVERY_BATCH") == "true"
+            and (all_companies_batch or os.getenv("NFCE_PROXY_PILOT_DISCOVERY_BATCH") == "true")
             and not pending_only and not options.get("missing_notes")
         )
+
+        def proxy_lane(route: OutboundTransportManager) -> str:
+            address = urlparse(route.current().proxy_url or "").hostname
+            return f"proxy-ip:{address}"
 
         def download_for_job(*args, **kwargs):
             nonlocal pilot_available
@@ -1760,6 +1771,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 pilot_available = False
                 kwargs["session"] = None
                 kwargs["transport"] = OutboundTransportManager([pilot_routes[0]], enabled=True)
+                kwargs["lane"] = proxy_lane(kwargs["transport"])
             return _download_one(*args, **kwargs)
 
         saved_keys = {str(key) for key in (options.get("saved_keys") or []) if str(key)}
@@ -1827,7 +1839,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         _download_one, cert_path, key_path, verify_path,
                         pending_download_item(pending_queue[1]), limiter,
                         run_id=job.external_run_id or "", empresa_id=job.empresa_id,
-                        transport=second_transport, circuit=circuit, lane="pilot-download-2",
+                        transport=second_transport, circuit=circuit, lane=proxy_lane(second_transport),
                     )
                     parallel_results = [first.result(), second.result()]
 
@@ -2037,7 +2049,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         number = start_number + 1
         consecutive_217, gap_start, last_probe = 0, None, number - 1
         probed_this_gap = False
-        max_numbers = min(options["max_numbers"], 10) if discovery_pilot else options["max_numbers"]
+        max_numbers = min(options["max_numbers"], 10) if discovery_pilot and not all_companies_batch else options["max_numbers"]
         last_progress_at = 0.0
         # Cursor já gravado. Só anda depois de ausência (217) ou de ack HTTP 200 da chave.
         safe_aamm = current_month
@@ -2144,6 +2156,45 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             if outcome == "pause":
                 halt_reason = "hold"
                 paused_for_svrs = True
+
+        discovery_queue: dict[str, dict[str, Any]] = {}
+
+        def flush_discovered() -> None:
+            candidates = list(discovery_queue.values())
+            discovery_queue.clear()
+            if not candidates:
+                return
+            routes = [OutboundTransportManager([route], enabled=True) for route in pilot_routes]
+            with ThreadPoolExecutor(max_workers=len(routes)) as pilot_pool:
+                for offset in range(0, len(candidates), len(routes)):
+                    batch = candidates[offset:offset + len(routes)]
+                    futures = {
+                        pilot_pool.submit(
+                            _download_one, cert_path, key_path, verify_path,
+                            {**item, "_download_interval_seconds": interval_seconds}, limiter,
+                            run_id=job.external_run_id or "", empresa_id=job.empresa_id,
+                            transport=route, circuit=circuit,
+                            lane=proxy_lane(route),
+                        ): item
+                        for item, route in zip(batch, routes)
+                    }
+                    for future in as_completed(futures):
+                        item = futures[future]
+                        download_found(item["AAMM"], item["nNF"], item["chave_real"], result=future.result())
+                    if paused_for_svrs:
+                        break
+
+        def download_or_queue(aamm: str, n_nf: int, key: str) -> None:
+            if not discovery_pilot:
+                download_found(aamm, n_nf, key)
+                return
+            if key in saved_keys:
+                return
+            discovery_queue[key] = {
+                "AAMM": aamm, "nNF": n_nf, "chave_real": key,
+            }
+            if all_companies_batch and len(discovery_queue) >= batch_size:
+                flush_discovered()
 
         def report_progress(message: str, force: bool = False) -> None:
             nonlocal last_progress_at
@@ -2256,8 +2307,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             )
             if action == "found" and _found_key:
                 record["chave_real"] = _found_key
-                if not discovery_pilot:
-                    download_found(current_month, number, _found_key)
+                download_or_queue(current_month, number, _found_key)
             if halt_reason:
                 scan_reason = halt_reason
                 break
@@ -2312,8 +2362,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         if not probe_acked:
                             halt_reason = "ack"
                             break
-                        if action2 == "found" and _probe_key and not discovery_pilot:
-                            download_found(following, probe, _probe_key)
+                        if action2 == "found" and _probe_key:
+                            download_or_queue(following, probe, _probe_key)
                         if halt_reason:
                             break
                         if action2 == "found":
@@ -2333,27 +2383,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             number += 1
 
         if discovery_pilot and not paused_for_svrs and not halt_reason and scan_reason not in {"hold", "ack"}:
-            queued = {item["chave_real"]: item for item in found if item["chave_real"] not in saved_keys}
-            candidates = list(queued.values())
-            routes = [OutboundTransportManager([route], enabled=True) for route in pilot_routes]
-            with ThreadPoolExecutor(max_workers=len(routes)) as pilot_pool:
-                for offset in range(0, len(candidates), len(routes)):
-                    batch = candidates[offset:offset + len(routes)]
-                    futures = {
-                        pilot_pool.submit(
-                            _download_one, cert_path, key_path, verify_path,
-                            {**item, "_download_interval_seconds": interval_seconds}, limiter,
-                            run_id=job.external_run_id or "", empresa_id=job.empresa_id,
-                            transport=route, circuit=circuit,
-                            lane="download" if slot == 1 else f"pilot-download-{slot}",
-                        ): item
-                        for slot, (item, route) in enumerate(zip(batch, routes), 1)
-                    }
-                    for future in as_completed(futures):
-                        item = futures[future]
-                        download_found(item["AAMM"], item["nNF"], item["chave_real"], result=future.result())
-                    if paused_for_svrs:
-                        break
+            flush_discovered()
 
         _update(
             job, consulted=len(records), found=len(found),
