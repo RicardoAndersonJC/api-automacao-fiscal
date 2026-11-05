@@ -562,7 +562,7 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         from contextlib import ExitStack
         from unittest.mock import Mock
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
-            job = worker.Job(id="test", owner_id="test", directory=Path(directory))
+            job = worker.Job(id="test", owner_id="test", directory=Path(directory), empresa_id="test-company")
             defaults = dict(start_aamm="2608", start_number=15103, max_numbers=7,
                             month_trigger=8, month_window=30, stop_gap=80)
             defaults.update(options or {})
@@ -577,6 +577,42 @@ class MissingNotesRecoveryTests(unittest.TestCase):
             callback = stack.enter_context(patch.object(worker, "_callback", side_effect=callback_effect))
             worker.run_job(job, SEED, b"pfx", "", defaults)
             return job, callback.call_args_list, consult.call_args_list
+
+    def test_discovery_pilot_acknowledges_ten_keys_before_downloading_in_pairs(self):
+        import os
+        import threading
+
+        barrier = threading.Barrier(2, timeout=2)
+        acknowledged = []
+        routes = {}
+
+        def on_callback(job, event, **payload):
+            if event == "discovered":
+                acknowledged.append(payload["key"])
+
+        def download(*args, **kwargs):
+            self.assertEqual(len(acknowledged), 10)
+            routes[args[3]["nNF"]] = kwargs["transport"].current().outbound_id
+            barrier.wait()
+            return {}, "<nfeProc><NFe /></nfeProc>", "", "ok"
+
+        env = {
+            "NFCE_PROXY_PILOT_EMPRESA_ID": "test-company",
+            "NFCE_PROXY_PILOT_URL": "http://first.invalid:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://second.invalid:8080",
+            "NFCE_PROXY_PILOT_DISCOVERY_BATCH": "true",
+        }
+        with patch.dict(os.environ, env):
+            job, callbacks, consults = self.run_worker(
+                [("613", "", f"{number:044d}") for number in range(1, 12)],
+                dict(max_numbers=11),
+                callback_effect=on_callback,
+                downloads=download,
+            )
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(len(consults), 10)
+        self.assertEqual(sum(call.args[1] == "file" for call in callbacks), 10)
+        self.assertEqual([routes[number] for number in sorted(routes)], ["outbound-1", "outbound-2"] * 5)
 
     def test_six_saved_then_timeout_keeps_cursor_and_requests_resume(self):
         responses = [("100", "Autorizada", str(index) * 44) for index in range(1, 7)] + [("", "timeout", "")]

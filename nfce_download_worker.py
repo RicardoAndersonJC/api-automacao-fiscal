@@ -1692,17 +1692,28 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         pilot_proxy_url = os.getenv("NFCE_PROXY_PILOT_URL", "").strip()
         pilot_available = bool(pilot_company_id and job.empresa_id == pilot_company_id and pilot_proxy_url)
 
+        second_proxy_url = os.getenv("NFCE_PROXY_PILOT_URL_2", "").strip()
+        discovery_pilot = bool(
+            pilot_available and second_proxy_url and second_proxy_url != pilot_proxy_url
+            and os.getenv("NFCE_PROXY_PILOT_DISCOVERY_BATCH") == "true"
+            and not pending_only and not options.get("missing_notes")
+        )
+
+        def pilot_transport(slot: int) -> OutboundTransportManager:
+            suffix = "" if slot == 1 else "_2"
+            return OutboundTransportManager.from_env({
+                "PROXY_ENABLED": "true",
+                f"PROXY_URL{suffix}": pilot_proxy_url if slot == 1 else second_proxy_url,
+                f"PROXY_USERNAME{suffix}": os.getenv(f"NFCE_PROXY_PILOT_USERNAME{suffix}") or os.getenv("NFCE_PROXY_PILOT_USERNAME", ""),
+                f"PROXY_PASSWORD{suffix}": os.getenv(f"NFCE_PROXY_PILOT_PASSWORD{suffix}") or os.getenv("NFCE_PROXY_PILOT_PASSWORD", ""),
+            })
+
         def download_for_job(*args, **kwargs):
             nonlocal pilot_available
             if pilot_available:
                 pilot_available = False
                 kwargs["session"] = None
-                kwargs["transport"] = OutboundTransportManager.from_env({
-                    "PROXY_ENABLED": "true",
-                    "PROXY_URL": pilot_proxy_url,
-                    "PROXY_USERNAME": os.getenv("NFCE_PROXY_PILOT_USERNAME", ""),
-                    "PROXY_PASSWORD": os.getenv("NFCE_PROXY_PILOT_PASSWORD", ""),
-                })
+                kwargs["transport"] = pilot_transport(1)
             return _download_one(*args, **kwargs)
 
         saved_keys = {str(key) for key in (options.get("saved_keys") or []) if str(key)}
@@ -1753,19 +1764,13 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     "_download_interval_seconds": interval_seconds,
                 }
 
-            second_proxy_url = os.getenv("NFCE_PROXY_PILOT_URL_2", "").strip()
             parallel_results = []
             if (
                 pilot_available and pending_only and not options.get("missing_notes")
                 and len(pending_queue) == 2 and second_proxy_url
                 and second_proxy_url != pilot_proxy_url
             ):
-                second_transport = OutboundTransportManager.from_env({
-                    "PROXY_ENABLED": "true",
-                    "PROXY_URL": second_proxy_url,
-                    "PROXY_USERNAME": os.getenv("NFCE_PROXY_PILOT_USERNAME_2") or os.getenv("NFCE_PROXY_PILOT_USERNAME", ""),
-                    "PROXY_PASSWORD": os.getenv("NFCE_PROXY_PILOT_PASSWORD_2") or os.getenv("NFCE_PROXY_PILOT_PASSWORD", ""),
-                })
+                second_transport = pilot_transport(2)
                 with ThreadPoolExecutor(max_workers=2) as pilot_pool:
                     first = pilot_pool.submit(
                         download_for_job, cert_path, key_path, verify_path,
@@ -1987,7 +1992,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         number = start_number + 1
         consecutive_217, gap_start, last_probe = 0, None, number - 1
         probed_this_gap = False
-        max_numbers = options["max_numbers"]
+        max_numbers = min(options["max_numbers"], 10) if discovery_pilot else options["max_numbers"]
         last_progress_at = 0.0
         # Cursor já gravado. Só anda depois de ausência (217) ou de ack HTTP 200 da chave.
         safe_aamm = current_month
@@ -2015,7 +2020,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
 
         halt_reason: str | None = None
 
-        def download_found(aamm: str, n_nf: int, found_key: str) -> None:
+        def download_found(aamm: str, n_nf: int, found_key: str, *, result=None) -> None:
             """Baixa toda chave encontrada; só pausa se a SVRS pedir contenção."""
             nonlocal halt_reason, pending_saved, pending_failed, paused_for_svrs
 
@@ -2037,7 +2042,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                               current_number=number, current_competence=current_month,
                               mode="discovery")
 
-                _item, xml, error, kind = download_for_job(
+                _item, xml, error, kind = result if result is not None else download_for_job(
                     cert_path,
                     key_path,
                     verify_path,
@@ -2206,7 +2211,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             )
             if action == "found" and _found_key:
                 record["chave_real"] = _found_key
-                download_found(current_month, number, _found_key)
+                if not discovery_pilot:
+                    download_found(current_month, number, _found_key)
             if halt_reason:
                 scan_reason = halt_reason
                 break
@@ -2261,7 +2267,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         if not probe_acked:
                             halt_reason = "ack"
                             break
-                        if action2 == "found" and _probe_key:
+                        if action2 == "found" and _probe_key and not discovery_pilot:
                             download_found(following, probe, _probe_key)
                         if halt_reason:
                             break
@@ -2280,6 +2286,29 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 scan_reason = "gap"
                 break
             number += 1
+
+        if discovery_pilot and not paused_for_svrs and not halt_reason and scan_reason not in {"hold", "ack"}:
+            queued = {item["chave_real"]: item for item in found if item["chave_real"] not in saved_keys}
+            candidates = list(queued.values())
+            routes = (pilot_transport(1), pilot_transport(2))
+            with ThreadPoolExecutor(max_workers=2) as pilot_pool:
+                for offset in range(0, len(candidates), 2):
+                    batch = candidates[offset:offset + 2]
+                    futures = {
+                        pilot_pool.submit(
+                            _download_one, cert_path, key_path, verify_path,
+                            {**item, "_download_interval_seconds": interval_seconds}, limiter,
+                            run_id=job.external_run_id or "", empresa_id=job.empresa_id,
+                            transport=routes[slot], circuit=circuit,
+                            lane="download" if slot == 0 else "pilot-download-2",
+                        ): item
+                        for slot, item in enumerate(batch)
+                    }
+                    for future in as_completed(futures):
+                        item = futures[future]
+                        download_found(item["AAMM"], item["nNF"], item["chave_real"], result=future.result())
+                    if paused_for_svrs:
+                        break
 
         _update(
             job, consulted=len(records), found=len(found),
