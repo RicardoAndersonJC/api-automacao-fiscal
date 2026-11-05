@@ -1681,25 +1681,26 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         verify_path = svrs_ca_bundle()
         pending_items = list(options.get("pending_items") or [])
         pending_only = bool(options.get("pending_only"))
-        pilot_company_id = os.getenv("NFCE_PROXY_PILOT_EMPRESA_ID", "").strip()
-        pilot_key = os.getenv("NFCE_PROXY_PILOT_CHAVE", "").strip()
-        pilot_proxy_url = os.getenv("NFCE_PROXY_PILOT_URL", "").strip()
-        if (
-            pilot_company_id and job.empresa_id == pilot_company_id
-            and pilot_key and pilot_proxy_url
-            and pending_only and not options.get("missing_notes")
-            and len(pending_items) == 1 and pending_items[0].get("chave") == pilot_key
-        ):
-            transport = OutboundTransportManager.from_env({
-                "PROXY_ENABLED": "true",
-                "PROXY_URL": pilot_proxy_url,
-                "PROXY_USERNAME": os.getenv("NFCE_PROXY_PILOT_USERNAME", ""),
-                "PROXY_PASSWORD": os.getenv("NFCE_PROXY_PILOT_PASSWORD", ""),
-            })
-        else:
-            transport = shared_outbound_transport()
+        transport = shared_outbound_transport()
         circuit = shared_transport_circuit()
         session = _new_svrs_session(cert_path, key_path, verify_path, transport)
+        pilot_company_id = os.getenv("NFCE_PROXY_PILOT_EMPRESA_ID", "").strip()
+        pilot_proxy_url = os.getenv("NFCE_PROXY_PILOT_URL", "").strip()
+        pilot_available = bool(pilot_company_id and job.empresa_id == pilot_company_id and pilot_proxy_url)
+
+        def download_for_job(*args, **kwargs):
+            nonlocal pilot_available
+            if pilot_available:
+                pilot_available = False
+                kwargs["session"] = None
+                kwargs["transport"] = OutboundTransportManager.from_env({
+                    "PROXY_ENABLED": "true",
+                    "PROXY_URL": pilot_proxy_url,
+                    "PROXY_USERNAME": os.getenv("NFCE_PROXY_PILOT_USERNAME", ""),
+                    "PROXY_PASSWORD": os.getenv("NFCE_PROXY_PILOT_PASSWORD", ""),
+                })
+            return _download_one(*args, **kwargs)
+
         saved_keys = {str(key) for key in (options.get("saved_keys") or []) if str(key)}
         records: list[dict[str, Any]] = []
         interval_seconds = clamp_download_interval(
@@ -1772,7 +1773,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                               downloaded=pending_saved, pending_total=pending_total,
                               pending_failed=pending_failed, mode="pending_recovery")
 
-                item, xml, last_download_error, failure_kind = _download_one(
+                item, xml, last_download_error, failure_kind = download_for_job(
                     cert_path, key_path, verify_path, item, limiter,
                     run_id=job.external_run_id or "",
                     empresa_id=job.empresa_id,
@@ -1997,7 +1998,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                               current_number=number, current_competence=current_month,
                               mode="discovery")
 
-                _item, xml, error, kind = _download_one(
+                _item, xml, error, kind = download_for_job(
                     cert_path,
                     key_path,
                     verify_path,
