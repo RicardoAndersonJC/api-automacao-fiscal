@@ -578,11 +578,11 @@ class MissingNotesRecoveryTests(unittest.TestCase):
             worker.run_job(job, SEED, b"pfx", "", defaults)
             return job, callback.call_args_list, consult.call_args_list
 
-    def test_discovery_pilot_acknowledges_ten_keys_before_downloading_in_pairs(self):
+    def test_discovery_pilot_acknowledges_ten_keys_before_using_ten_proxy_routes(self):
         import os
         import threading
 
-        barrier = threading.Barrier(2, timeout=2)
+        barrier = threading.Barrier(10, timeout=5)
         acknowledged = []
         routes = {}
 
@@ -599,9 +599,12 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         env = {
             "NFCE_PROXY_PILOT_EMPRESA_ID": "test-company",
             "NFCE_PROXY_PILOT_URL": "http://first.invalid:8080",
-            "NFCE_PROXY_PILOT_URL_2": "http://second.invalid:8080",
             "NFCE_PROXY_PILOT_DISCOVERY_BATCH": "true",
         }
+        env.update({
+            f"NFCE_PROXY_PILOT_URL_{slot}": f"http://proxy-{slot}.invalid:8080"
+            for slot in range(2, 11)
+        })
         with patch.dict(os.environ, env):
             job, callbacks, consults = self.run_worker(
                 [("613", "", f"{number:044d}") for number in range(1, 12)],
@@ -612,7 +615,21 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.assertEqual(job.status, "completed", job.error)
         self.assertEqual(len(consults), 10)
         self.assertEqual(sum(call.args[1] == "file" for call in callbacks), 10)
-        self.assertEqual([routes[number] for number in sorted(routes)], ["outbound-1", "outbound-2"] * 5)
+        self.assertEqual([routes[number] for number in sorted(routes)], [f"outbound-{slot}" for slot in range(1, 11)])
+
+    def test_webshare_pilot_routes_limits_and_deduplicates_direct_addresses(self):
+        rows = [
+            dict(proxy_address=f"192.0.2.{index}", port=8080, valid=True, username="test", password="test")
+            for index in range(1, 12)
+        ]
+        with patch.object(worker.requests, "get") as get:
+            get.return_value.status_code = 200
+            get.return_value.json.return_value = {"results": [rows[0], *rows], "next": None}
+            routes = worker.webshare_pilot_routes("test-token", "123")
+        self.assertEqual(len(routes), 10)
+        self.assertEqual(len({route.proxy_url for route in routes}), 10)
+        self.assertEqual(get.call_args.kwargs["params"]["mode"], "direct")
+        self.assertFalse(get.call_args.kwargs["allow_redirects"])
 
     def test_six_saved_then_timeout_keeps_cursor_and_requests_resume(self):
         responses = [("100", "Autorizada", str(index) * 44) for index in range(1, 7)] + [("", "timeout", "")]

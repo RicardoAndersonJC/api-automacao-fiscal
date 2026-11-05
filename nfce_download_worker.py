@@ -16,6 +16,7 @@ import csv
 import hashlib
 import html
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -827,6 +828,44 @@ class OutboundTransportManager:
 
 _shared_transport: OutboundTransportManager | None = None
 _shared_transport_guard = threading.Lock()
+
+
+def webshare_pilot_routes(api_key: str, plan_id: str) -> list[OutboundRoute]:
+    routes: list[OutboundRoute] = []
+    seen_addresses: set[str] = set()
+    try:
+        for page in range(1, 5):
+            params = {"mode": "direct", "page": page, "page_size": 25, "valid": "true"}
+            if plan_id:
+                params["plan_id"] = plan_id
+            response = requests.get(
+                "https://proxy.webshare.io/api/v2/proxy/list/",
+                params=params, headers={"Authorization": f"Token {api_key}"},
+                timeout=(3, 5), allow_redirects=False,
+            )
+            if response.status_code != 200:
+                return []
+            data = response.json()
+            for proxy in data["results"]:
+                try:
+                    address = str(ipaddress.IPv4Address(proxy["proxy_address"]))
+                    port = int(proxy["port"])
+                except (ValueError, TypeError, KeyError):
+                    continue
+                if not proxy.get("valid") or address in seen_addresses or not 1 <= port <= 65535:
+                    continue
+                seen_addresses.add(address)
+                routes.append(OutboundRoute(
+                    f"outbound-{len(routes) + 1}", f"http://{address}:{port}",
+                    str(proxy["username"]), str(proxy["password"]),
+                ))
+                if len(routes) == 10:
+                    return routes
+            if not data.get("next"):
+                break
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        return []
+    return routes
 
 
 def shared_outbound_transport() -> OutboundTransportManager:
@@ -1689,31 +1728,38 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         circuit = shared_transport_circuit()
         session = _new_svrs_session(cert_path, key_path, verify_path, transport)
         pilot_company_id = os.getenv("NFCE_PROXY_PILOT_EMPRESA_ID", "").strip()
-        pilot_proxy_url = os.getenv("NFCE_PROXY_PILOT_URL", "").strip()
-        pilot_available = bool(pilot_company_id and job.empresa_id == pilot_company_id and pilot_proxy_url)
+        pilot_routes: list[OutboundRoute] = []
+        if pilot_company_id and job.empresa_id == pilot_company_id:
+            webshare_key = os.getenv("NFCE_PROXY_PILOT_WEBSHARE_API_KEY", "").strip()
+            if webshare_key:
+                pilot_routes = webshare_pilot_routes(
+                    webshare_key, os.getenv("NFCE_PROXY_PILOT_WEBSHARE_PLAN_ID", "").strip(),
+                )
+            if not pilot_routes:
+                seen_proxy_urls: set[str] = set()
+                for slot in range(1, 11):
+                    suffix = "" if slot == 1 else f"_{slot}"
+                    url = os.getenv(f"NFCE_PROXY_PILOT_URL{suffix}", "").strip()
+                    if not url or url in seen_proxy_urls:
+                        continue
+                    seen_proxy_urls.add(url)
+                    username = os.getenv(f"NFCE_PROXY_PILOT_USERNAME{suffix}") or os.getenv("NFCE_PROXY_PILOT_USERNAME", "")
+                    password = os.getenv(f"NFCE_PROXY_PILOT_PASSWORD{suffix}") or os.getenv("NFCE_PROXY_PILOT_PASSWORD", "")
+                    pilot_routes.append(OutboundRoute(f"outbound-{slot}", url, username, password))
 
-        second_proxy_url = os.getenv("NFCE_PROXY_PILOT_URL_2", "").strip()
+        pilot_available = bool(pilot_routes)
         discovery_pilot = bool(
-            pilot_available and second_proxy_url and second_proxy_url != pilot_proxy_url
+            len(pilot_routes) >= 2
             and os.getenv("NFCE_PROXY_PILOT_DISCOVERY_BATCH") == "true"
             and not pending_only and not options.get("missing_notes")
         )
-
-        def pilot_transport(slot: int) -> OutboundTransportManager:
-            suffix = "" if slot == 1 else "_2"
-            return OutboundTransportManager.from_env({
-                "PROXY_ENABLED": "true",
-                f"PROXY_URL{suffix}": pilot_proxy_url if slot == 1 else second_proxy_url,
-                f"PROXY_USERNAME{suffix}": os.getenv(f"NFCE_PROXY_PILOT_USERNAME{suffix}") or os.getenv("NFCE_PROXY_PILOT_USERNAME", ""),
-                f"PROXY_PASSWORD{suffix}": os.getenv(f"NFCE_PROXY_PILOT_PASSWORD{suffix}") or os.getenv("NFCE_PROXY_PILOT_PASSWORD", ""),
-            })
 
         def download_for_job(*args, **kwargs):
             nonlocal pilot_available
             if pilot_available:
                 pilot_available = False
                 kwargs["session"] = None
-                kwargs["transport"] = pilot_transport(1)
+                kwargs["transport"] = OutboundTransportManager([pilot_routes[0]], enabled=True)
             return _download_one(*args, **kwargs)
 
         saved_keys = {str(key) for key in (options.get("saved_keys") or []) if str(key)}
@@ -1767,10 +1813,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             parallel_results = []
             if (
                 pilot_available and pending_only and not options.get("missing_notes")
-                and len(pending_queue) == 2 and second_proxy_url
-                and second_proxy_url != pilot_proxy_url
+                and len(pending_queue) == 2 and len(pilot_routes) >= 2
             ):
-                second_transport = pilot_transport(2)
+                second_transport = OutboundTransportManager([pilot_routes[1]], enabled=True)
                 with ThreadPoolExecutor(max_workers=2) as pilot_pool:
                     first = pilot_pool.submit(
                         download_for_job, cert_path, key_path, verify_path,
@@ -2290,19 +2335,19 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         if discovery_pilot and not paused_for_svrs and not halt_reason and scan_reason not in {"hold", "ack"}:
             queued = {item["chave_real"]: item for item in found if item["chave_real"] not in saved_keys}
             candidates = list(queued.values())
-            routes = (pilot_transport(1), pilot_transport(2))
-            with ThreadPoolExecutor(max_workers=2) as pilot_pool:
-                for offset in range(0, len(candidates), 2):
-                    batch = candidates[offset:offset + 2]
+            routes = [OutboundTransportManager([route], enabled=True) for route in pilot_routes]
+            with ThreadPoolExecutor(max_workers=len(routes)) as pilot_pool:
+                for offset in range(0, len(candidates), len(routes)):
+                    batch = candidates[offset:offset + len(routes)]
                     futures = {
                         pilot_pool.submit(
                             _download_one, cert_path, key_path, verify_path,
                             {**item, "_download_interval_seconds": interval_seconds}, limiter,
                             run_id=job.external_run_id or "", empresa_id=job.empresa_id,
-                            transport=routes[slot], circuit=circuit,
-                            lane="download" if slot == 0 else "pilot-download-2",
+                            transport=route, circuit=circuit,
+                            lane="download" if slot == 1 else f"pilot-download-{slot}",
                         ): item
-                        for slot, item in enumerate(batch)
+                        for slot, (item, route) in enumerate(zip(batch, routes), 1)
                     }
                     for future in as_completed(futures):
                         item = futures[future]
