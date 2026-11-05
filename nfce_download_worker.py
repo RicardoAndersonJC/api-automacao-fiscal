@@ -1679,16 +1679,32 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             raise ValueError("A raiz do CNPJ do certificado é diferente da raiz do emitente do XML.")
 
         verify_path = svrs_ca_bundle()
-        transport = shared_outbound_transport()
+        pending_items = list(options.get("pending_items") or [])
+        pending_only = bool(options.get("pending_only"))
+        pilot_company_id = os.getenv("NFCE_PROXY_PILOT_EMPRESA_ID", "").strip()
+        pilot_key = os.getenv("NFCE_PROXY_PILOT_CHAVE", "").strip()
+        pilot_proxy_url = os.getenv("NFCE_PROXY_PILOT_URL", "").strip()
+        if (
+            pilot_company_id and job.empresa_id == pilot_company_id
+            and pilot_key and pilot_proxy_url
+            and pending_only and not options.get("missing_notes")
+            and len(pending_items) == 1 and pending_items[0].get("chave") == pilot_key
+        ):
+            transport = OutboundTransportManager.from_env({
+                "PROXY_ENABLED": "true",
+                "PROXY_URL": pilot_proxy_url,
+                "PROXY_USERNAME": os.getenv("NFCE_PROXY_PILOT_USERNAME", ""),
+                "PROXY_PASSWORD": os.getenv("NFCE_PROXY_PILOT_PASSWORD", ""),
+            })
+        else:
+            transport = shared_outbound_transport()
         circuit = shared_transport_circuit()
         session = _new_svrs_session(cert_path, key_path, verify_path, transport)
         saved_keys = {str(key) for key in (options.get("saved_keys") or []) if str(key)}
         records: list[dict[str, Any]] = []
-        pending_items = list(options.get("pending_items") or [])
         interval_seconds = clamp_download_interval(
             int(options.get("download_interval_seconds", SVRS_INTERVAL_MIN_SECONDS))
         )
-        pending_only = bool(options.get("pending_only"))
         paused_for_svrs = False
         limiter = shared_rate_limiter(
             float(options.get("query_interval_ms", 100)) / 1000,
