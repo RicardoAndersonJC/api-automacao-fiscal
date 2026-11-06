@@ -656,7 +656,7 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         with patch.object(worker.requests, "get") as get:
             get.return_value.status_code = 200
             get.return_value.json.return_value = {"results": [rows[0], *rows], "next": None}
-            routes = worker.webshare_pilot_routes("test-token", "123")
+            routes = worker.webshare_pilot_routes("test-token", "123", limit=10)
         self.assertEqual(len(routes), 10)
         self.assertEqual(len({route.proxy_url for route in routes}), 10)
         self.assertEqual(get.call_args.kwargs["params"]["mode"], "direct")

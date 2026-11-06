@@ -830,7 +830,7 @@ _shared_transport: OutboundTransportManager | None = None
 _shared_transport_guard = threading.Lock()
 
 
-def webshare_pilot_routes(api_key: str, plan_id: str, limit: int = 10) -> list[OutboundRoute]:
+def webshare_pilot_routes(api_key: str, plan_id: str, limit: int = 100) -> list[OutboundRoute]:
     routes: list[OutboundRoute] = []
     seen_addresses: set[str] = set()
     try:
@@ -1729,12 +1729,10 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         session = _new_svrs_session(cert_path, key_path, verify_path, transport)
         pilot_company_id = os.getenv("NFCE_PROXY_PILOT_EMPRESA_ID", "").strip()
         all_companies_batch = os.getenv("NFCE_PROXY_BATCH_ALL_COMPANIES") == "true"
-        batch_size = 10
-        if all_companies_batch:
-            try:
-                batch_size = max(1, min(100, int(os.getenv("NFCE_PROXY_BATCH_SIZE", "10"))))
-            except ValueError:
-                pass
+        try:
+            batch_size = max(1, min(100, int(os.getenv("NFCE_PROXY_BATCH_SIZE", "100"))))
+        except ValueError:
+            batch_size = 100
         pilot_routes: list[OutboundRoute] = []
         if all_companies_batch or (pilot_company_id and job.empresa_id == pilot_company_id):
             webshare_key = os.getenv("NFCE_PROXY_PILOT_WEBSHARE_API_KEY", "").strip()
@@ -1744,7 +1742,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 )
             if not pilot_routes:
                 seen_proxy_urls: set[str] = set()
-                for slot in range(1, 11):
+                for slot in range(1, batch_size + 1):
                     suffix = "" if slot == 1 else f"_{slot}"
                     url = os.getenv(f"NFCE_PROXY_PILOT_URL{suffix}", "").strip()
                     if not url or url in seen_proxy_urls:
@@ -2049,7 +2047,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         number = start_number + 1
         consecutive_217, gap_start, last_probe = 0, None, number - 1
         probed_this_gap = False
-        max_numbers = min(options["max_numbers"], 10) if discovery_pilot and not all_companies_batch else options["max_numbers"]
+        max_numbers = (
+            min(options["max_numbers"], len(pilot_routes) or batch_size)
+            if discovery_pilot and not all_companies_batch
+            else options["max_numbers"]
+        )
         last_progress_at = 0.0
         # Cursor já gravado. Só anda depois de ausência (217) ou de ack HTTP 200 da chave.
         safe_aamm = current_month
