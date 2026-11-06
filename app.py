@@ -990,6 +990,12 @@ def processar_consulta(
 @app.get("/health")
 def health() -> dict[str, Any]:
     outbound = shared_outbound_transport().public_status()
+    batch_all = os.getenv("NFCE_PROXY_BATCH_ALL_COMPANIES") == "true"
+    discovery_batch = os.getenv("NFCE_PROXY_PILOT_DISCOVERY_BATCH") == "true"
+    try:
+        batch_size = max(1, min(100, int(os.getenv("NFCE_PROXY_BATCH_SIZE", "100"))))
+    except ValueError:
+        batch_size = 100
     return {
         "ok": True,
         "git": os.environ.get("RENDER_GIT_COMMIT", ""),
@@ -1001,6 +1007,18 @@ def health() -> dict[str, Any]:
         "nfce_proxy_routes": outbound["routes"],
         "nfce_outbound_id": outbound["outbound_id"],
         "nfce_outbound_health": outbound["outbound_health"],
+        # Diagnóstico do lote paralelo (sem segredos): se batch_all/discovery
+        # estiverem false ou webshare sem chave, o worker cai no download 1 a 1.
+        "nfce_proxy_batch_all_companies": batch_all,
+        "nfce_proxy_pilot_discovery_batch": discovery_batch,
+        "nfce_proxy_batch_size": batch_size,
+        "nfce_proxy_pilot_empresa_set": bool(os.getenv("NFCE_PROXY_PILOT_EMPRESA_ID", "").strip()),
+        "nfce_proxy_webshare_key_set": bool(
+            os.getenv("NFCE_PROXY_PILOT_WEBSHARE_API_KEY", "").strip()
+        ),
+        "nfce_proxy_webshare_plan_set": bool(
+            os.getenv("NFCE_PROXY_PILOT_WEBSHARE_PLAN_ID", "").strip()
+        ),
     }
 
 

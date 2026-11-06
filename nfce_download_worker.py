@@ -844,7 +844,13 @@ def webshare_pilot_routes(api_key: str, plan_id: str, limit: int = 100) -> list[
                 timeout=(3, 5), allow_redirects=False,
             )
             if response.status_code != 200:
-                return []
+                _logger.warning(json.dumps({
+                    "event": "nfce_webshare_list_failed",
+                    "status": response.status_code,
+                    "page": page,
+                    "plan_set": bool(plan_id),
+                }))
+                return routes
             data = response.json()
             for proxy in data["results"]:
                 try:
@@ -863,8 +869,13 @@ def webshare_pilot_routes(api_key: str, plan_id: str, limit: int = 100) -> list[
                     return routes
             if not data.get("next"):
                 break
-    except (requests.RequestException, ValueError, TypeError, KeyError):
-        return []
+    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+        _logger.warning(json.dumps({
+            "event": "nfce_webshare_list_error",
+            "error": type(exc).__name__,
+            "routes_so_far": len(routes),
+        }))
+        return routes
     return routes
 
 
@@ -1753,11 +1764,45 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     pilot_routes.append(OutboundRoute(f"outbound-{slot}", url, username, password))
 
         pilot_available = bool(pilot_routes)
+        # Lacunas (missing_notes) NÃO podem desligar o lote: a Edge quase sempre
+        # manda até 20 lacunas no mesmo job; isso forçava download 1 a 1.
         discovery_pilot = bool(
             len(pilot_routes) >= 2
             and (all_companies_batch or os.getenv("NFCE_PROXY_PILOT_DISCOVERY_BATCH") == "true")
-            and not pending_only and not options.get("missing_notes")
+            and not pending_only
         )
+        wants_proxy_batch = all_companies_batch or bool(
+            pilot_company_id and job.empresa_id == pilot_company_id
+        )
+        _logger.info(json.dumps({
+            "event": "nfce_proxy_batch_status",
+            "run_id": job.external_run_id,
+            "empresa_id": job.empresa_id,
+            "routes": len(pilot_routes),
+            "batch_size": batch_size,
+            "discovery_pilot": discovery_pilot,
+            "pending_only": pending_only,
+            "missing_notes": len(options.get("missing_notes") or []),
+            "all_companies_batch": all_companies_batch,
+            "webshare_key_set": bool(os.getenv("NFCE_PROXY_PILOT_WEBSHARE_API_KEY", "").strip()),
+        }))
+        if wants_proxy_batch and len(pilot_routes) < 2:
+            _logger.warning(json.dumps({
+                "event": "nfce_proxy_batch_unavailable",
+                "run_id": job.external_run_id,
+                "empresa_id": job.empresa_id,
+                "routes": len(pilot_routes),
+                "batch_size": batch_size,
+                "all_companies_batch": all_companies_batch,
+                "webshare_key_set": bool(os.getenv("NFCE_PROXY_PILOT_WEBSHARE_API_KEY", "").strip()),
+            }))
+            _update(
+                job,
+                message=(
+                    f"Lote de proxies indisponível ({len(pilot_routes)} rota(s)); "
+                    "seguindo 1 a 1 com intervalo da SVRS"
+                ),
+            )
 
         def proxy_lane(route: OutboundTransportManager) -> str:
             address = urlparse(route.current().proxy_url or "").hostname

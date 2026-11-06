@@ -648,6 +648,35 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.assertEqual({lane for _, lane in downloads}, {"proxy-ip:192.0.2.1", "proxy-ip:192.0.2.2"})
         self.assertTrue(callbacks[-1].kwargs["scan_complete"])
 
+    def test_discovery_batch_stays_on_with_missing_notes_payload(self):
+        """Edge quase sempre manda lacunas; isso não pode forçar download serial."""
+        import os
+
+        lanes = []
+
+        def download(*args, **kwargs):
+            lanes.append(kwargs.get("lane") or "direct")
+            return {}, "<nfeProc><NFe /></nfeProc>", "", "ok"
+
+        env = {
+            "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+            "NFCE_PROXY_BATCH_SIZE": "2",
+            "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.12:8080",
+        }
+        with patch.dict(os.environ, env):
+            job, _callbacks, _consults = self.run_worker(
+                [("613", "", f"{number:044d}") for number in range(1, 4)] + [("217", "", "")],
+                dict(
+                    stop_gap=1,
+                    missing_notes=[dict(aamm="2608", nnf=99999)],
+                ),
+                downloads=download,
+            )
+        self.assertEqual(job.status, "completed", job.error)
+        proxy_lanes = {lane for lane in lanes if str(lane).startswith("proxy-ip:")}
+        self.assertTrue(proxy_lanes, f"esperava lote proxy; lanes={lanes}")
+
     def test_pending_recovery_downloads_in_proxy_batches(self):
         import os
         import threading
