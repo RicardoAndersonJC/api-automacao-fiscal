@@ -2671,6 +2671,9 @@ def _build_export_zip(
         filters["metadata"] = f"cs.{json.dumps({'competencia': params['competencia']})}"
 
     company_names: dict[str, str] = {}
+    company_archives: dict[str, tuple[str, Path]] = {}
+    used_folders: set[str] = set()
+    open_archives: dict[str, zipfile.ZipFile] = {}
     processed = 0
     missing_xmls: list[str] = []
     last_progress = time.monotonic()
@@ -2693,7 +2696,31 @@ def _build_export_zip(
                     output.write(chunk)
         return True
 
-    with ExitStack() as resources:
+    with tempfile.TemporaryDirectory(dir=local_path.parent) as archive_dir, ExitStack() as resources:
+        def close_company_archives() -> None:
+            for company_zip in open_archives.values():
+                company_zip.close()
+            open_archives.clear()
+
+        def company_archive(company_id: str, folder: str) -> zipfile.ZipFile:
+            company_zip = open_archives.pop(company_id, None)
+            if company_zip is None:
+                if len(open_archives) >= 16:
+                    open_archives.pop(next(iter(open_archives))).close()
+                if company_id not in company_archives:
+                    base = folder
+                    suffix = 2
+                    while folder.casefold() in used_folders:
+                        folder = f"{base}-{suffix}"
+                        suffix += 1
+                    used_folders.add(folder.casefold())
+                    company_archives[company_id] = (folder, Path(archive_dir) / f"{len(company_archives)}.zip")
+                _, path = company_archives[company_id]
+                company_zip = zipfile.ZipFile(path, "a", zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True)
+            open_archives[company_id] = company_zip
+            return company_zip
+
+        resources.callback(close_company_archives)
         clients = [resources.enter_context(requests.Session()) for _ in range(concurrency)]
         for client in clients:
             client.headers.update(session.headers)
@@ -2713,14 +2740,19 @@ def _build_export_zip(
                 response = session.get(
                     f"{url}/rest/v1/empresas",
                     params={
-                        "select": "id,nome",
+                        "select": "id,nome,apelido",
                         "organizacao_id": filters["organizacao_id"],
                         "id": f"in.({','.join(sorted(missing_companies))})",
                     },
                     timeout=(5, 30),
                 )
                 response.raise_for_status()
-                company_names.update({company["id"]: company["nome"] or "Empresa" for company in response.json()})
+                for company in response.json():
+                    name = company["nome"] or "Empresa"
+                    code = re.match(r"^([0-9]+)(?:\s*[-–—]|$)", (company.get("apelido") or "").strip())
+                    if code and not re.match(r"^[0-9]+\s*[-–—]", name.strip()):
+                        name = f"{code.group(1)} - {name}"
+                    company_names[company["id"]] = name
 
             entries = []
             for row in rows:
@@ -2739,25 +2771,26 @@ def _build_export_zip(
                 company = _export_segment(company_names[company_id], "Empresa")
                 name = _export_segment(row["nome"] or "", f"{row['id']}.xml")
                 archive_name = f"{company}/{name}"
-                entries.append((row["id"], storage_path, archive_name))
+                entries.append((row["id"], storage_path, archive_name, company_id))
 
             for start in range(0, len(entries), concurrency):
                 batch = entries[start:start + concurrency]
                 downloads = []
-                for slot, (row_id, storage_path, archive_name) in enumerate(batch):
+                for slot, (row_id, storage_path, archive_name, company_id) in enumerate(batch):
                     destination = local_path.parent / f"xml-{slot}.tmp"
                     future = pool.submit(download_xml, clients[slot], storage_path, destination)
-                    downloads.append((future, destination, row_id, archive_name))
+                    downloads.append((future, destination, row_id, archive_name, company_id))
 
-                for future, destination, row_id, archive_name in downloads:
+                for future, destination, row_id, archive_name, company_id in downloads:
                     processed += 1
                     if not future.result():
                         missing_xmls.append(archive_name)
                         continue
-                    if archive_name in archive.NameToInfo:
-                        company, name = archive_name.split("/", 1)
-                        archive_name = f"{company}/duplicados/{row_id}/{name}"
-                    archive.write(destination, archive_name)
+                    company, name = archive_name.split("/", 1)
+                    company_zip = company_archive(company_id, company)
+                    if name in company_zip.NameToInfo:
+                        name = f"duplicados/{row_id}/{name}"
+                    company_zip.write(destination, name)
                     destination.unlink()
 
                 if time.monotonic() - last_progress >= 5:
@@ -2768,6 +2801,9 @@ def _build_export_zip(
             if not _export_progress(session, url, execution, processed):
                 return None
             last_progress = time.monotonic()
+        close_company_archives()
+        for folder, path in company_archives.values():
+            archive.write(path, f"{folder}/{folder}.zip", compress_type=zipfile.ZIP_STORED)
         if missing_xmls:
             report = [
                 "Exportação parcial de XMLs NFC-e",
