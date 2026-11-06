@@ -1820,68 +1820,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     "_download_interval_seconds": interval_seconds,
                 }
 
-            parallel_results = []
-            if (
-                pilot_available and pending_only and not options.get("missing_notes")
-                and len(pending_queue) == 2 and len(pilot_routes) >= 2
-            ):
-                second_transport = OutboundTransportManager([pilot_routes[1]], enabled=True)
-                with ThreadPoolExecutor(max_workers=2) as pilot_pool:
-                    first = pilot_pool.submit(
-                        download_for_job, cert_path, key_path, verify_path,
-                        pending_download_item(pending_queue[0]), limiter,
-                        run_id=job.external_run_id or "", empresa_id=job.empresa_id,
-                        circuit=circuit,
-                    )
-                    second = pilot_pool.submit(
-                        _download_one, cert_path, key_path, verify_path,
-                        pending_download_item(pending_queue[1]), limiter,
-                        run_id=job.external_run_id or "", empresa_id=job.empresa_id,
-                        transport=second_transport, circuit=circuit, lane=proxy_lane(second_transport),
-                    )
-                    parallel_results = [first.result(), second.result()]
-
-            for pending_index, pending in enumerate(pending_queue, 1):
-                item = pending_download_item(pending)
-
-                def notify_attempt(attempt: int) -> None:
-                    espera = PORTAL_EMPTY_RETRY_SECONDS if attempt else interval_seconds
-                    _callback(
-                        job,
-                        "progress",
-                        consulted=0,
-                        found=0,
-                        downloaded=pending_saved,
-                        pending_total=pending_total,
-                        pending_failed=pending_failed,
-                        mode="pending_recovery",
-                        message=(
-                            f"Aguardando {format_wait(espera)} · pendência "
-                            f"{pending_index}/{pending_total} · tentativa {attempt + 1}"
-                        ),
-                    )
-
-                def notify_pending_wait() -> None:
-                    message = f"Aguardando intervalo de download da SVRS · nota {item['nNF']}"
-                    _update(job, message=message, downloaded=pending_saved)
-                    _callback(job, "progress", message=message, consulted=0, found=0,
-                              downloaded=pending_saved, pending_total=pending_total,
-                              pending_failed=pending_failed, mode="pending_recovery")
-
-                if parallel_results:
-                    item, xml, last_download_error, failure_kind = parallel_results[pending_index - 1]
-                else:
-                    item, xml, last_download_error, failure_kind = download_for_job(
-                        cert_path, key_path, verify_path, item, limiter,
-                        run_id=job.external_run_id or "",
-                        empresa_id=job.empresa_id,
-                        notify=notify_attempt,
-                        notify_wait=notify_pending_wait,
-                        session=session,
-                        transport=transport,
-                        circuit=circuit,
-                    )
-
+            def apply_pending_result(pending_index, item, xml, last_download_error, failure_kind):
+                nonlocal pending_saved, pending_failed, paused_for_svrs
                 if xml:
                     full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
                     _callback(
@@ -1921,6 +1861,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         item_index=pending_index,
                         mode="pending_recovery",
                     )
+                    if failure_kind in {"rate_limit", "circuit_open", "proxy"}:
+                        paused_for_svrs = True
 
                 message = (
                     f"Recuperando pendências: {pending_index}/{pending_total} · "
@@ -1944,17 +1886,19 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     message=message,
                 )
 
-                if failure_kind in {"rate_limit", "circuit_open", "proxy"}:
-                    paused_for_svrs = True
-                    if not parallel_results:
-                        break
-
-                if not parallel_results and pending_index < pending_total and interval_seconds and not paused_for_svrs:
-                    wait_message = (
-                        f"Aguardando {format_wait(interval_seconds)} · pendência "
-                        f"{pending_index}/{pending_total}"
+            # Mesmo padrão da descoberta: até N IPs em paralelo; o intervalo de 1 min
+            # só aparece ao reutilizar o lote (por lane) ou após contenção da SVRS.
+            pending_batch = len(pilot_routes) if len(pilot_routes) >= 2 else 0
+            if pending_batch:
+                routes = [OutboundTransportManager([route], enabled=True) for route in pilot_routes]
+                processed = 0
+                while processed < pending_total and not paused_for_svrs:
+                    chunk = pending_queue[processed:processed + pending_batch]
+                    lote_msg = (
+                        f"Recuperando lote {processed + 1}-{processed + len(chunk)}/"
+                        f"{pending_total} · {len(chunk)} proxy(s) em paralelo"
                     )
-                    _update(job, message=wait_message)
+                    _update(job, message=lote_msg, downloaded=pending_saved)
                     _callback(
                         job,
                         "progress",
@@ -1964,8 +1908,135 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         pending_total=pending_total,
                         pending_failed=pending_failed,
                         mode="pending_recovery",
-                        message=wait_message,
+                        message=lote_msg,
                     )
+
+                    def notify_batch_wait(
+                        saved=pending_saved,
+                        failed=pending_failed,
+                        batch_n=pending_batch,
+                    ):
+                        message = (
+                            f"Aguardando intervalo de 1 min para reutilizar "
+                            f"o lote de {batch_n} IPs · {saved} salvas"
+                        )
+                        _update(job, message=message, downloaded=saved)
+                        _callback(
+                            job,
+                            "progress",
+                            consulted=0,
+                            found=0,
+                            downloaded=saved,
+                            pending_total=pending_total,
+                            pending_failed=failed,
+                            mode="pending_recovery",
+                            message=message,
+                        )
+
+                    with ThreadPoolExecutor(max_workers=len(chunk)) as pilot_pool:
+                        futures = {
+                            pilot_pool.submit(
+                                _download_one,
+                                cert_path,
+                                key_path,
+                                verify_path,
+                                pending_download_item(pending),
+                                limiter,
+                                run_id=job.external_run_id or "",
+                                empresa_id=job.empresa_id,
+                                notify_wait=notify_batch_wait if processed else None,
+                                transport=route,
+                                circuit=circuit,
+                                lane=proxy_lane(route),
+                            ): offset
+                            for offset, (pending, route) in enumerate(zip(chunk, routes))
+                        }
+                        results_by_offset: dict[int, tuple] = {}
+                        for future in as_completed(futures):
+                            offset = futures[future]
+                            results_by_offset[offset] = future.result()
+                        for offset in range(len(chunk)):
+                            item, xml, last_download_error, failure_kind = results_by_offset[offset]
+                            apply_pending_result(
+                                processed + offset + 1,
+                                item,
+                                xml,
+                                last_download_error,
+                                failure_kind,
+                            )
+                    processed += len(chunk)
+            else:
+                for pending_index, pending in enumerate(pending_queue, 1):
+                    item = pending_download_item(pending)
+
+                    def notify_attempt(attempt: int, index=pending_index) -> None:
+                        espera = PORTAL_EMPTY_RETRY_SECONDS if attempt else interval_seconds
+                        _callback(
+                            job,
+                            "progress",
+                            consulted=0,
+                            found=0,
+                            downloaded=pending_saved,
+                            pending_total=pending_total,
+                            pending_failed=pending_failed,
+                            mode="pending_recovery",
+                            message=(
+                                f"Aguardando {format_wait(espera)} · pendência "
+                                f"{index}/{pending_total} · tentativa {attempt + 1}"
+                            ),
+                        )
+
+                    def notify_pending_wait(index=pending_index, note=item["nNF"]) -> None:
+                        message = f"Aguardando intervalo de download da SVRS · nota {note}"
+                        _update(job, message=message, downloaded=pending_saved)
+                        _callback(
+                            job,
+                            "progress",
+                            message=message,
+                            consulted=0,
+                            found=0,
+                            downloaded=pending_saved,
+                            pending_total=pending_total,
+                            pending_failed=pending_failed,
+                            mode="pending_recovery",
+                        )
+
+                    item, xml, last_download_error, failure_kind = download_for_job(
+                        cert_path,
+                        key_path,
+                        verify_path,
+                        item,
+                        limiter,
+                        run_id=job.external_run_id or "",
+                        empresa_id=job.empresa_id,
+                        notify=notify_attempt,
+                        notify_wait=notify_pending_wait,
+                        session=session,
+                        transport=transport,
+                        circuit=circuit,
+                    )
+                    apply_pending_result(
+                        pending_index, item, xml, last_download_error, failure_kind,
+                    )
+                    if paused_for_svrs:
+                        break
+                    if pending_index < pending_total and interval_seconds:
+                        wait_message = (
+                            f"Aguardando {format_wait(interval_seconds)} · pendência "
+                            f"{pending_index}/{pending_total}"
+                        )
+                        _update(job, message=wait_message)
+                        _callback(
+                            job,
+                            "progress",
+                            consulted=0,
+                            found=0,
+                            downloaded=pending_saved,
+                            pending_total=pending_total,
+                            pending_failed=pending_failed,
+                            mode="pending_recovery",
+                            message=wait_message,
+                        )
 
             _callback(
                 job,

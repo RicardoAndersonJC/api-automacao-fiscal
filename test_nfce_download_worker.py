@@ -648,6 +648,44 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.assertEqual({lane for _, lane in downloads}, {"proxy-ip:192.0.2.1", "proxy-ip:192.0.2.2"})
         self.assertTrue(callbacks[-1].kwargs["scan_complete"])
 
+    def test_pending_recovery_downloads_in_proxy_batches(self):
+        import os
+        import threading
+
+        barrier = threading.Barrier(2, timeout=5)
+        lanes = []
+
+        def download(*args, **kwargs):
+            lanes.append(kwargs["lane"])
+            barrier.wait()
+            item = args[3]
+            return item, "<nfeProc><NFe /></nfeProc>", "", "ok"
+
+        pendings = [
+            dict(aamm="2608", nnf=100 + index, chave=f"{index:044d}")
+            for index in range(1, 5)
+        ]
+        env = {
+            "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+            "NFCE_PROXY_BATCH_SIZE": "2",
+            "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.12:8080",
+        }
+        with patch.dict(os.environ, env):
+            job, callbacks, consults = self.run_worker(
+                [],
+                dict(pending_only=True, pending_items=pendings),
+                downloads=download,
+            )
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(consults, [])
+        self.assertEqual(sum(call.args[1] == "file" for call in callbacks), 4)
+        self.assertEqual(lanes.count("proxy-ip:192.0.2.11"), 2)
+        self.assertEqual(lanes.count("proxy-ip:192.0.2.12"), 2)
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertEqual(completed["pending_saved"], 4)
+        self.assertFalse(completed["pause_for_svrs"])
+
     def test_webshare_pilot_routes_limits_and_deduplicates_direct_addresses(self):
         rows = [
             dict(proxy_address=f"192.0.2.{index}", port=8080, valid=True, username="test", password="test")
