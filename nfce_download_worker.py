@@ -2600,10 +2600,11 @@ def normalize_missing_notes(payload: str) -> list[dict[str, Any]]:
     return result
 
 
-def _export_segment(value: str, fallback: str) -> str:
+def _export_segment(value: str, fallback: str, *, keep_spaces: bool = False) -> str:
     normalized = unicodedata.normalize("NFKD", value)
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", normalized.encode("ascii", "ignore").decode())
-    return safe[:80].strip("._") or fallback
+    invalid = r"[^A-Za-z0-9 ._-]+" if keep_spaces else r"[^A-Za-z0-9._-]+"
+    safe = re.sub(invalid, "_", normalized.encode("ascii", "ignore").decode())
+    return safe[:80].strip("._ ") or fallback
 
 
 def _export_update(
@@ -2768,7 +2769,7 @@ def _build_export_zip(
                     )
                 ):
                     raise ValueError("Referência de XML incompatível com a empresa")
-                company = _export_segment(company_names[company_id], "Empresa")
+                company = _export_segment(company_names[company_id], "Empresa", keep_spaces=True)
                 name = _export_segment(row["nome"] or "", f"{row['id']}.xml")
                 archive_name = f"{company}/{name}"
                 entries.append((row["id"], storage_path, archive_name, company_id))
