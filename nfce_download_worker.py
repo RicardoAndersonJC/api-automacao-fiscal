@@ -1764,15 +1764,18 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     pilot_routes.append(OutboundRoute(f"outbound-{slot}", url, username, password))
 
         pilot_available = bool(pilot_routes)
+        wants_proxy_batch = all_companies_batch or bool(
+            pilot_company_id and job.empresa_id == pilot_company_id
+        )
+        # Qualquer download (pendência, lacuna ou descoberta) usa IPs em paralelo
+        # quando o lote contratado estiver disponível.
+        use_proxy_batch = wants_proxy_batch and len(pilot_routes) >= 2
         # Lacunas (missing_notes) NÃO podem desligar o lote: a Edge quase sempre
         # manda até 20 lacunas no mesmo job; isso forçava download 1 a 1.
         discovery_pilot = bool(
-            len(pilot_routes) >= 2
+            use_proxy_batch
             and (all_companies_batch or os.getenv("NFCE_PROXY_PILOT_DISCOVERY_BATCH") == "true")
             and not pending_only
-        )
-        wants_proxy_batch = all_companies_batch or bool(
-            pilot_company_id and job.empresa_id == pilot_company_id
         )
         _logger.info(json.dumps({
             "event": "nfce_proxy_batch_status",
@@ -1780,6 +1783,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             "empresa_id": job.empresa_id,
             "routes": len(pilot_routes),
             "batch_size": batch_size,
+            "use_proxy_batch": use_proxy_batch,
             "discovery_pilot": discovery_pilot,
             "pending_only": pending_only,
             "missing_notes": len(options.get("missing_notes") or []),
@@ -1933,7 +1937,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
 
             # Mesmo padrão da descoberta: até N IPs em paralelo; o intervalo de 1 min
             # só aparece ao reutilizar o lote (por lane) ou após contenção da SVRS.
-            pending_batch = len(pilot_routes) if len(pilot_routes) >= 2 else 0
+            pending_batch = len(pilot_routes) if use_proxy_batch else 0
             if pending_batch:
                 routes = [OutboundTransportManager([route], enabled=True) for route in pilot_routes]
                 processed = 0
@@ -2303,7 +2307,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         break
 
         def download_or_queue(aamm: str, n_nf: int, key: str) -> None:
-            if not discovery_pilot:
+            # Com lote contratado, nunca baixar 1 a 1: enfileira e dispara por IP.
+            if not use_proxy_batch:
                 download_found(aamm, n_nf, key)
                 return
             if key in saved_keys:
@@ -2340,6 +2345,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         # real; a recuperação nunca altera safe_aamm/safe_nnf nem number.
         missing_attempted = missing_recovered = missing_not_located = 0
         known_pending_saved, known_pending_failed = pending_saved, pending_failed
+        saved_before_missing = pending_saved
         for missing in (options.get("missing_notes") or [])[:20]:
             missing_attempted += 1
             missing_aamm, missing_nnf = str(missing["aamm"]), int(missing["nnf"])
@@ -2375,9 +2381,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 probe_aamm = next_aamm(probe_aamm)
             if action == "found":
                 acknowledge(probe_aamm, missing_nnf, status, real_key, consulted_cfg)
-                saved_before_recovery = pending_saved
-                download_found(probe_aamm, missing_nnf, recovered_key)
-                missing_recovered += pending_saved - saved_before_recovery
+                # Lacunas também entram no lote paralelo — não baixar serial aqui.
+                download_or_queue(probe_aamm, missing_nnf, recovered_key)
             else:
                 if action == "absent":
                     missing_not_located += 1
@@ -2385,10 +2390,18 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                           error=reason or ("Nota ainda não localizada (217)" if action == "absent" else "Consulta temporariamente indisponível"))
                 if action == "hold":
                     halt_reason = "hold"
+            missing_recovered = max(0, pending_saved - saved_before_missing)
             _update(job, missing_attempted=missing_attempted,
                     missing_recovered=missing_recovered, missing_not_located=missing_not_located)
             if halt_reason:
                 break
+
+        # Descarrega lacunas enfileiradas antes da varredura (ou no fim se pending_only).
+        if use_proxy_batch and discovery_queue and not paused_for_svrs:
+            flush_discovered()
+            missing_recovered = max(0, pending_saved - saved_before_missing)
+            _update(job, missing_attempted=missing_attempted,
+                    missing_recovered=missing_recovered, missing_not_located=missing_not_located)
 
         defer_discovery = options.get("defer_discovery", False)
         report_progress(
@@ -2500,7 +2513,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 break
             number += 1
 
-        if discovery_pilot and not paused_for_svrs and not halt_reason and scan_reason not in {"hold", "ack"}:
+        # Sempre esgota a fila paralela remanescente (descoberta ou lacunas).
+        if use_proxy_batch and discovery_queue and not paused_for_svrs:
             flush_discovered()
 
         _update(
