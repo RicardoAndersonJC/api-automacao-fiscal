@@ -102,6 +102,57 @@ def _pfx(dados: bytes, senha: str, pasta: Path) -> tuple[Path, Path]:
     return cert_path, key_path
 
 
+def _transporte():
+    """Mesma saída da NFC-e. Limite da SVRS não troca o proxy."""
+    from nfce_download_worker import shared_outbound_transport
+
+    return shared_outbound_transport()
+
+
+def _abrir_sessao(cert_path: Path, key_path: Path) -> requests.Session:
+    sessao = requests.Session()
+    sessao.cert = (str(cert_path), str(key_path))
+    sessao.verify = _ca_bundle()
+    _transporte().apply(sessao)
+    return sessao
+
+
+def _esperar_limite() -> None:
+    from nfce_download_worker import sefaz_cooldown_seconds
+
+    time.sleep(sefaz_cooldown_seconds())
+
+
+def _enviar(sessao: requests.Session, metodo: str, url: str, **kwargs: Any) -> requests.Response:
+    transporte = _transporte()
+    kwargs["verify"] = _ca_bundle()
+
+    def chamar() -> requests.Response:
+        return getattr(sessao, metodo)(url, **kwargs)
+
+    try:
+        resposta = chamar()
+    except requests.exceptions.ProxyError:
+        if not transporte.note_infrastructure_failure():
+            raise
+        transporte.apply(sessao)
+        resposta = chamar()
+    if resposta.status_code != 429:
+        if resposta.ok:
+            transporte.note_success()
+        resposta.raise_for_status()
+        return resposta
+    transporte.note_remote_limit()
+    _esperar_limite()
+    resposta = chamar()
+    if resposta.status_code == 429:
+        transporte.note_remote_limit()
+    elif resposta.ok:
+        transporte.note_success()
+    resposta.raise_for_status()
+    return resposta
+
+
 def _ca_bundle() -> str:
     """Raízes públicas mais a ICP-Brasil v10. A SVRS não fecha a cadeia só com o certifi."""
     try:
@@ -121,7 +172,9 @@ def _ca_bundle() -> str:
 
 def _consultar(sessao: requests.Session, cfg: dict, nnf: int, aamm: str) -> str:
     chave = chave_artificial(cfg, nnf, aamm)
-    resposta = sessao.post(
+    resposta = _enviar(
+        sessao,
+        "post",
         URL_CONSULTA,
         data=montar_soap(chave).encode("utf-8"),
         headers={
@@ -129,17 +182,13 @@ def _consultar(sessao: requests.Session, cfg: dict, nnf: int, aamm: str) -> str:
             "Accept": "application/soap+xml, text/xml, */*",
         },
         timeout=(20, 75),
-        verify=_ca_bundle(),
     )
-    resposta.raise_for_status()
     return resposta.text
 
 
 def _baixar(cert_path: Path, key_path: Path, chave: str) -> str:
-    with requests.Session() as sessao:
-        sessao.cert = (str(cert_path), str(key_path))
-        pagina = sessao.get(URL_PORTAL, timeout=45, verify=_ca_bundle())
-        pagina.raise_for_status()
+    with _abrir_sessao(cert_path, key_path) as sessao:
+        pagina = _enviar(sessao, "get", URL_PORTAL, timeout=45)
         campos: dict[str, str] = {}
         for tag in re.findall(r"<input\b[^>]*>", pagina.text, flags=re.I):
             nome = re.search(r"\bname=[\"']([^\"']+)[\"']", tag, flags=re.I)
@@ -148,14 +197,14 @@ def _baixar(cert_path: Path, key_path: Path, chave: str) -> str:
             valor = re.search(r"\bvalue=[\"']([^\"']*)[\"']", tag, flags=re.I)
             campos[nome.group(1)] = valor.group(1) if valor else ""
         campos.update({"sistema": "Nfe", "OrigemSite": "0", "Ambiente": "1", "ChaveAcessoDfe": chave})
-        resposta = sessao.post(
+        resposta = _enviar(
+            sessao,
+            "post",
             URL_PORTAL,
             data=campos,
             timeout=45,
-            verify=_ca_bundle(),
             headers={"Referer": URL_PORTAL, "Content-Type": "application/x-www-form-urlencoded"},
         )
-        resposta.raise_for_status()
     xml = extrair_xml_portal(resposta.text)
     if not xml or not xml_modelo_55(xml, chave):
         raise RuntimeError("O portal não devolveu o XML modelo 55 desta chave.")
@@ -169,8 +218,7 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
         cfg = cfg_da_chave(opcoes["chave"]) if opcoes.get("chave") else ler_xml_semente(semente)
         if opcoes.get("cnpj") and opcoes["cnpj"] != cfg["CNPJ"]:
             raise RuntimeError("A semente não pertence ao CNPJ da empresa.")
-        with requests.Session() as sessao:
-            sessao.cert = (str(cert_path), str(key_path))
+        with _abrir_sessao(cert_path, key_path) as sessao:
             if opcoes.get("somente_chave"):
                 xml = _baixar(cert_path, key_path, cfg["chave_semente"])
                 _callback(run_id, token, "xml", chave=cfg["chave_semente"], aamm=cfg["AAMM"], nnf=cfg["nNF_semente"], xml=xml)
