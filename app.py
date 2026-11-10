@@ -30,6 +30,7 @@ from nfce_download_worker import (
     router as nfce_download_router,
     shared_outbound_transport,
 )
+from nfe55_saida_worker import router as nfe55_saida_router
 
 logger = logging.getLogger("api-automacao-fiscal")
 
@@ -80,6 +81,7 @@ app = FastAPI()
 install_nfse_zip_routes(app)
 install_nfe_danfe_routes(app)
 app.include_router(nfce_download_router)
+app.include_router(nfe55_saida_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
