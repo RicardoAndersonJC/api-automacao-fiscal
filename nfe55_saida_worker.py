@@ -14,6 +14,8 @@ from typing import Any
 from urllib.parse import urlparse
 import certifi
 import requests
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, pkcs12
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
@@ -34,6 +36,8 @@ URL_PORTAL = "https://dfe-portal.svrs.rs.gov.br/NFeSSL/DownloadXMLDFe"
 SOAP_ACTION = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF"
 MAX_NUMEROS = 10000
 JANELA_MES_SEGUINTE = 3
+ICP_BRASIL_CA_PATH = Path(__file__).with_name("icp-brasil-v10.pem")
+ICP_BRASIL_CA_SHA256 = "6E0BFF069A26994C15DE2C4888CC54AF84882E5495B7FBF66BE9CCFFEC7489F6"
 
 router = APIRouter(prefix="/nfe55/saida-jobs", tags=["NF-e saída"])
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nfe55-saida")
@@ -98,6 +102,23 @@ def _pfx(dados: bytes, senha: str, pasta: Path) -> tuple[Path, Path]:
     return cert_path, key_path
 
 
+def _ca_bundle() -> str:
+    """Raízes públicas mais a ICP-Brasil v10. A SVRS não fecha a cadeia só com o certifi."""
+    try:
+        certificate = x509.load_pem_x509_certificate(ICP_BRASIL_CA_PATH.read_bytes())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("Cadeia ICP-Brasil v10 ausente ou inválida.") from exc
+    fingerprint = certificate.fingerprint(hashes.SHA256()).hex().upper()
+    if fingerprint != ICP_BRASIL_CA_SHA256:
+        raise RuntimeError("Fingerprint da cadeia ICP-Brasil v10 não confere.")
+    bundle_path = Path(tempfile.gettempdir()) / "nexus_nfe55_svrs_ca.pem"
+    if not bundle_path.exists():
+        public_roots = Path(certifi.where()).read_bytes()
+        separator = b"" if public_roots.endswith(b"\n") else b"\n"
+        bundle_path.write_bytes(public_roots + separator + ICP_BRASIL_CA_PATH.read_bytes())
+    return str(bundle_path)
+
+
 def _consultar(sessao: requests.Session, cfg: dict, nnf: int, aamm: str) -> str:
     chave = chave_artificial(cfg, nnf, aamm)
     resposta = sessao.post(
@@ -108,7 +129,7 @@ def _consultar(sessao: requests.Session, cfg: dict, nnf: int, aamm: str) -> str:
             "Accept": "application/soap+xml, text/xml, */*",
         },
         timeout=(20, 75),
-        verify=certifi.where(),
+        verify=_ca_bundle(),
     )
     resposta.raise_for_status()
     return resposta.text
@@ -117,7 +138,7 @@ def _consultar(sessao: requests.Session, cfg: dict, nnf: int, aamm: str) -> str:
 def _baixar(cert_path: Path, key_path: Path, chave: str) -> str:
     with requests.Session() as sessao:
         sessao.cert = (str(cert_path), str(key_path))
-        pagina = sessao.get(URL_PORTAL, timeout=45, verify=certifi.where())
+        pagina = sessao.get(URL_PORTAL, timeout=45, verify=_ca_bundle())
         pagina.raise_for_status()
         campos: dict[str, str] = {}
         for tag in re.findall(r"<input\b[^>]*>", pagina.text, flags=re.I):
@@ -131,7 +152,7 @@ def _baixar(cert_path: Path, key_path: Path, chave: str) -> str:
             URL_PORTAL,
             data=campos,
             timeout=45,
-            verify=certifi.where(),
+            verify=_ca_bundle(),
             headers={"Referer": URL_PORTAL, "Content-Type": "application/x-www-form-urlencoded"},
         )
         resposta.raise_for_status()
