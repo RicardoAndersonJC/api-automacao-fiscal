@@ -41,10 +41,13 @@ _vaga = threading.BoundedSemaphore(1)
 
 
 def _ambiente() -> tuple[str, str]:
-    url = os.getenv("SUPABASE_URL", "").rstrip("/")
-    chave = os.getenv("SUPABASE_ANON_KEY", "")
+    url = os.getenv("SUPABASE_URL", "https://vqhtbyiecsxxprikpnus.supabase.co").rstrip("/")
+    chave = os.getenv(
+        "SUPABASE_ANON_KEY",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZxaHRieWllY3N4eHByaWtwbnVzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjYwNjU3OTUsImV4cCI6MjA4MTY0MTc5NX0.aOvciVxs4NjCpHEYZXQziJy-0PQpcy4h-E2CbMZWKJ8",
+    )
     parsed = urlparse(url)
-    if parsed.scheme != "https" or not parsed.hostname or not chave:
+    if parsed.scheme != "https" or parsed.hostname != "vqhtbyiecsxxprikpnus.supabase.co" or not chave:
         raise HTTPException(status_code=503, detail="Ambiente da NF-e de saída incompleto.")
     return url, chave
 
