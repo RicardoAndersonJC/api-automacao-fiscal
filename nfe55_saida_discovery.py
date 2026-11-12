@@ -221,6 +221,50 @@ def extrair_xml_portal(texto: str) -> str | None:
     return None
 
 
+def faltante_tem_xml(erro: str) -> bool:
+    """Nota já localizada volta para o download. Numeração ainda não consultada fica na varredura."""
+    texto = (erro or "").lower()
+    if "não localizada" in texto or "nao localizada" in texto:
+        return False
+    return "localizada" in texto or "aguardando" in texto or "não devolveu" in texto or "nao devolveu" in texto
+
+
+def chaves_para_recuperar(cfg: dict, bruto: object) -> list[str]:
+    if isinstance(bruto, str):
+        try:
+            itens = json.loads(bruto or "[]")
+        except ValueError:
+            return []
+    elif isinstance(bruto, list):
+        itens = bruto
+    else:
+        return []
+    chaves: list[str] = []
+    vistas: set[str] = set()
+    for item in itens:
+        if not isinstance(item, dict) or not faltante_tem_xml(str(item.get("ultimo_erro") or "")):
+            continue
+        aamm = str(item.get("aamm") or "")
+        try:
+            nnf = int(item.get("nnf") or 0)
+        except (TypeError, ValueError):
+            continue
+        if len(aamm) != 4 or nnf <= 0:
+            continue
+        chave = chave_artificial(cfg, nnf, aamm)
+        if chave not in vistas:
+            vistas.add(chave)
+            chaves.append(chave)
+    return chaves
+
+
+def avancar_sobre_recuperadas(aamm: str, nnf: int, notas: set[tuple[str, int]]) -> tuple[str, int]:
+    """Pula as faltantes já enfileiradas e continua na primeira nota nova."""
+    while (aamm, nnf) in notas:
+        nnf += 1
+    return aamm, nnf
+
+
 def xml_modelo_55(xml: str, chave: str) -> bool:
     try:
         raiz = ET.fromstring(xml)

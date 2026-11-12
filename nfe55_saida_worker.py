@@ -21,8 +21,10 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from nfe55_saida_discovery import (
     avancar,
+    avancar_sobre_recuperadas,
     cfg_da_chave,
     chave_artificial,
+    chaves_para_recuperar,
     extrair_xml_portal,
     interpretar_consulta,
     ler_xml_semente,
@@ -415,7 +417,7 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                 _callback(run_id, token, "xml", chave=chave, aamm=chave[2:6], nnf=int(chave[25:34]), xml=xml)
                 salvas += 1
 
-            def esvaziar(final: bool = False) -> bool:
+            def esvaziar(final: bool = False, origem: str = "Baixando") -> bool:
                 nonlocal onda_inicio, falhas
                 if not lote:
                     return False
@@ -427,7 +429,7 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                     del fila[:capacidade]
                     fim = onda_inicio + len(pedaco) - 1
                     faixa = f"/{capacidade}" if len(pedaco) == capacidade else ""
-                    mensagem = f"Baixando lote {onda_inicio}-{fim}{faixa} · {len(pedaco)} proxy(s) em paralelo"
+                    mensagem = f"{origem} lote {onda_inicio}-{fim}{faixa} · {len(pedaco)} proxy(s) em paralelo"
                     if _callback(run_id, token, "progress", mensagem=mensagem, aamm=aamm, nnf=nnf, consultadas=consultadas, encontradas=len(encontradas)):
                         _callback(run_id, token, "done", mensagem="Busca cancelada.", consultadas=consultadas, encontradas=len(encontradas))
                         return True
@@ -449,7 +451,7 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                             )
                         _callback(
                             run_id, token, "progress",
-                            mensagem=f"Baixando {feitos}/{len(pedaco)} · {salvas} salvas · {len(pedaco)} proxy(s) em paralelo",
+                            mensagem=f"{origem} {feitos}/{len(pedaco)} · {salvas} salvas · {len(pedaco)} proxy(s) em paralelo",
                             aamm=aamm, nnf=nnf, consultadas=consultadas, encontradas=len(encontradas),
                         )
 
@@ -467,13 +469,13 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                         return True
                 return False
 
-            def guardar(chave: str) -> bool:
+            def guardar(chave: str, origem: str = "Baixando") -> bool:
                 if not lote:
                     time.sleep(60)
                     publicar(chave, _baixar(cert_path, key_path, chave))
                     return False
                 fila.append(chave)
-                return esvaziar(False)
+                return esvaziar(False, origem)
 
             if lote:
                 aviso = f"Lote de {len(rotas)} proxies pronto"
@@ -484,6 +486,20 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
             if aviso and _callback(run_id, token, "progress", mensagem=aviso, aamm=aamm, nnf=nnf, consultadas=0, encontradas=0):
                 _callback(run_id, token, "done", mensagem="Busca cancelada.", consultadas=0, encontradas=0)
                 return
+            chaves_faltantes = chaves_para_recuperar(cfg, opcoes.get("lacunas_abertas"))
+            if chaves_faltantes:
+                if _callback(run_id, token, "progress", mensagem=f"Recuperando {len(chaves_faltantes)} nota(s) faltante(s) antes das novas", aamm=aamm, nnf=nnf, consultadas=0, encontradas=len(chaves_faltantes)):
+                    _callback(run_id, token, "done", mensagem="Busca cancelada.", consultadas=0, encontradas=len(chaves_faltantes))
+                    return
+                for chave_faltante in chaves_faltantes:
+                    encontradas.append(chave_faltante)
+                    if guardar(chave_faltante, "Recuperando faltantes"):
+                        return
+                if esvaziar(True, "Recuperando faltantes"):
+                    return
+                aamm, nnf = avancar_sobre_recuperadas(
+                    aamm, nnf, {(chave[2:6], int(chave[25:34])) for chave in chaves_faltantes},
+                )
             while consultadas < limite:
                 if _callback(run_id, token, "progress", mensagem=f"Consultando {aamm} nNF {nnf}", aamm=aamm, nnf=nnf, consultadas=consultadas, encontradas=len(encontradas)):
                     _callback(run_id, token, "done", mensagem="Busca cancelada.", consultadas=consultadas, encontradas=len(encontradas))
@@ -566,6 +582,7 @@ async def iniciar(
     somente_chave: str = Form("false"),
     cursor_aamm: str = Form(""),
     cursor_nnf: int = Form(0),
+    lacunas_abertas: str = Form("[]"),
 ) -> dict[str, str]:
     _validar_execucao(run_id, run_token)
     if not _vaga.acquire(blocking=False):
@@ -589,6 +606,7 @@ async def iniciar(
             "somente_chave": somente_chave.lower() == "true",
             "cursor_aamm": re.sub(r"\D", "", cursor_aamm)[:4],
             "cursor_nnf": cursor_nnf,
+            "lacunas_abertas": lacunas_abertas,
         })
     except HTTPException:
         _vaga.release()
