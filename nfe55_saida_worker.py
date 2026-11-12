@@ -442,6 +442,11 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                         else:
                             falhas += 1
                             houve_limite = houve_limite or erro == "limite"
+                            _callback(
+                                run_id, token, "download_falhou", chave=chave,
+                                aamm=chave[2:6], nnf=int(chave[25:34]),
+                                erro="O portal não devolveu o XML desta chave.",
+                            )
                         _callback(
                             run_id, token, "progress",
                             mensagem=f"Baixando {feitos}/{len(pedaco)} · {salvas} salvas · {len(pedaco)} proxy(s) em paralelo",
@@ -501,21 +506,33 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                             break
                     if recuperada:
                         encontradas.append(recuperada)
+                        _callback(
+                            run_id, token, "descoberta", chave=recuperada,
+                            aamm=recuperada[2:6], nnf=int(recuperada[25:34]),
+                            erro="Chave localizada; XML aguardando download",
+                        )
                         if guardar(recuperada) or esvaziar(True):
                             return
                         aamm = recuperada[2:6]
                         nnf = int(recuperada[25:34]) + 1
                         consecutivos = 0
                         continue
-                    lacunas.append({"aamm": aamm, "nnf": nnf})
+                    lacunas.append({"aamm": aamm, "nnf": nnf, "erro": "Numeração ainda não localizada na consulta"})
+                    _callback(run_id, token, "descoberta", aamm=aamm, nnf=nnf, erro="Numeração ainda não localizada na consulta")
                     break
                 aamm, nnf, consecutivos = passo.aamm, passo.nnf, passo.consecutivos_217
                 if passo.encontrada:
                     encontradas.append(passo.encontrada)
+                    _callback(
+                        run_id, token, "descoberta", chave=passo.encontrada,
+                        aamm=passo.encontrada[2:6], nnf=int(passo.encontrada[25:34]),
+                        erro="Chave localizada; XML aguardando download",
+                    )
                     if guardar(passo.encontrada):
                         return
                 elif passo.lacuna:
-                    lacunas.append({"aamm": aamm, "nnf": nnf - 1})
+                    lacunas.append({"aamm": aamm, "nnf": nnf - 1, "erro": "Numeração ainda não localizada na consulta"})
+                    _callback(run_id, token, "descoberta", aamm=aamm, nnf=nnf - 1, erro="Numeração ainda não localizada na consulta")
                 time.sleep(0.7)
             if esvaziar(True):
                 return
