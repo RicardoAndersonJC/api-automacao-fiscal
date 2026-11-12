@@ -340,6 +340,7 @@ def _descarregar_lote(
     chaves: list[str],
     rotas: list[Any],
     avisar_espera: Any = None,
+    ao_concluir: Any = None,
 ) -> list[tuple[str, str, str]]:
     """Uma chave por IP. O intervalo de 1 min vale ao reutilizar a mesma faixa."""
     from nfce_download_worker import OutboundTransportManager
@@ -361,6 +362,8 @@ def _descarregar_lote(
         for futuro in as_completed(futuros):
             indice, chave, xml, erro = futuro.result()
             resultados[indice] = (chave, xml, erro)
+            if ao_concluir:
+                ao_concluir(chave, xml, erro)
     return [resultados[indice] for indice in range(quantidade)]
 
 
@@ -428,17 +431,27 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                     if _callback(run_id, token, "progress", mensagem=mensagem, aamm=aamm, nnf=nnf, consultadas=consultadas, encontradas=len(encontradas)):
                         _callback(run_id, token, "done", mensagem="Busca cancelada.", consultadas=consultadas, encontradas=len(encontradas))
                         return True
-                    resultados = _descarregar_lote(
-                        cert_path, key_path, pedaco, rotas, avisar_espera if onda_inicio > 1 else None,
-                    )
-                    onda_inicio = fim + 1
+                    feitos = 0
                     houve_limite = False
-                    for chave, xml, erro in resultados:
+
+                    def ao_concluir(chave: str, xml: str, erro: str) -> None:
+                        nonlocal feitos, houve_limite, falhas
+                        feitos += 1
                         if xml:
                             publicar(chave, xml)
                         else:
                             falhas += 1
                             houve_limite = houve_limite or erro == "limite"
+                        _callback(
+                            run_id, token, "progress",
+                            mensagem=f"Baixando {feitos}/{len(pedaco)} · {salvas} salvas · {len(pedaco)} proxy(s) em paralelo",
+                            aamm=aamm, nnf=nnf, consultadas=consultadas, encontradas=len(encontradas),
+                        )
+
+                    _descarregar_lote(
+                        cert_path, key_path, pedaco, rotas, avisar_espera if onda_inicio > 1 else None, ao_concluir,
+                    )
+                    onda_inicio = fim + 1
                     if houve_limite:
                         _callback(
                             run_id, token, "done",
