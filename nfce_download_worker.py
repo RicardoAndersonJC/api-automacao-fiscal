@@ -2783,12 +2783,83 @@ def _export_progress(
     ))
 
 
+# O teto global do projeto, com spend cap, rejeita arquivo acima de 50 MB.
+EXPORT_PART_LIMIT_BYTES = 45 * 1024 * 1024
+
+
+def _split_company_zip(folder: str, source: Path, directory: Path, limit: int) -> list[tuple[str, Path, int]]:
+    pieces: list[tuple[str, Path, int]] = []
+    with zipfile.ZipFile(source) as incoming:
+        members: list[zipfile.ZipInfo] = []
+        used = 0
+
+        def flush() -> None:
+            nonlocal members, used
+            if not members:
+                return
+            piece = directory / f"{folder}-{len(pieces)}.zip"
+            with zipfile.ZipFile(piece, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as output:
+                for info in members:
+                    output.writestr(info, incoming.read(info))
+            pieces.append((folder, piece, len(members)))
+            members = []
+            used = 0
+
+        for info in incoming.infolist():
+            size = max(info.compress_size, info.file_size, 1)
+            if members and used + size > limit:
+                flush()
+            members.append(info)
+            used += size
+        flush()
+    return pieces
+
+
+def _pack_export_parts(
+    companies: list[tuple[str, Path]],
+    directory: Path,
+    limit: int = EXPORT_PART_LIMIT_BYTES,
+) -> list[tuple[str, Path, int]]:
+    """Agrupa os ZIPs das empresas em arquivos que cabem no limite do storage."""
+    pieces: list[tuple[str, Path, int]] = []
+    for folder, path in companies:
+        if path.stat().st_size > limit:
+            pieces.extend(_split_company_zip(folder, path, directory, limit))
+        else:
+            with zipfile.ZipFile(path) as company_zip:
+                pieces.append((folder, path, len(company_zip.namelist())))
+    groups: list[list[tuple[str, Path, int]]] = []
+    current: list[tuple[str, Path, int]] = []
+    current_bytes = 0
+    for piece in pieces:
+        size = piece[1].stat().st_size
+        if current and current_bytes + size > limit:
+            groups.append(current)
+            current = []
+            current_bytes = 0
+        current.append(piece)
+        current_bytes += size
+    if current:
+        groups.append(current)
+    parts: list[tuple[str, Path, int]] = []
+    for index, group in enumerate(groups, start=1):
+        name = "nfce-completo.zip" if len(groups) == 1 else f"nfce-parte-{index:03d}.zip"
+        path = directory / name
+        count = 0
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as outer:
+            for folder, company_zip, xml_count in group:
+                outer.write(company_zip, f"{folder}/{folder}.zip", compress_type=zipfile.ZIP_STORED)
+                count += xml_count
+        parts.append((name, path, count))
+    return parts
+
+
 def _build_export_zip(
     session: requests.Session,
     url: str,
     execution: dict[str, Any],
     local_path: Path,
-) -> int | None:
+) -> tuple[int, list[tuple[str, Path, int]]] | None:
     params = execution["parametros"]
     filters = {
         "select": "id,nome,storage_path,empresa_id",
@@ -2858,9 +2929,6 @@ def _build_export_zip(
         for client in clients:
             client.headers.update(session.headers)
         pool = resources.enter_context(ThreadPoolExecutor(max_workers=concurrency))
-        archive = resources.enter_context(
-            zipfile.ZipFile(local_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True)
-        )
         while True:
             response = session.get(f"{url}/rest/v1/arquivos", params=filters, timeout=(5, 30))
             response.raise_for_status()
@@ -2935,27 +3003,34 @@ def _build_export_zip(
                 return None
             last_progress = time.monotonic()
         close_company_archives()
-        for folder, path in company_archives.values():
-            archive.write(path, f"{folder}/{folder}.zip", compress_type=zipfile.ZIP_STORED)
+        parts = _pack_export_parts(list(company_archives.values()), local_path.parent)
         if missing_xmls:
-            report = [
+            report = "\n".join([
                 "Exportação parcial de XMLs NFC-e",
                 f"XMLs incluídos: {processed - len(missing_xmls)}",
                 f"XMLs ausentes no Storage: {len(missing_xmls)}",
                 "",
                 *missing_xmls,
-            ]
-            archive.writestr("AVISO-XMLS-AUSENTES.txt", "\n".join(report) + "\n")
+            ]) + "\n"
+            if not parts:
+                notice = local_path.parent / "nfce-completo.zip"
+                with zipfile.ZipFile(notice, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as outer:
+                    outer.writestr("AVISO-XMLS-AUSENTES.txt", report)
+                parts = [("nfce-completo.zip", notice, 0)]
+            else:
+                with zipfile.ZipFile(parts[-1][1], "a", compression=zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as outer:
+                    outer.writestr("AVISO-XMLS-AUSENTES.txt", report)
+        if len(parts) == 1 and parts[0][1] != local_path:
+            parts[0][1].replace(local_path)
+            parts = [(parts[0][0], local_path, parts[0][2])]
     if not processed:
         raise ValueError("Nenhum XML disponível na exportação")
-    return processed - len(missing_xmls)
+    return processed - len(missing_xmls), parts
 
 
 def _run_export_zip(url: str, key: str, execution: dict[str, Any]) -> None:
     job_id = execution["id"]
     params = execution["parametros"]
-    archive_name = "nfce-completo.zip"
-    object_path = f"nfce-exports/{execution['organizacao_id']}/{job_id}/{archive_name}"
     try:
         if __package__:
             from .nfse_zip_worker import _upload_zip
@@ -2967,11 +3042,18 @@ def _run_export_zip(url: str, key: str, execution: dict[str, Any]) -> None:
             if not _export_progress(session, url, execution, 0):
                 return
             with tempfile.TemporaryDirectory(prefix="nfce-export-", dir=WORK_ROOT) as work_dir:
-                local_path = Path(work_dir) / archive_name
-                processed = _build_export_zip(session, url, execution, local_path)
-                if processed is None or not _export_progress(session, url, execution, processed):
+                local_path = Path(work_dir) / "nfce-completo.zip"
+                built = _build_export_zip(session, url, execution, local_path)
+                if built is None:
                     return
-                _upload_zip(url, key, object_path, local_path, session, bucket="fiscal-files")
+                processed, parts = built
+                if not _export_progress(session, url, execution, processed):
+                    return
+                stored = []
+                for name, path, count in parts:
+                    object_path = f"nfce-exports/{execution['organizacao_id']}/{job_id}/{name}"
+                    _upload_zip(url, key, object_path, path, session, bucket="fiscal-files")
+                    stored.append({"path": object_path, "name": name, "count": count})
                 completed = _export_update(
                     session, url, job_id, "processando",
                     {
@@ -2982,13 +3064,16 @@ def _run_export_zip(url: str, key: str, execution: dict[str, Any]) -> None:
                             **params,
                             "processed": processed,
                             "total": processed,
-                            "parts": [{"path": object_path, "name": archive_name, "count": processed}],
+                            "parts": stored,
                         },
                     },
                 )
                 if not completed:
-                    response = session.delete(f"{url}/storage/v1/object/fiscal-files/{object_path}", timeout=(5, 20))
-                    response.raise_for_status()
+                    for item in stored:
+                        response = session.delete(
+                            f"{url}/storage/v1/object/fiscal-files/{item['path']}", timeout=(5, 20),
+                        )
+                        response.raise_for_status()
     except Exception as exc:
         # HTTP errors may contain private object names or upload URLs.
         _logger.warning("Falha na exportação NFC-e %s (%s)", job_id, type(exc).__name__)
