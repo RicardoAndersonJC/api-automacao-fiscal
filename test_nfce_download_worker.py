@@ -451,6 +451,55 @@ class NfceWorkerTest(unittest.TestCase):
         self.assertEqual(breaker.state, "closed")
         self.assertTrue(breaker.allow_call())
 
+    def test_pinned_proxy_failures_do_not_open_the_shared_circuit(self):
+        from pathlib import Path
+        from unittest.mock import Mock
+
+        circuit = worker.TransportCircuitBreaker(threshold=5, cooldown_seconds=60)
+        limiter = worker.SvrsRateLimiter(soap_seconds=0, download_seconds=0)
+        with patch.object(worker, "_new_svrs_session", return_value=Mock()), patch.object(
+            worker, "_download", side_effect=requests.exceptions.ProxyError("tunnel")
+        ):
+            for index in range(6):
+                route = worker.OutboundRoute(f"outbound-{index}", f"http://192.0.2.{index + 1}:8080")
+                transport = worker.OutboundTransportManager([route], enabled=True)
+                _item, xml, _message, kind = worker._download_one(
+                    Path("cert"),
+                    Path("key"),
+                    "verify",
+                    {"AAMM": "2611", "nNF": 10 + index, "chave_real": f"{index:044d}"},
+                    limiter=limiter,
+                    transport=transport,
+                    circuit=circuit,
+                    lane=f"proxy-ip:192.0.2.{index + 1}",
+                )
+                self.assertEqual(kind, "proxy")
+                self.assertIsNone(xml)
+        self.assertEqual(circuit.state, "closed")
+        self.assertEqual(circuit.failures, 0)
+
+    def test_direct_proxy_failure_still_opens_the_shared_circuit(self):
+        from pathlib import Path
+        from unittest.mock import Mock
+
+        circuit = worker.TransportCircuitBreaker(threshold=1, cooldown_seconds=60)
+        limiter = worker.SvrsRateLimiter(soap_seconds=0, download_seconds=0)
+        with patch.object(worker, "_new_svrs_session", return_value=Mock()), patch.object(
+            worker, "_download", side_effect=requests.exceptions.ProxyError("tunnel")
+        ):
+            _item, xml, _message, kind = worker._download_one(
+                Path("cert"),
+                Path("key"),
+                "verify",
+                {"AAMM": "2611", "nNF": 10, "chave_real": "1" * 44},
+                limiter=limiter,
+                circuit=circuit,
+                lane="download",
+            )
+        self.assertEqual(kind, "proxy")
+        self.assertIsNone(xml)
+        self.assertEqual(circuit.state, "open")
+
     def test_certificate_and_cnpj_do_not_retry(self):
         self.assertTrue(client_error_is_permanent("certificate"))
         self.assertTrue(client_error_is_permanent("cnpj"))
@@ -759,6 +808,40 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
         self.assertEqual(completed["pending_saved"], 4)
         self.assertFalse(completed["pause_for_svrs"])
+
+    def test_proxy_failure_does_not_pause_the_other_notes(self):
+        import os
+
+        def download(*args, **kwargs):
+            item = args[3]
+            if int(item["nNF"]) == 101:
+                return item, None, "A saída de rede configurada falhou antes de alcançar a SVRS.", "proxy"
+            return item, "<nfeProc><NFe /></nfeProc>", "", "ok"
+
+        env = {
+            "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+            "NFCE_PROXY_BATCH_SIZE": "2",
+            "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.12:8080",
+        }
+        with patch.dict(os.environ, env):
+            job, callbacks, _consults = self.run_worker(
+                [],
+                dict(
+                    pending_only=True,
+                    pending_items=[
+                        dict(aamm="2611", nnf=101, chave="1" * 44),
+                        dict(aamm="2611", nnf=102, chave="2" * 44),
+                    ],
+                ),
+                downloads=download,
+            )
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(sum(call.args[1] == "file" for call in callbacks), 1)
+        self.assertEqual(sum(call.args[1] == "download_failed" for call in callbacks), 1)
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertFalse(completed["pause_for_svrs"])
+        self.assertNotIn("Pausa temporária na SVRS", completed["message"])
 
     def test_pending_recovery_saves_xml_before_slow_peer_finishes(self):
         import os

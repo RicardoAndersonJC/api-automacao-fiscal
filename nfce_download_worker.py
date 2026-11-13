@@ -748,6 +748,17 @@ def reset_shared_transport_circuit() -> None:
         _shared_circuit = None
 
 
+def lane_uses_shared_circuit(lane: str, transport: OutboundTransportManager | None) -> bool:
+    """Um IP preso a uma nota não representa a SVRS.
+
+    A falha do túnel dele não pode abrir o circuito e impedir os outros IPs de tentar.
+    """
+    if transport is None or not transport.enabled:
+        return True
+    proxy_routes = [route for route in transport.routes if route.proxy_url]
+    return not (len(proxy_routes) == 1 and str(lane).startswith("proxy-ip:"))
+
+
 @dataclass
 class OutboundRoute:
     outbound_id: str
@@ -1570,7 +1581,7 @@ def _download_one(
     active_session = session or _new_svrs_session(cert_path, key_path, verify_path, transport)
     interval = clamp_download_interval(int(item.get("_download_interval_seconds", SVRS_INTERVAL_MIN_SECONDS)))
     active = limiter or SvrsRateLimiter(soap_seconds=0.1, download_seconds=interval)
-    breaker = circuit
+    breaker = circuit if circuit is not None and lane_uses_shared_circuit(lane, transport) else None
     route = transport.current() if transport else None
     try:
         kind = "no_xml"
@@ -1971,7 +1982,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         item_index=pending_index,
                         mode="pending_recovery",
                     )
-                    if failure_kind in {"rate_limit", "circuit_open", "proxy"}:
+                    if failure_kind in {"rate_limit", "circuit_open"}:
                         paused_for_svrs = True
 
                 message = (
@@ -2366,7 +2377,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     found=len(found),
                     mode="discovery",
                 )
-                if kind in {"rate_limit", "circuit_open", "proxy"}:
+                if kind in {"rate_limit", "circuit_open"}:
                     paused_for_svrs = True
                     return "pause"
                 return "failed"
