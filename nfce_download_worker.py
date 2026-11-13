@@ -2393,10 +2393,26 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         discovery_queue: dict[str, dict[str, Any]] = {}
 
         def flush_discovered() -> None:
+            nonlocal halt_reason
             candidates = list(discovery_queue.values())
             discovery_queue.clear()
             if not candidates:
                 return
+            saved_before = pending_saved
+            saw_transport_failure = False
+            saw_other_failure = False
+
+            def note_batch_result(result: tuple) -> None:
+                nonlocal saw_transport_failure, saw_other_failure
+                xml = result[1] if len(result) > 1 else None
+                kind = result[3] if len(result) > 3 else "timeout"
+                if xml:
+                    return
+                if kind in {"proxy", "timeout"}:
+                    saw_transport_failure = True
+                else:
+                    saw_other_failure = True
+
             routes = [OutboundTransportManager([route], enabled=True) for route in pilot_routes]
             for offset in range(0, len(candidates), len(routes)):
                 batch = candidates[offset:offset + len(routes)]
@@ -2419,13 +2435,16 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                             result = future.result()
                         except Exception as exc:
                             result = (item, None, str(exc), "timeout")
+                        note_batch_result(result)
                         download_found(item["AAMM"], item["nNF"], item["chave_real"], result=result)
 
                     def on_timeout(future, futures=futures):
                         item = futures[future]
+                        result = (item, None, download_failure_message("timeout"), "timeout")
+                        note_batch_result(result)
                         download_found(
                             item["AAMM"], item["nNF"], item["chave_real"],
-                            result=(item, None, download_failure_message("timeout"), "timeout"),
+                            result=result,
                         )
 
                     def on_heartbeat(done_n, total):
@@ -2441,7 +2460,15 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     )
                 finally:
                     pilot_pool.shutdown(wait=False, cancel_futures=True)
-                if paused_for_svrs:
+                if (
+                    pending_saved == saved_before
+                    and saw_transport_failure
+                    and not saw_other_failure
+                    and not paused_for_svrs
+                    and not halt_reason
+                ):
+                    halt_reason = "download_transport"
+                if paused_for_svrs or halt_reason:
                     break
 
         def download_or_queue(aamm: str, n_nf: int, key: str) -> None:
@@ -2693,6 +2720,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             completion_message = (
                 f"Pausa temporária na SVRS · {downloaded} XML salvos. "
                 "O restante continua na fila e segue em 1 min."
+            )
+        elif downloaded == 0 and len(found) > 0:
+            completion_message = (
+                f"{len(found)} chave(s) encontradas · 0 XML salvos. "
+                "O download não gravou o XML. As notas continuam na fila."
             )
         elif known_pending_saved or known_pending_failed:
             completion_message = (

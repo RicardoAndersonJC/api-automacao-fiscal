@@ -697,6 +697,70 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.assertEqual({lane for _, lane in downloads}, {"proxy-ip:192.0.2.1", "proxy-ip:192.0.2.2"})
         self.assertTrue(callbacks[-1].kwargs["scan_complete"])
 
+    def test_hundred_found_notes_download_before_the_next_consult(self):
+        import os
+
+        consulted = []
+        download_at = []
+
+        def responses(*_args, **_kwargs):
+            consulted.append(1)
+            number = len(consulted)
+            if number <= 120:
+                return ("613", "", f"{number:044d}")
+            return ("217", "", "")
+
+        def download(*_args, **_kwargs):
+            download_at.append(len(consulted))
+            return {}, "<nfeProc><NFe /></nfeProc>", "", "ok"
+
+        env = {
+            "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+            "NFCE_PROXY_BATCH_SIZE": "100",
+            "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.12:8080",
+        }
+        with patch.dict(os.environ, env):
+            job, callbacks, _consults = self.run_worker(
+                responses,
+                dict(max_numbers=120, stop_gap=80),
+                downloads=download,
+            )
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(download_at.count(100), 100)
+        self.assertEqual(download_at.count(120), 20)
+        self.assertNotIn("0 XML salvos", callbacks[-1].kwargs["message"])
+
+    def test_proxy_batch_without_saves_stops_the_scan(self):
+        import os
+
+        consulted = []
+
+        def responses(*_args, **_kwargs):
+            consulted.append(1)
+            return ("613", "", f"{len(consulted):044d}")
+
+        def download(*_args, **_kwargs):
+            return {}, None, "A saída falhou.", "proxy"
+
+        env = {
+            "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+            "NFCE_PROXY_BATCH_SIZE": "2",
+            "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.12:8080",
+        }
+        with patch.dict(os.environ, env):
+            job, callbacks, _consults = self.run_worker(
+                responses,
+                dict(max_numbers=10, stop_gap=80),
+                downloads=download,
+            )
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(len(consulted), 2)
+        message = callbacks[-1].kwargs["message"]
+        self.assertNotIn("Processamento concluído", message)
+        self.assertIn("0 XML salvos", message)
+
     def test_discovery_batch_stays_on_with_missing_notes_payload(self):
         """Edge quase sempre manda lacunas; isso não pode forçar download serial."""
         import os
