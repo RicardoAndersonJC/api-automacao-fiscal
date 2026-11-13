@@ -677,6 +677,51 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         proxy_lanes = {lane for lane in lanes if str(lane).startswith("proxy-ip:")}
         self.assertTrue(proxy_lanes, f"esperava lote proxy; lanes={lanes}")
 
+    def test_missing_notes_downloads_use_proxy_batch_not_serial(self):
+        """Lacunas recuperadas devem baixar em paralelo nos IPs contratados."""
+        import os
+        import threading
+
+        barrier = threading.Barrier(2, timeout=5)
+        lanes = []
+
+        def download(*args, **kwargs):
+            lanes.append(kwargs["lane"])
+            barrier.wait()
+            item = args[3]
+            return item, "<nfeProc><NFe /></nfeProc>", "", "ok"
+
+        # Duas lacunas encontradas (613) — baixar juntas, não 1 a 1.
+        responses = [
+            ("613", "Autorizada", "1" * 44),
+            ("613", "Autorizada", "2" * 44),
+        ]
+        env = {
+            "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+            "NFCE_PROXY_BATCH_SIZE": "2",
+            "NFCE_PROXY_PILOT_URL": "http://192.0.2.21:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.22:8080",
+        }
+        with patch.dict(os.environ, env):
+            job, callbacks, consults = self.run_worker(
+                responses,
+                dict(
+                    pending_only=True,
+                    defer_discovery=True,
+                    missing_notes=[
+                        dict(aamm="2608", nnf=10001),
+                        dict(aamm="2608", nnf=10002),
+                    ],
+                ),
+                downloads=download,
+            )
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(len(consults), 2)
+        self.assertEqual(sum(call.args[1] == "file" for call in callbacks), 2)
+        self.assertEqual(set(lanes), {"proxy-ip:192.0.2.21", "proxy-ip:192.0.2.22"})
+        self.assertEqual(lanes.count("proxy-ip:192.0.2.21"), 1)
+        self.assertEqual(lanes.count("proxy-ip:192.0.2.22"), 1)
+
     def test_pending_recovery_downloads_in_proxy_batches(self):
         import os
         import threading
@@ -1005,3 +1050,45 @@ class DownloadFifoTests(unittest.TestCase):
         self.assertFalse(limiter._download_tickets)
         self.assertEqual(limiter.begin_download(), "call")
         self.assertEqual(now[0], 60)
+
+    def test_free_ip_does_not_wait_behind_another_ip(self):
+        now = [0.0]
+        limiter = worker.SvrsRateLimiter(
+            download_seconds=60,
+            clock=lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        self.assertEqual(limiter.begin_download(lane="proxy-ip:192.0.2.1"), "call")
+        self.assertEqual(limiter.begin_download(lane="proxy-ip:192.0.2.2"), "call")
+        self.assertEqual(now[0], 0)
+        self.assertEqual(limiter.begin_download(lane="proxy-ip:192.0.2.1"), "call")
+        self.assertEqual(now[0], 60)
+
+    def test_parallel_wave_keeps_finished_ip_when_another_stalls(self):
+        import concurrent.futures
+
+        done = concurrent.futures.Future()
+        done.set_result("xml")
+        stuck = concurrent.futures.Future()
+        now = [0.0]
+        seen = []
+
+        def clock():
+            return now[0]
+
+        def fake_wait(pending, timeout, return_when):
+            now[0] += timeout
+            finished = {future for future in pending if future.done()}
+            return finished, pending - finished
+
+        worker.collect_parallel_downloads(
+            {done: 1, stuck: 2},
+            on_done=lambda future: seen.append(future.result()),
+            on_timeout=lambda future: seen.append("timeout"),
+            on_heartbeat=lambda done_n, total: None,
+            deadline_seconds=30,
+            heartbeat_seconds=20,
+            clock=clock,
+            wait_fn=fake_wait,
+        )
+        self.assertEqual(seen, ["xml", "timeout"])

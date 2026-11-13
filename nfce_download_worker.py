@@ -31,7 +31,7 @@ import time
 import unicodedata
 import zipfile
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -64,6 +64,11 @@ SVRS_DOWNLOAD_GET_URL = "https://dfe-portal.svrs.rs.gov.br/NFCESSL/DownloadXMLDF
 SVRS_DOWNLOAD_POST_URL = "https://dfe-portal.svrs.rs.gov.br/BpeSSL/DownloadXmlDfe"
 SOAP_ACTION = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF"
 REQUEST_TIMEOUT = int(os.getenv("NFCE_REQUEST_TIMEOUT", "45"))
+# Conexão morta de proxy não pode segurar o lote até a Edge encerrar a empresa.
+PORTAL_CONNECT_TIMEOUT = 15
+PARALLEL_HEARTBEAT_SECONDS = 20
+# Uma onda de 100 IPs termina antes dos 8 min em que a Edge declara o worker morto.
+PARALLEL_WAVE_DEADLINE_SECONDS = 6 * 60
 JOB_TTL_SECONDS = int(os.getenv("NFCE_JOB_TTL_SECONDS", "21600"))
 MAX_UPLOAD_BYTES = int(os.getenv("NFCE_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024)))
 MAX_NUMERACOES = int(os.getenv("NFCE_MAX_NUMERACOES", "10000"))
@@ -429,7 +434,7 @@ class SvrsRateLimiter:
         self._sleep = sleep or time.sleep
         self._lock = threading.Lock()
         self._download_condition = threading.Condition(self._lock)
-        self._download_tickets: deque[object] = deque()
+        self._lane_tickets: dict[str, deque] = {}
         self._next = {"soap": 0.0, "download": 0.0}
         self._download_state = "available"
         self._cooldown_until = 0.0
@@ -472,17 +477,25 @@ class SvrsRateLimiter:
                 now = float(self._clock())
                 self._next["download"] = now + self.download_seconds
 
+    @property
+    def _download_tickets(self) -> list:
+        return [ticket for queue in self._lane_tickets.values() for ticket in queue]
+
     def begin_download(self, notify_wait=None, lane: str = "download") -> str:
-        """FIFO admission, preserving spacing and the single half-open probe."""
+        """Cada IP espera só o próprio intervalo. Outro IP livre não entra na fila dele.
+
+        O cooldown do portal continua único: depois do limite, só uma sonda sai.
+        """
         ticket = object()
         last_notification = float(self._clock()) - 30.0
         with self._download_condition:
-            self._download_tickets.append(ticket)
+            self._lane_tickets.setdefault(lane, deque()).append(ticket)
         try:
             while True:
                 with self._download_condition:
                     now = float(self._clock())
-                    is_head = self._download_tickets[0] is ticket
+                    lane_queue = self._lane_tickets.get(lane) or deque()
+                    is_head = bool(lane_queue) and lane_queue[0] is ticket
                     delay = 0.0
                     if is_head:
                         self._roll_download_state_locked(now)
@@ -498,19 +511,24 @@ class SvrsRateLimiter:
                             if delay == 0:
                                 self._next[lane] = now + self.download_seconds
                                 return "call"
-                # Both heartbeat and sleep are outside the limiter lock.
+                # Heartbeat e sono ficam fora do lock. Outro IP não entra nesta fila.
                 if notify_wait and now - last_notification >= 30.0:
                     notify_wait()
                     last_notification = float(self._clock())
-                if is_head:
+                if is_head and delay > 0:
                     self._sleep(min(delay, 30.0) if notify_wait else delay)
                 else:
                     with self._download_condition:
-                        if self._download_tickets[0] is not ticket:
+                        lane_queue = self._lane_tickets.get(lane) or deque()
+                        if not lane_queue or lane_queue[0] is not ticket:
                             self._download_condition.wait(timeout=30.0)
         finally:
             with self._download_condition:
-                self._download_tickets.remove(ticket)
+                lane_queue = self._lane_tickets.get(lane)
+                if lane_queue is not None and ticket in lane_queue:
+                    lane_queue.remove(ticket)
+                if lane_queue is not None and not lane_queue:
+                    self._lane_tickets.pop(lane, None)
                 self._download_condition.notify_all()
 
     def wait(self, channel: str) -> float:
@@ -538,6 +556,49 @@ class SvrsRateLimiter:
             if self._download_state == "cooldown":
                 target = max(target, self._cooldown_until)
             self._next[lane] = max(self._next.get(lane, 0.0), target)
+
+
+def collect_parallel_downloads(
+    futures: dict,
+    *,
+    on_done,
+    on_timeout,
+    on_heartbeat,
+    deadline_seconds: float = PARALLEL_WAVE_DEADLINE_SECONDS,
+    heartbeat_seconds: float = PARALLEL_HEARTBEAT_SECONDS,
+    clock=None,
+    wait_fn=None,
+) -> None:
+    """Cada IP devolve a sua nota. Quem não volta vira timeout e não segura o lote."""
+    clock = clock or time.monotonic
+    wait_fn = wait_fn or wait
+    pending = set(futures)
+    started = clock()
+    last_beat = started
+    while pending:
+        now = clock()
+        ready = {future for future in pending if future.done()}
+        for future in ready:
+            pending.discard(future)
+            on_done(future)
+        if not pending:
+            return
+        remaining = deadline_seconds - (now - started)
+        if remaining <= 0:
+            for future in list(pending):
+                on_timeout(future)
+            return
+        if now - last_beat >= heartbeat_seconds:
+            on_heartbeat(len(futures) - len(pending), len(futures))
+            last_beat = clock()
+        done, not_done = wait_fn(
+            pending,
+            timeout=min(heartbeat_seconds, remaining),
+            return_when=FIRST_COMPLETED,
+        )
+        for future in done:
+            on_done(future)
+        pending = set(not_done)
 
 
 def discovery_action(status: str, artificial: str, real_key: str) -> tuple[str, str]:
@@ -1656,7 +1717,7 @@ def _download(session: requests.Session, key: str,
         SVRS_DOWNLOAD_GET_URL,
         params={"OrigemSite": "2", "Ambiente": "1", "ChaveAcessoDfe": key},
         headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html,application/xml;q=0.9,*/*;q=0.8"},
-        timeout=REQUEST_TIMEOUT,
+        timeout=(PORTAL_CONNECT_TIMEOUT, REQUEST_TIMEOUT),
     )
     _log_remote_response(get_response, "portal_get", started, context)
     blocked = _portal_http_failure(get_response)
@@ -1682,7 +1743,7 @@ def _download(session: requests.Session, key: str,
             "Origin": "https://dfe-portal.svrs.rs.gov.br",
             "Referer": get_response.url,
         },
-        timeout=REQUEST_TIMEOUT,
+        timeout=(PORTAL_CONNECT_TIMEOUT, REQUEST_TIMEOUT),
     )
     _log_remote_response(post_response, "portal_post", started, context)
     blocked = _portal_http_failure(post_response)
@@ -1982,7 +2043,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                             message=message,
                         )
 
-                    with ThreadPoolExecutor(max_workers=len(chunk)) as pilot_pool:
+                    pilot_pool = ThreadPoolExecutor(max_workers=len(chunk))
+                    try:
                         futures = {
                             pilot_pool.submit(
                                 _download_one,
@@ -2000,10 +2062,15 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                             ): offset
                             for offset, (pending, route) in enumerate(zip(chunk, routes))
                         }
-                        # Grava e avisa a tela no XML que voltar, sem esperar o lote inteiro.
-                        for future in as_completed(futures):
+
+                        def on_done(future, futures=futures):
                             offset = futures[future]
-                            item, xml, last_download_error, failure_kind = future.result()
+                            try:
+                                item, xml, last_download_error, failure_kind = future.result()
+                            except Exception as exc:
+                                pending = pending_queue[processed + offset]
+                                item = pending_download_item(pending)
+                                xml, last_download_error, failure_kind = None, str(exc), "timeout"
                             apply_pending_result(
                                 processed + offset + 1,
                                 item,
@@ -2011,6 +2078,41 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                                 last_download_error,
                                 failure_kind,
                             )
+
+                        def on_timeout(future, futures=futures):
+                            offset = futures[future]
+                            pending = pending_queue[processed + offset]
+                            apply_pending_result(
+                                processed + offset + 1,
+                                pending_download_item(pending),
+                                None,
+                                download_failure_message("timeout"),
+                                "timeout",
+                            )
+
+                        def on_heartbeat(done_n, total):
+                            message = f"Baixando {done_n}/{total} neste lote · um IP por nota · {pending_saved} salvas"
+                            _update(job, message=message, downloaded=saved)
+                            _callback(
+                                job,
+                                "progress",
+                                consulted=0,
+                                found=0,
+                                downloaded=saved,
+                                pending_total=pending_total,
+                                pending_failed=pending_failed,
+                                mode="pending_recovery",
+                                message=message,
+                            )
+
+                        collect_parallel_downloads(
+                            futures,
+                            on_done=on_done,
+                            on_timeout=on_timeout,
+                            on_heartbeat=on_heartbeat,
+                        )
+                    finally:
+                        pilot_pool.shutdown(wait=False, cancel_futures=True)
                     processed += len(chunk)
             else:
                 for pending_index, pending in enumerate(pending_queue, 1):
@@ -2285,9 +2387,10 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             if not candidates:
                 return
             routes = [OutboundTransportManager([route], enabled=True) for route in pilot_routes]
-            with ThreadPoolExecutor(max_workers=len(routes)) as pilot_pool:
-                for offset in range(0, len(candidates), len(routes)):
-                    batch = candidates[offset:offset + len(routes)]
+            for offset in range(0, len(candidates), len(routes)):
+                batch = candidates[offset:offset + len(routes)]
+                pilot_pool = ThreadPoolExecutor(max_workers=len(batch))
+                try:
                     futures = {
                         pilot_pool.submit(
                             _download_one, cert_path, key_path, verify_path,
@@ -2298,11 +2401,37 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         ): item
                         for item, route in zip(batch, routes)
                     }
-                    for future in as_completed(futures):
+
+                    def on_done(future, futures=futures):
                         item = futures[future]
-                        download_found(item["AAMM"], item["nNF"], item["chave_real"], result=future.result())
-                    if paused_for_svrs:
-                        break
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            result = (item, None, str(exc), "timeout")
+                        download_found(item["AAMM"], item["nNF"], item["chave_real"], result=result)
+
+                    def on_timeout(future, futures=futures):
+                        item = futures[future]
+                        download_found(
+                            item["AAMM"], item["nNF"], item["chave_real"],
+                            result=(item, None, download_failure_message("timeout"), "timeout"),
+                        )
+
+                    def on_heartbeat(done_n, total):
+                        message = f"Baixando {done_n}/{total} neste lote · um IP por nota"
+                        _update(job, message=message, consulted=len(records), found=len(found), downloaded=pending_saved)
+                        _callback(
+                            job, "progress", message=message, consulted=len(records), found=len(found),
+                            downloaded=pending_saved, mode="discovery",
+                        )
+
+                    collect_parallel_downloads(
+                        futures, on_done=on_done, on_timeout=on_timeout, on_heartbeat=on_heartbeat,
+                    )
+                finally:
+                    pilot_pool.shutdown(wait=False, cancel_futures=True)
+                if paused_for_svrs:
+                    break
 
         def download_or_queue(aamm: str, n_nf: int, key: str) -> None:
             # Com lote contratado, nunca baixar 1 a 1: enfileira e dispara por IP.
