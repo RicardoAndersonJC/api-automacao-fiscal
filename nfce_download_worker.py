@@ -1993,19 +1993,17 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                                 limiter,
                                 run_id=job.external_run_id or "",
                                 empresa_id=job.empresa_id,
-                                notify_wait=notify_batch_wait if processed else None,
+                                notify_wait=notify_batch_wait,
                                 transport=route,
                                 circuit=circuit,
                                 lane=proxy_lane(route),
                             ): offset
                             for offset, (pending, route) in enumerate(zip(chunk, routes))
                         }
-                        results_by_offset: dict[int, tuple] = {}
+                        # Grava e avisa a tela no XML que voltar, sem esperar o lote inteiro.
                         for future in as_completed(futures):
                             offset = futures[future]
-                            results_by_offset[offset] = future.result()
-                        for offset in range(len(chunk)):
-                            item, xml, last_download_error, failure_kind = results_by_offset[offset]
+                            item, xml, last_download_error, failure_kind = future.result()
                             apply_pending_result(
                                 processed + offset + 1,
                                 item,

@@ -715,6 +715,47 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.assertEqual(completed["pending_saved"], 4)
         self.assertFalse(completed["pause_for_svrs"])
 
+    def test_pending_recovery_saves_xml_before_slow_peer_finishes(self):
+        import os
+        import threading
+
+        first_file = threading.Event()
+
+        def on_callback(job, event, **payload):
+            if event == "file":
+                first_file.set()
+
+        def download(*args, **kwargs):
+            item = args[3]
+            if int(item["nNF"]) == 102:
+                self.assertTrue(
+                    first_file.wait(timeout=5),
+                    "a tela precisa ver o XML rápido antes do lote paralelo fechar",
+                )
+            return item, "<nfeProc><NFe /></nfeProc>", "", "ok"
+
+        env = {
+            "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+            "NFCE_PROXY_BATCH_SIZE": "2",
+            "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.12:8080",
+        }
+        with patch.dict(os.environ, env):
+            job, callbacks, _ = self.run_worker(
+                [],
+                dict(
+                    pending_only=True,
+                    pending_items=[
+                        dict(aamm="2608", nnf=101, chave="1" * 44),
+                        dict(aamm="2608", nnf=102, chave="2" * 44),
+                    ],
+                ),
+                downloads=download,
+                callback_effect=on_callback,
+            )
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(sum(call.args[1] == "file" for call in callbacks), 2)
+
     def test_webshare_pilot_routes_limits_and_deduplicates_direct_addresses(self):
         rows = [
             dict(proxy_address=f"192.0.2.{index}", port=8080, valid=True, username="test", password="test")
