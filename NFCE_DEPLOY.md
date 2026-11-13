@@ -20,7 +20,7 @@ Os arquivos prontos ficam no repositório `C:\Users\Acer\Music\API\api-automacao
 Use apenas um processo do Gunicorn para que criação, polling e download enxerguem a mesma fila em memória. O worker interno já limita a concorrência pesada:
 
 ```text
-gunicorn app:app -k uvicorn.workers.UvicornWorker --workers 1
+gunicorn app:app -k uvicorn.workers.UvicornWorker --workers 1 --timeout 300 --bind 0.0.0.0:$PORT
 ```
 
 Variáveis:

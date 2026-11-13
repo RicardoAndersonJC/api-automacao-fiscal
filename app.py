@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 import warnings
 import zipfile
@@ -77,7 +78,41 @@ ENDPOINT_CONSULTA_PRODUCAO = {
 BASE_DIR = os.path.abspath("./dados")
 os.makedirs(BASE_DIR, exist_ok=True)
 
+def _resume_nfce_queue_after_boot() -> None:
+    """O processo anterior morreu com o lote na memória. Avisa a fila para retomar."""
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    url = os.getenv("SUPABASE_URL", "https://vqhtbyiecsxxprikpnus.supabase.co").rstrip("/")
+    if not key or not url.startswith("https://"):
+        logger.warning("NFC-e: boot sem chave de serviço; a fila órfã espera o prazo normal")
+        return
+    try:
+        response = requests.post(
+            f"{url}/functions/v1/nfce-download",
+            json={"action": "worker_booted"},
+            headers={
+                "Authorization": f"Bearer {key}",
+                "apikey": key,
+                "Content-Type": "application/json",
+            },
+            timeout=20,
+        )
+        logger.info("NFC-e: worker reiniciado, fila avisada (%s)", response.status_code)
+    except requests.RequestException as exc:
+        logger.warning("NFC-e: não avisou a fila no boot (%s)", type(exc).__name__)
+
+
 app = FastAPI()
+
+
+@app.on_event("startup")
+def resume_nfce_after_worker_boot() -> None:
+    threading.Thread(
+        target=_resume_nfce_queue_after_boot,
+        name="nfce-boot",
+        daemon=True,
+    ).start()
+
+
 install_nfse_zip_routes(app)
 install_nfe_danfe_routes(app)
 app.include_router(nfce_download_router)
