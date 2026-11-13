@@ -1985,15 +1985,16 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     if failure_kind in {"rate_limit", "circuit_open"}:
                         paused_for_svrs = True
 
+                completed_count = pending_saved + pending_failed
                 message = (
-                    f"Recuperando pendências: {pending_index}/{pending_total} · "
+                    f"Recuperando pendências: {completed_count}/{pending_total} · "
                     f"{pending_saved} salvas · {pending_failed} falhas"
                 )
                 _update(
                     job,
                     downloaded=pending_saved,
                     message=message,
-                    progress=min(60, 2 + int(pending_index / max(1, pending_total) * 58)),
+                    progress=min(60, 2 + int(completed_count / max(1, pending_total) * 58)),
                 )
                 _callback(
                     job,
@@ -2010,11 +2011,13 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             # Mesmo padrão da descoberta: até N IPs em paralelo; o intervalo de 1 min
             # só aparece ao reutilizar o lote (por lane) ou após contenção da SVRS.
             pending_batch = len(pilot_routes) if use_proxy_batch else 0
+            pending_proxy_unavailable = False
             if pending_batch:
                 routes = [OutboundTransportManager([route], enabled=True) for route in pilot_routes]
                 processed = 0
                 while processed < pending_total and not paused_for_svrs:
                     chunk = pending_queue[processed:processed + pending_batch]
+                    proxy_failures = 0
                     lote_msg = (
                         f"Recuperando lote {processed + 1}-{processed + len(chunk)}/"
                         f"{pending_total} · {len(chunk)} proxy(s) em paralelo"
@@ -2075,6 +2078,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         }
 
                         def on_done(future, futures=futures):
+                            nonlocal proxy_failures
                             offset = futures[future]
                             try:
                                 item, xml, last_download_error, failure_kind = future.result()
@@ -2082,6 +2086,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                                 pending = pending_queue[processed + offset]
                                 item = pending_download_item(pending)
                                 xml, last_download_error, failure_kind = None, str(exc), "timeout"
+                            if not xml and failure_kind == "proxy":
+                                proxy_failures += 1
                             apply_pending_result(
                                 processed + offset + 1,
                                 item,
@@ -2103,13 +2109,13 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
 
                         def on_heartbeat(done_n, total):
                             message = f"Baixando {done_n}/{total} neste lote · um IP por nota · {pending_saved} salvas"
-                            _update(job, message=message, downloaded=saved)
+                            _update(job, message=message, downloaded=pending_saved)
                             _callback(
                                 job,
                                 "progress",
                                 consulted=0,
                                 found=0,
-                                downloaded=saved,
+                                downloaded=pending_saved,
                                 pending_total=pending_total,
                                 pending_failed=pending_failed,
                                 mode="pending_recovery",
@@ -2123,8 +2129,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                             on_heartbeat=on_heartbeat,
                         )
                     finally:
-                        pilot_pool.shutdown(wait=False, cancel_futures=True)
+                        pilot_pool.shutdown(wait=True, cancel_futures=True)
                     processed += len(chunk)
+                    if proxy_failures == len(chunk):
+                        pending_proxy_unavailable = True
+                        break
             else:
                 for pending_index, pending in enumerate(pending_queue, 1):
                     item = pending_download_item(pending)
@@ -2220,7 +2229,16 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 ),
             )
 
-            if (pending_only and not options.get("missing_notes")) or paused_for_svrs:
+            if (pending_only and not options.get("missing_notes")) or paused_for_svrs or pending_proxy_unavailable:
+                if pending_proxy_unavailable:
+                    message = (
+                        f"Recuperação interrompida: todas as saídas de rede do lote falharam. "
+                        f"{pending_saved} XML salvos · {pending_failed} falhas. "
+                        "As notas restantes continuam pendentes."
+                    )
+                    _update(job, status="failed", message=message, error=message, progress=100)
+                    _callback(job, "failed", error=message)
+                    return
                 _update(
                     job,
                     status="completed",
@@ -2459,7 +2477,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         futures, on_done=on_done, on_timeout=on_timeout, on_heartbeat=on_heartbeat,
                     )
                 finally:
-                    pilot_pool.shutdown(wait=False, cancel_futures=True)
+                    pilot_pool.shutdown(wait=True, cancel_futures=True)
                 if (
                     pending_saved == saved_before
                     and saw_transport_failure

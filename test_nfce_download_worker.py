@@ -907,6 +907,39 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.assertFalse(completed["pause_for_svrs"])
         self.assertNotIn("Pausa temporária na SVRS", completed["message"])
 
+    def test_pending_proxy_outage_stops_before_the_next_wave(self):
+        import os
+
+        def download(*args, **kwargs):
+            return args[3], None, "Falha na saída de rede", "proxy"
+
+        collect = worker.collect_parallel_downloads
+
+        def collect_with_heartbeat(futures, **callbacks):
+            callbacks["on_heartbeat"](0, len(futures))
+            collect(futures, **callbacks)
+
+        pending = [
+            dict(aamm="2611", nnf=number, chave=f"{number:044d}")
+            for number in range(101, 105)
+        ]
+        env = {
+            "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+            "NFCE_PROXY_BATCH_SIZE": "2",
+            "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.12:8080",
+        }
+        with patch.dict(os.environ, env), patch.object(worker, "collect_parallel_downloads", side_effect=collect_with_heartbeat):
+            job, callbacks, consults = self.run_worker([], dict(pending_items=pending), downloads=download)
+
+        self.assertEqual(job.status, "failed")
+        self.assertIn("todas as saídas de rede do lote falharam", job.error)
+        self.assertEqual(consults, [])
+        failures = [call.kwargs["number"] for call in callbacks if call.args[1] == "download_failed"]
+        self.assertCountEqual(failures, [101, 102])
+        self.assertTrue(any(call.kwargs.get("message", "").startswith("Baixando 0/2") for call in callbacks))
+        self.assertEqual(callbacks[-1].args[1], "failed")
+
     def test_pending_recovery_saves_xml_before_slow_peer_finishes(self):
         import os
         import threading
