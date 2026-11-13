@@ -2783,8 +2783,8 @@ def _export_progress(
     ))
 
 
-# O teto global do projeto, com spend cap, rejeita arquivo acima de 50 MB.
-EXPORT_PART_LIMIT_BYTES = 45 * 1024 * 1024
+# Um único ZIP por exportação. O teto de 400 GB fica abaixo do máximo de 500 GB do storage.
+EXPORT_PART_LIMIT_BYTES = 400 * 1024 * 1024 * 1024
 
 
 def _split_company_zip(folder: str, source: Path, directory: Path, limit: int) -> list[tuple[str, Path, int]]:
