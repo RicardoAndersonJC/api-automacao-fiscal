@@ -31,7 +31,7 @@ import time
 import unicodedata
 import zipfile
 from collections import deque
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -84,6 +84,7 @@ _jobs: dict[str, "Job"] = {}
 # Jobs de orgs diferentes coexistem; o limitador da SVRS continua compartilhado.
 NFCE_WORKERS = max(1, int(os.getenv("NFCE_WORKERS", "2")))
 _executor = ThreadPoolExecutor(max_workers=NFCE_WORKERS)
+_job_futures: set[Future] = set()
 _export_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nfce-export")
 _export_slots = threading.BoundedSemaphore(MAX_QUEUED_JOBS + 1)
 DOWNLOAD_CONCURRENCY = 1
@@ -481,7 +482,7 @@ class SvrsRateLimiter:
     def _download_tickets(self) -> list:
         return [ticket for queue in self._lane_tickets.values() for ticket in queue]
 
-    def begin_download(self, notify_wait=None, lane: str = "download") -> str:
+    def begin_download(self, notify_wait=None, lane: str = "download", stop_event=None) -> str:
         """Cada IP espera só o próprio intervalo. Outro IP livre não entra na fila dele.
 
         O cooldown do portal continua único: depois do limite, só uma sonda sai.
@@ -492,6 +493,8 @@ class SvrsRateLimiter:
             self._lane_tickets.setdefault(lane, deque()).append(ticket)
         try:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    return "cancelled"
                 with self._download_condition:
                     now = float(self._clock())
                     lane_queue = self._lane_tickets.get(lane) or deque()
@@ -516,12 +519,15 @@ class SvrsRateLimiter:
                     notify_wait()
                     last_notification = float(self._clock())
                 if is_head and delay > 0:
-                    self._sleep(min(delay, 30.0) if notify_wait else delay)
+                    if stop_event is not None:
+                        stop_event.wait(min(delay, 30.0))
+                    else:
+                        self._sleep(min(delay, 30.0) if notify_wait else delay)
                 else:
                     with self._download_condition:
                         lane_queue = self._lane_tickets.get(lane) or deque()
                         if not lane_queue or lane_queue[0] is not ticket:
-                            self._download_condition.wait(timeout=30.0)
+                            self._download_condition.wait(timeout=1.0 if stop_event is not None else 30.0)
         finally:
             with self._download_condition:
                 lane_queue = self._lane_tickets.get(lane)
@@ -564,6 +570,7 @@ def collect_parallel_downloads(
     on_done,
     on_timeout,
     on_heartbeat,
+    stop_event=None,
     deadline_seconds: float = PARALLEL_WAVE_DEADLINE_SECONDS,
     heartbeat_seconds: float = PARALLEL_HEARTBEAT_SECONDS,
     clock=None,
@@ -575,30 +582,37 @@ def collect_parallel_downloads(
     pending = set(futures)
     started = clock()
     last_beat = started
+    total = len(pending)
+
+    def report_if_due(completed: int) -> None:
+        nonlocal last_beat
+        if clock() - last_beat >= heartbeat_seconds:
+            on_heartbeat(completed, total)
+            last_beat = clock()
+
     while pending:
-        now = clock()
         ready = {future for future in pending if future.done()}
         for future in ready:
             pending.discard(future)
             on_done(future)
+            report_if_due(total - len(pending))
         if not pending:
             return
-        remaining = deadline_seconds - (now - started)
+        remaining = deadline_seconds - (clock() - started)
         if remaining <= 0:
+            if stop_event is not None:
+                stop_event.set()
             for future in list(pending):
+                pending.discard(future)
                 on_timeout(future)
+                report_if_due(total - len(pending))
             return
-        if now - last_beat >= heartbeat_seconds:
-            on_heartbeat(len(futures) - len(pending), len(futures))
-            last_beat = clock()
-        done, not_done = wait_fn(
+        report_if_due(total - len(pending))
+        wait_fn(
             pending,
             timeout=min(heartbeat_seconds, remaining),
             return_when=FIRST_COMPLETED,
         )
-        for future in done:
-            on_done(future)
-        pending = set(not_done)
 
 
 def discovery_action(status: str, artificial: str, real_key: str) -> tuple[str, str]:
@@ -1571,6 +1585,7 @@ def _download_one(
     transport: OutboundTransportManager | None = None,
     circuit: TransportCircuitBreaker | None = None,
     lane: str = "download",
+    stop_event: threading.Event | None = None,
 ) -> tuple[dict[str, Any], str | None, str, str]:
     """Até 3 tentativas. Limite do portal entra em cooldown. Página sem XML repete a chave.
 
@@ -1587,6 +1602,8 @@ def _download_one(
         kind = "no_xml"
         message = download_failure_message("no_xml")
         for attempt in range(sefaz_max_retries()):
+            if stop_event is not None and stop_event.is_set():
+                return item, None, download_failure_message("timeout"), "timeout"
             if breaker and not breaker.allow_call():
                 kind = "circuit_open"
                 message = download_failure_message("circuit_open")
@@ -1618,11 +1635,12 @@ def _download_one(
                 if notify:
                     notify(attempt)
             if lane != "download":
-                slot = active.begin_download(notify_wait=notify_wait, lane=lane)
+                slot = active.begin_download(notify_wait=notify_wait, lane=lane, stop_event=stop_event)
             else:
                 slot = active.begin_download(notify_wait=notify_wait) if notify_wait else active.begin_download()
+            if slot == "cancelled" or (stop_event is not None and stop_event.is_set()):
+                return item, None, download_failure_message("timeout"), "timeout"
             if slot == "skip":
-                active.note_remote_limit()
                 kind = "rate_limit"
                 message = download_failure_message("rate_limit")
                 return item, None, message, kind
@@ -1782,6 +1800,13 @@ def _live_jobs_locked() -> list[Job]:
             continue
         live.append(item)
     return live
+
+
+def _submit_job_locked(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, options: dict[str, Any]) -> None:
+    _job_futures.difference_update([future for future in _job_futures if future.done()])
+    job.directory.mkdir(mode=0o700, exist_ok=True)
+    _job_futures.add(_executor.submit(run_job, job, seed_bytes, pfx_bytes, password, options))
+    _jobs[job.id] = job
 
 
 def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, options: dict[str, Any]) -> None:
@@ -2057,6 +2082,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                             message=message,
                         )
 
+                    stop_wave = threading.Event()
                     pilot_pool = ThreadPoolExecutor(max_workers=len(chunk))
                     try:
                         futures = {
@@ -2073,6 +2099,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                                 transport=route,
                                 circuit=circuit,
                                 lane=proxy_lane(route),
+                                stop_event=stop_wave,
                             ): offset
                             for offset, (pending, route) in enumerate(zip(chunk, routes))
                         }
@@ -2127,8 +2154,10 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                             on_done=on_done,
                             on_timeout=on_timeout,
                             on_heartbeat=on_heartbeat,
+                            stop_event=stop_wave,
                         )
                     finally:
+                        stop_wave.set()
                         pilot_pool.shutdown(wait=True, cancel_futures=True)
                     processed += len(chunk)
                     if proxy_failures == len(chunk):
@@ -2434,6 +2463,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             routes = [OutboundTransportManager([route], enabled=True) for route in pilot_routes]
             for offset in range(0, len(candidates), len(routes)):
                 batch = candidates[offset:offset + len(routes)]
+                stop_wave = threading.Event()
                 pilot_pool = ThreadPoolExecutor(max_workers=len(batch))
                 try:
                     futures = {
@@ -2443,6 +2473,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                             run_id=job.external_run_id or "", empresa_id=job.empresa_id,
                             transport=route, circuit=circuit,
                             lane=proxy_lane(route),
+                            stop_event=stop_wave,
                         ): item
                         for item, route in zip(batch, routes)
                     }
@@ -2475,8 +2506,10 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
 
                     collect_parallel_downloads(
                         futures, on_done=on_done, on_timeout=on_timeout, on_heartbeat=on_heartbeat,
+                        stop_event=stop_wave,
                     )
                 finally:
+                    stop_wave.set()
                     pilot_pool.shutdown(wait=True, cancel_futures=True)
                 if (
                     pending_saved == saved_before
@@ -3387,7 +3420,6 @@ async def create_internal_job(
         raise HTTPException(status_code=400, detail="Certificado ausente ou maior que o limite.")
     job_id = secrets.token_urlsafe(24)
     directory = WORK_ROOT / job_id
-    directory.mkdir(mode=0o700)
     empresa = empresa_id.strip()
     if empresa and not re.fullmatch(r"[0-9a-fA-F-]{36}", empresa):
         empresa = ""
@@ -3396,13 +3428,6 @@ async def create_internal_job(
         callback_token=run_token, external_run_id=run_id, empresa_id=empresa,
         organizacao_id=org,
     )
-    with _jobs_lock:
-        active_now = [item for item in _jobs.values() if item.status in {"queued", "running"}]
-        if org and any(item.organizacao_id == org for item in active_now):
-            raise HTTPException(status_code=429, detail=WORKER_BUSY_DETAIL)
-        if len(active_now) >= MAX_QUEUED_JOBS:
-            raise HTTPException(status_code=429, detail=WORKER_BUSY_DETAIL)
-        _jobs[job_id] = job
     if not (0 <= intervalo_download_segundos <= 300):
         raise HTTPException(status_code=400, detail="Intervalo de download inválido.")
     pending_only = str(somente_pendentes or "").strip().lower() in {"1", "true", "yes", "sim"}
@@ -3418,7 +3443,16 @@ async def create_internal_job(
         "pending_items": normalized_pending,
         "missing_notes": normalized_missing,
     }
-    _executor.submit(run_job, job, seed_bytes, pfx_bytes, senha, options)
+    with _jobs_lock:
+        active_now = _live_jobs_locked()
+        occupied = sum(not future.done() for future in _job_futures)
+        if (
+            (org and any(item.organizacao_id == org for item in active_now))
+            or len(active_now) >= MAX_QUEUED_JOBS
+            or occupied >= NFCE_WORKERS
+        ):
+            raise HTTPException(status_code=429, detail=WORKER_BUSY_DETAIL)
+        _submit_job_locked(job, seed_bytes, pfx_bytes, senha, options)
     return job.public()
 
 
@@ -3474,10 +3508,7 @@ async def create_job(
         raise HTTPException(status_code=400, detail="Certificado ausente ou maior que o limite.")
     job_id = secrets.token_urlsafe(24)
     directory = WORK_ROOT / job_id
-    directory.mkdir(mode=0o700)
     job = Job(id=job_id, owner_id=owner_id, directory=directory)
-    with _jobs_lock:
-        _jobs[job_id] = job
     options = {
         "month_trigger": gatilho_mes,
         "month_window": janela_mes,
@@ -3486,7 +3517,8 @@ async def create_job(
         "query_interval_ms": intervalo_consulta_ms,
         "download_interval_seconds": clamp_download_interval(intervalo_download_segundos),
     }
-    _executor.submit(run_job, job, seed_bytes, pfx_bytes, senha, options)
+    with _jobs_lock:
+        _submit_job_locked(job, seed_bytes, pfx_bytes, senha, options)
     return job.public()
 
 

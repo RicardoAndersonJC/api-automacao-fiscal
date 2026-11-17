@@ -1246,12 +1246,14 @@ class DownloadFifoTests(unittest.TestCase):
 
     def test_parallel_wave_keeps_finished_ip_when_another_stalls(self):
         import concurrent.futures
+        import threading
 
         done = concurrent.futures.Future()
         done.set_result("xml")
         stuck = concurrent.futures.Future()
         now = [0.0]
         seen = []
+        stop_wave = threading.Event()
 
         def clock():
             return now[0]
@@ -1261,14 +1263,41 @@ class DownloadFifoTests(unittest.TestCase):
             finished = {future for future in pending if future.done()}
             return finished, pending - finished
 
+        def on_timeout(future):
+            self.assertTrue(stop_wave.is_set())
+            seen.append("timeout")
+
         worker.collect_parallel_downloads(
             {done: 1, stuck: 2},
             on_done=lambda future: seen.append(future.result()),
-            on_timeout=lambda future: seen.append("timeout"),
+            on_timeout=on_timeout,
             on_heartbeat=lambda done_n, total: None,
+            stop_event=stop_wave,
             deadline_seconds=30,
             heartbeat_seconds=20,
             clock=clock,
             wait_fn=fake_wait,
         )
         self.assertEqual(seen, ["xml", "timeout"])
+
+    def test_parallel_wave_sends_heartbeat_while_persisting_ready_results(self):
+        from concurrent.futures import Future
+
+        futures = {Future(): index for index in range(3)}
+        for future in futures:
+            future.set_result("xml")
+        now = [0.0]
+        heartbeats = []
+
+        def persist(future):
+            now[0] += 15
+
+        worker.collect_parallel_downloads(
+            futures,
+            on_done=persist,
+            on_timeout=lambda future: self.fail("finished download timed out"),
+            on_heartbeat=lambda completed, total: heartbeats.append((completed, total)),
+            clock=lambda: now[0],
+        )
+
+        self.assertEqual(heartbeats, [(2, 3)])
