@@ -31,10 +31,12 @@ class RemoteResponseLoggingTests(unittest.TestCase):
                 limiter.note_remote_limit()
         limiter = worker.SvrsRateLimiter(download_seconds=90, cooldown_seconds=60,
                                         clock=lambda: now[0], sleep=sleep)
-        self.assertEqual(limiter.begin_download(), "call")
-        self.assertEqual(limiter.begin_download(), "call")
+        self.assertEqual(limiter.begin_download(), ("call", None))
+        decision, probe = limiter.begin_download()
+        self.assertEqual(decision, "call")
+        self.assertIsNotNone(probe)
         self.assertEqual(now[0], 150)
-        self.assertEqual(limiter.begin_download(), "skip")
+        self.assertEqual(limiter.begin_download(), ("skip", None))
 
     def test_retry_cannot_shorten_shared_download_interval(self):
         now = [0.0]
@@ -412,14 +414,16 @@ class NfceWorkerTest(unittest.TestCase):
         limiter.note_remote_limit()
         self.assertEqual(limiter.download_state(), "cooldown")
         self.assertFalse(limiter.download_admission())
-        self.assertEqual(limiter.begin_download(), "call")
+        decision, probe = limiter.begin_download()
+        self.assertEqual(decision, "call")
+        self.assertIsNotNone(probe)
         self.assertGreaterEqual(now[0], 60)
         self.assertEqual(limiter.download_state(), "half_open")
-        self.assertEqual(limiter.begin_download(), "skip")
-        limiter.note_download_ok()
+        self.assertEqual(limiter.begin_download(), ("skip", None))
+        limiter.finish_download_probe(probe, succeeded=True)
         self.assertEqual(limiter.download_state(), "available")
         recovered_at = now[0]
-        self.assertEqual(limiter.begin_download(), "call")
+        self.assertEqual(limiter.begin_download(), ("call", None))
         self.assertGreaterEqual(now[0] - recovered_at, 60)
         limiter.note_remote_limit()
         now[0] += 60
@@ -1180,7 +1184,7 @@ class DownloadFifoTests(unittest.TestCase):
                     raise RuntimeError("test did not release head")
             now[0] += seconds
         limiter = worker.SvrsRateLimiter(download_seconds=60, clock=lambda: now[0], sleep=sleep)
-        self.assertEqual(limiter.begin_download(), "call")
+        self.assertEqual(limiter.begin_download(), ("call", None))
         def repeat():
             limiter.begin_download()
             order.append("first")
@@ -1213,7 +1217,7 @@ class DownloadFifoTests(unittest.TestCase):
             self.assertTrue(limiter._lock.acquire(blocking=False))
             limiter._lock.release()
             notifications.append(now[0])
-        self.assertEqual(limiter.begin_download(notify_wait=heartbeat), "call")
+        self.assertEqual(limiter.begin_download(notify_wait=heartbeat), ("call", None))
         self.assertEqual(now[0], 90)
         self.assertEqual(notifications, [0, 30, 60])
         self.assertEqual(limiter._next["download"], 180)
@@ -1228,7 +1232,7 @@ class DownloadFifoTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             limiter.begin_download(notify_wait=fail)
         self.assertFalse(limiter._download_tickets)
-        self.assertEqual(limiter.begin_download(), "call")
+        self.assertEqual(limiter.begin_download(), ("call", None))
         self.assertEqual(now[0], 60)
 
     def test_free_ip_does_not_wait_behind_another_ip(self):
@@ -1238,11 +1242,134 @@ class DownloadFifoTests(unittest.TestCase):
             clock=lambda: now[0],
             sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
         )
-        self.assertEqual(limiter.begin_download(lane="proxy-ip:192.0.2.1"), "call")
-        self.assertEqual(limiter.begin_download(lane="proxy-ip:192.0.2.2"), "call")
+        self.assertEqual(limiter.begin_download(lane="proxy-ip:192.0.2.1"), ("call", None))
+        self.assertEqual(limiter.begin_download(lane="proxy-ip:192.0.2.2"), ("call", None))
         self.assertEqual(now[0], 0)
-        self.assertEqual(limiter.begin_download(lane="proxy-ip:192.0.2.1"), "call")
+        self.assertEqual(limiter.begin_download(lane="proxy-ip:192.0.2.1"), ("call", None))
         self.assertEqual(now[0], 60)
+
+    def test_probe_respects_and_reserves_the_same_ip_interval(self):
+        now = [0.0]
+        limiter = worker.SvrsRateLimiter(
+            download_seconds=90,
+            cooldown_seconds=60,
+            clock=lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        lane = "proxy-ip:192.0.2.1"
+        self.assertEqual(limiter.begin_download(lane=lane), ("call", None))
+        limiter.note_remote_limit()
+        attempts_at = []
+
+        def download(*args):
+            attempts_at.append(now[0])
+            return "<nfeProc/>", "ok", "", 200
+
+        with patch.object(worker, "_download", side_effect=download), requests.Session() as session:
+            worker._download_one(None, None, "", {"chave_real": "0" * 44}, limiter, session=session, lane=lane)
+            worker._download_one(None, None, "", {"chave_real": "1" * 44}, limiter, session=session, lane=lane)
+
+        self.assertEqual(attempts_at, [90, 180])
+
+    def test_inconclusive_probe_allows_another_probe_after_cooldown(self):
+        now = [0.0]
+        limiter = worker.SvrsRateLimiter(
+            download_seconds=60,
+            cooldown_seconds=60,
+            clock=lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        limiter.note_remote_limit()
+        attempts_at = []
+
+        def download(*args):
+            attempts_at.append(now[0])
+            if len(attempts_at) == 1:
+                raise requests.Timeout()
+            return "<nfeProc/>", "ok", "", 200
+
+        with (
+            patch.object(worker, "sefaz_max_retries", return_value=1),
+            patch.object(worker, "_download", side_effect=download),
+            requests.Session() as session,
+        ):
+            first = worker._download_one(None, None, "", {"chave_real": "0" * 44}, limiter, session=session)
+            second = worker._download_one(None, None, "", {"chave_real": "1" * 44}, limiter, session=session)
+
+        self.assertEqual(first[3], "timeout")
+        self.assertEqual(second[3], "ok")
+        self.assertEqual(attempts_at, [60, 120])
+
+    def test_stale_probe_and_non_probe_responses_cannot_release_the_current_probe(self):
+        now = [0.0]
+        limiter = worker.SvrsRateLimiter(
+            download_seconds=60,
+            cooldown_seconds=60,
+            clock=lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        _, normal_request = limiter.begin_download(lane="proxy-ip:192.0.2.1")
+        limiter.note_remote_limit()
+        _, stale_probe = limiter.begin_download(lane="proxy-ip:192.0.2.2")
+        limiter.note_remote_limit()
+        _, current_probe = limiter.begin_download(lane="proxy-ip:192.0.2.3")
+
+        self.assertIsNotNone(stale_probe)
+        self.assertIsNotNone(current_probe)
+        limiter.finish_download_probe(normal_request, succeeded=True)
+        limiter.finish_download_probe(stale_probe, succeeded=True)
+        self.assertEqual(limiter.download_state(), "half_open")
+        self.assertEqual(limiter.begin_download(lane="proxy-ip:192.0.2.4"), ("skip", None))
+        limiter.finish_download_probe(current_probe, succeeded=True)
+        self.assertEqual(limiter.download_state(), "available")
+
+    def test_local_probe_skip_is_separate_from_portal_rate_limit(self):
+        now = [0.0]
+        limiter = worker.SvrsRateLimiter(
+            download_seconds=60,
+            cooldown_seconds=60,
+            clock=lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        limiter.note_remote_limit()
+        _, probe = limiter.begin_download(lane="proxy-ip:192.0.2.1")
+        with patch.object(worker, "_download") as download, requests.Session() as session:
+            result = worker._download_one(
+                None, None, "", {"chave_real": "0" * 44}, limiter,
+                session=session, lane="proxy-ip:192.0.2.2",
+            )
+
+        download.assert_not_called()
+        self.assertEqual(result[3], "circuit_open")
+        self.assertEqual(limiter.download_state(), "half_open")
+        limiter.finish_download_probe(probe, succeeded=True)
+        self.assertEqual(limiter.download_state(), "available")
+
+    def test_transport_error_with_429_in_message_is_not_a_rate_limit(self):
+        limiter = worker.SvrsRateLimiter(download_seconds=60)
+        with (
+            patch.object(worker, "sefaz_max_retries", return_value=1),
+            patch.object(worker, "_download", side_effect=requests.ConnectionError("request key ends in 429")),
+            requests.Session() as session,
+        ):
+            result = worker._download_one(None, None, "", {"chave_real": "0" * 44}, limiter, session=session)
+
+        self.assertEqual(result[3], "http")
+        self.assertEqual(limiter.download_state(), "available")
+
+    def test_structured_http_429_triggers_cooldown(self):
+        limiter = worker.SvrsRateLimiter(download_seconds=60)
+        response = requests.Response()
+        response.status_code = 429
+        with (
+            patch.object(worker, "_download", side_effect=requests.HTTPError("portal refused", response=response)),
+            patch.object(worker, "sefaz_max_retries", return_value=1),
+            requests.Session() as session,
+        ):
+            result = worker._download_one(None, None, "", {"chave_real": "0" * 44}, limiter, session=session)
+
+        self.assertEqual(result[3], "rate_limit")
+        self.assertEqual(limiter.download_state(), "cooldown")
 
     def test_parallel_wave_keeps_finished_ip_when_another_stalls(self):
         import concurrent.futures

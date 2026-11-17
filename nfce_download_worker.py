@@ -439,7 +439,7 @@ class SvrsRateLimiter:
         self._next = {"soap": 0.0, "download": 0.0}
         self._download_state = "available"
         self._cooldown_until = 0.0
-        self._probe_issued = False
+        self._probe: object | None = None
 
     def download_state(self) -> str:
         with self._lock:
@@ -453,36 +453,42 @@ class SvrsRateLimiter:
             self._roll_download_state_locked(now)
             if self._download_state == "cooldown":
                 return False
-            if self._download_state == "half_open" and self._probe_issued:
+            if self._download_state == "half_open" and self._probe is not None:
                 return False
             return True
 
     def _roll_download_state_locked(self, now: float) -> None:
         if self._download_state == "cooldown" and now >= self._cooldown_until:
             self._download_state = "half_open"
-            self._probe_issued = False
+
+    def _enter_cooldown_locked(self, now: float) -> None:
+        self._download_state = "cooldown"
+        self._cooldown_until = now + self.cooldown_seconds
+        self._probe = None
 
     def note_remote_limit(self) -> None:
         with self._lock:
-            now = float(self._clock())
-            self._download_state = "cooldown"
-            self._cooldown_until = now + self.cooldown_seconds
-            self._probe_issued = False
-            self._next["download"] = self._cooldown_until
+            self._enter_cooldown_locked(float(self._clock()))
 
-    def note_download_ok(self) -> None:
+    def finish_download_probe(self, probe: object | None, *, succeeded: bool) -> None:
+        if probe is None:
+            return
         with self._lock:
-            if self._download_state == "half_open":
+            if probe is not self._probe:
+                return
+            if succeeded:
                 self._download_state = "available"
-                self._probe_issued = False
-                now = float(self._clock())
-                self._next["download"] = now + self.download_seconds
+                self._probe = None
+            else:
+                self._enter_cooldown_locked(float(self._clock()))
 
     @property
     def _download_tickets(self) -> list:
         return [ticket for queue in self._lane_tickets.values() for ticket in queue]
 
-    def begin_download(self, notify_wait=None, lane: str = "download", stop_event=None) -> str:
+    def begin_download(
+        self, notify_wait=None, lane: str = "download", stop_event=None,
+    ) -> tuple[str, object | None]:
         """Cada IP espera só o próprio intervalo. Outro IP livre não entra na fila dele.
 
         O cooldown do portal continua único: depois do limite, só uma sonda sai.
@@ -494,7 +500,7 @@ class SvrsRateLimiter:
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
-                    return "cancelled"
+                    return "cancelled", None
                 with self._download_condition:
                     now = float(self._clock())
                     lane_queue = self._lane_tickets.get(lane) or deque()
@@ -504,16 +510,15 @@ class SvrsRateLimiter:
                         self._roll_download_state_locked(now)
                         if self._download_state == "cooldown":
                             delay = max(0.0, self._cooldown_until - now)
-                        elif self._download_state == "half_open":
-                            if self._probe_issued:
-                                return "skip"
-                            self._probe_issued = True
-                            return "call"
+                        elif self._probe is not None:
+                            return "skip", None
                         else:
                             delay = max(0.0, self._next.get(lane, 0.0) - now)
                             if delay == 0:
                                 self._next[lane] = now + self.download_seconds
-                                return "call"
+                                if self._download_state == "half_open":
+                                    self._probe = object()
+                                return "call", self._probe
                 # Heartbeat e sono ficam fora do lock. Outro IP não entra nesta fila.
                 if notify_wait and now - last_notification >= 30.0:
                     notify_wait()
@@ -538,17 +543,13 @@ class SvrsRateLimiter:
                 self._download_condition.notify_all()
 
     def wait(self, channel: str) -> float:
-        if channel == "download" and self.download_state() == "cooldown":
-            decision = self.begin_download()
-            if decision == "skip":
-                return 0.0
-            return 0.0
         spacing = self.soap_seconds if channel == "soap" else self.download_seconds
         with self._lock:
             now = float(self._clock())
-            delay = self._next.get(channel, 0.0) - now
-            if delay < 0:
-                delay = 0.0
+            earliest = self._next.get(channel, 0.0)
+            if channel == "download":
+                earliest = max(earliest, self._cooldown_until)
+            delay = max(0.0, earliest - now)
             self._next[channel] = now + delay + spacing
         if delay > 0:
             self._sleep(delay)
@@ -1634,23 +1635,19 @@ def _download_one(
                 active.arm_same_key_retry(delay, lane=lane)
                 if notify:
                     notify(attempt)
-            if lane != "download":
-                slot = active.begin_download(notify_wait=notify_wait, lane=lane, stop_event=stop_event)
-            else:
-                slot = active.begin_download(notify_wait=notify_wait) if notify_wait else active.begin_download()
-            if slot == "cancelled" or (stop_event is not None and stop_event.is_set()):
-                return item, None, download_failure_message("timeout"), "timeout"
+            slot, probe = active.begin_download(notify_wait=notify_wait, lane=lane, stop_event=stop_event)
             if slot == "skip":
-                kind = "rate_limit"
-                message = download_failure_message("rate_limit")
-                return item, None, message, kind
-            if notify and attempt == 0:
-                notify(attempt)
+                return item, None, "Sonda do portal da SVRS em andamento. A chave continua na fila.", "circuit_open"
             started = time.perf_counter()
             http_status: int | None = None
             error_type = ""
             failover = False
+            probe_succeeded = False
             try:
+                if slot == "cancelled" or (stop_event is not None and stop_event.is_set()):
+                    return item, None, download_failure_message("timeout"), "timeout"
+                if notify and attempt == 0:
+                    notify(attempt)
                 xml, kind, message, http_status = _download(active_session, item["chave_real"], {
                     "run_id": run_id, "empresa_id": empresa_id,
                     "aamm": str(item.get("AAMM") or ""), "nnf": item.get("nNF"),
@@ -1659,6 +1656,7 @@ def _download_one(
                 })
                 if xml:
                     kind = "ok"
+                    probe_succeeded = True
             except requests.Timeout as exc:
                 error_type = type(exc).__name__
                 xml, kind, message = None, "timeout", download_failure_message("timeout")
@@ -1675,17 +1673,18 @@ def _download_one(
                     breaker.note_transport_failure()
             except requests.RequestException as exc:
                 error_type = type(exc).__name__
-                text = str(exc)
-                if "429" in text:
+                http_status = exc.response.status_code if exc.response is not None else None
+                if http_status == 429:
                     xml, kind, message = None, "rate_limit", download_failure_message("rate_limit")
                 else:
                     xml, kind, message = None, "http", download_failure_message("http")
-                    if breaker:
+                    if breaker and (http_status is None or http_status < 500):
                         breaker.note_transport_failure()
+            finally:
+                active.finish_download_probe(probe, succeeded=probe_succeeded)
             if kind == "ok":
                 if breaker:
                     breaker.note_success()
-                active.note_download_ok()
                 if transport:
                     transport.note_success()
             elif kind == "rate_limit":

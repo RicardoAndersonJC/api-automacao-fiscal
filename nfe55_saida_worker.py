@@ -321,19 +321,22 @@ def _baixar_na_faixa(
     avisar_espera: Any = None,
 ) -> tuple[str, str]:
     faixa = _faixa_proxy(transporte)
-    slot = limitador.begin_download(notify_wait=avisar_espera, lane=faixa)
+    slot, sonda = limitador.begin_download(notify_wait=avisar_espera, lane=faixa)
     if slot == "skip":
         return "", "limite"
+    sucesso = False
     try:
         xml = _baixar(cert_path, key_path, chave, transporte)
+        sucesso = bool(xml)
+        return xml, ""
     except requests.HTTPError as exc:
         if _categoria_download(exc) == "limite":
             limitador.note_remote_limit()
         return "", _categoria_download(exc)
     except (requests.RequestException, RuntimeError) as exc:
         return "", _categoria_download(exc)
-    limitador.note_download_ok()
-    return xml, ""
+    finally:
+        limitador.finish_download_probe(sonda, succeeded=sucesso)
 
 
 def _descarregar_lote(
