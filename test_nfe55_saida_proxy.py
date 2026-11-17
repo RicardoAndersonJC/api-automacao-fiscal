@@ -123,7 +123,7 @@ class ProxySaidaTest(unittest.TestCase):
             def finish_download_probe(self, probe, *, succeeded):
                 return None
 
-            def note_remote_limit(self):
+            def note_remote_limit(self, lane="download"):
                 raise AssertionError("sucesso não pode marcar limite")
 
         with patch.object(worker, "_baixar", side_effect=baixar), patch.object(worker, "_limitador", return_value=Limitador()):
@@ -180,7 +180,7 @@ class ProxySaidaTest(unittest.TestCase):
                 if succeeded:
                     raise AssertionError("429 não é sucesso")
 
-            def note_remote_limit(self):
+            def note_remote_limit(self, lane="download"):
                 self.limite += 1
 
         limitador = Limitador()

@@ -410,10 +410,20 @@ def handle_discovered_key(
     return "download"
 
 
+class _DownloadProbe:
+    """Sonda half_open de um IP. Só ela libera ou devolve o IP ao cooldown."""
+
+    __slots__ = ("lane",)
+
+    def __init__(self, lane: str) -> None:
+        self.lane = lane
+
+
 class SvrsRateLimiter:
     """Relógio único do processo. SOAP e download não dividem o mesmo espaçamento.
 
-    O canal de download tem available, cooldown e half_open.
+    Cada IP (lane) do download tem available, cooldown e half_open próprios.
+    Um "bloqueado" da SVRS num IP não congela os outros IPs do lote.
     O teste injeta clock e sleep. Produção usa time.monotonic e time.sleep.
     Vários processos Render exigiriam coordenação no banco. Hoje há um processo.
     """
@@ -437,50 +447,53 @@ class SvrsRateLimiter:
         self._download_condition = threading.Condition(self._lock)
         self._lane_tickets: dict[str, deque] = {}
         self._next = {"soap": 0.0, "download": 0.0}
-        self._download_state = "available"
-        self._cooldown_until = 0.0
-        self._probe: object | None = None
+        self._lane_state: dict[str, str] = {}
+        self._lane_cooldown_until: dict[str, float] = {}
+        self._lane_probe: dict[str, _DownloadProbe] = {}
 
-    def download_state(self) -> str:
+    def download_state(self, lane: str = "download") -> str:
         with self._lock:
-            self._roll_download_state_locked(float(self._clock()))
-            return self._download_state
+            return self._roll_download_state_locked(lane, float(self._clock()))
 
-    def download_admission(self) -> bool:
-        """False enquanto o cooldown não venceu ou a sonda half_open já saiu."""
+    def download_admission(self, lane: str = "download") -> bool:
+        """False enquanto o cooldown do IP não venceu ou a sonda half_open dele já saiu."""
         with self._lock:
-            now = float(self._clock())
-            self._roll_download_state_locked(now)
-            if self._download_state == "cooldown":
+            state = self._roll_download_state_locked(lane, float(self._clock()))
+            if state == "cooldown":
                 return False
-            if self._download_state == "half_open" and self._probe is not None:
+            if state == "half_open" and lane in self._lane_probe:
                 return False
             return True
 
-    def _roll_download_state_locked(self, now: float) -> None:
-        if self._download_state == "cooldown" and now >= self._cooldown_until:
-            self._download_state = "half_open"
+    def _roll_download_state_locked(self, lane: str, now: float) -> str:
+        state = self._lane_state.get(lane, "available")
+        if state == "cooldown" and now >= self._lane_cooldown_until.get(lane, 0.0):
+            state = "half_open"
+            self._lane_state[lane] = state
+        return state
 
-    def _enter_cooldown_locked(self, now: float) -> None:
-        self._download_state = "cooldown"
-        self._cooldown_until = now + self.cooldown_seconds
-        self._probe = None
+    def _enter_cooldown_locked(self, lane: str, now: float) -> None:
+        self._lane_state[lane] = "cooldown"
+        self._lane_cooldown_until[lane] = now + self.cooldown_seconds
+        self._lane_probe.pop(lane, None)
+        self._download_condition.notify_all()
 
-    def note_remote_limit(self) -> None:
+    def note_remote_limit(self, lane: str = "download") -> None:
         with self._lock:
-            self._enter_cooldown_locked(float(self._clock()))
+            self._enter_cooldown_locked(lane, float(self._clock()))
 
     def finish_download_probe(self, probe: object | None, *, succeeded: bool) -> None:
-        if probe is None:
+        if not isinstance(probe, _DownloadProbe):
             return
         with self._lock:
-            if probe is not self._probe:
+            if self._lane_probe.get(probe.lane) is not probe:
                 return
             if succeeded:
-                self._download_state = "available"
-                self._probe = None
+                self._lane_state[probe.lane] = "available"
+                self._lane_probe.pop(probe.lane, None)
+                self._download_condition.notify_all()
             else:
-                self._enter_cooldown_locked(float(self._clock()))
+                self._enter_cooldown_locked(probe.lane, float(self._clock()))
 
     @property
     def _download_tickets(self) -> list:
@@ -489,9 +502,10 @@ class SvrsRateLimiter:
     def begin_download(
         self, notify_wait=None, lane: str = "download", stop_event=None,
     ) -> tuple[str, object | None]:
-        """Cada IP espera só o próprio intervalo. Outro IP livre não entra na fila dele.
+        """Cada IP espera só o próprio intervalo e o próprio cooldown.
 
-        O cooldown do portal continua único: depois do limite, só uma sonda sai.
+        Depois de um limite naquele IP, só uma sonda sai por ele; a próxima chave
+        do mesmo IP espera o resultado da sonda em vez de virar falha local.
         """
         ticket = object()
         last_notification = float(self._clock()) - 30.0
@@ -501,24 +515,27 @@ class SvrsRateLimiter:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return "cancelled", None
+                probe_pending = False
                 with self._download_condition:
                     now = float(self._clock())
                     lane_queue = self._lane_tickets.get(lane) or deque()
                     is_head = bool(lane_queue) and lane_queue[0] is ticket
                     delay = 0.0
                     if is_head:
-                        self._roll_download_state_locked(now)
-                        if self._download_state == "cooldown":
-                            delay = max(0.0, self._cooldown_until - now)
-                        elif self._probe is not None:
-                            return "skip", None
+                        state = self._roll_download_state_locked(lane, now)
+                        if state == "cooldown":
+                            delay = max(0.0, self._lane_cooldown_until.get(lane, 0.0) - now)
+                        elif lane in self._lane_probe:
+                            probe_pending = True
                         else:
                             delay = max(0.0, self._next.get(lane, 0.0) - now)
                             if delay == 0:
                                 self._next[lane] = now + self.download_seconds
-                                if self._download_state == "half_open":
-                                    self._probe = object()
-                                return "call", self._probe
+                                probe = None
+                                if state == "half_open":
+                                    probe = _DownloadProbe(lane)
+                                    self._lane_probe[lane] = probe
+                                return "call", probe
                 # Heartbeat e sono ficam fora do lock. Outro IP não entra nesta fila.
                 if notify_wait and now - last_notification >= 30.0:
                     notify_wait()
@@ -531,7 +548,7 @@ class SvrsRateLimiter:
                 else:
                     with self._download_condition:
                         lane_queue = self._lane_tickets.get(lane) or deque()
-                        if not lane_queue or lane_queue[0] is not ticket:
+                        if probe_pending or not lane_queue or lane_queue[0] is not ticket:
                             self._download_condition.wait(timeout=1.0 if stop_event is not None else 30.0)
         finally:
             with self._download_condition:
@@ -548,7 +565,7 @@ class SvrsRateLimiter:
             now = float(self._clock())
             earliest = self._next.get(channel, 0.0)
             if channel == "download":
-                earliest = max(earliest, self._cooldown_until)
+                earliest = max(earliest, self._lane_cooldown_until.get(channel, 0.0))
             delay = max(0.0, earliest - now)
             self._next[channel] = now + delay + spacing
         if delay > 0:
@@ -560,8 +577,8 @@ class SvrsRateLimiter:
         with self._lock:
             now = float(self._clock())
             target = now + max(0.0, float(seconds))
-            if self._download_state == "cooldown":
-                target = max(target, self._cooldown_until)
+            if self._roll_download_state_locked(lane, now) == "cooldown":
+                target = max(target, self._lane_cooldown_until.get(lane, 0.0))
             self._next[lane] = max(self._next.get(lane, 0.0), target)
 
 
@@ -1688,7 +1705,7 @@ def _download_one(
                 if transport:
                     transport.note_success()
             elif kind == "rate_limit":
-                active.note_remote_limit()
+                active.note_remote_limit(lane)
                 if transport:
                     transport.note_remote_limit()
             elif kind == "http" and breaker and http_status is not None and http_status >= 500:
@@ -1715,7 +1732,7 @@ def _download_one(
                 ),
                 proxima_tentativa=proxima,
                 backoff=str(transient_backoff_seconds(attempt, 0)) if failure_policy(kind) == "backoff" else "",
-                cooldown=active.download_state() if kind == "rate_limit" else "",
+                cooldown=active.download_state(lane) if kind == "rate_limit" else "",
                 circuit_state=breaker.state if breaker else "",
                 proxy_enabled=bool(transport and transport.enabled),
                 outbound_id=route.outbound_id if route else "direct",
@@ -1965,7 +1982,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     "_download_interval_seconds": interval_seconds,
                 }
 
-            def apply_pending_result(pending_index, item, xml, last_download_error, failure_kind):
+            def apply_pending_result(
+                pending_index, item, xml, last_download_error, failure_kind, pause_on_limit=True,
+            ):
                 nonlocal pending_saved, pending_failed, paused_for_svrs
                 if xml:
                     full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
@@ -2006,7 +2025,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         item_index=pending_index,
                         mode="pending_recovery",
                     )
-                    if failure_kind in {"rate_limit", "circuit_open"}:
+                    # No lote por IP, o limite de um IP não pausa os outros; a onda decide.
+                    if pause_on_limit and failure_kind in {"rate_limit", "circuit_open"}:
                         paused_for_svrs = True
 
                 completed_count = pending_saved + pending_failed
@@ -2042,6 +2062,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 while processed < pending_total and not paused_for_svrs:
                     chunk = pending_queue[processed:processed + pending_batch]
                     proxy_failures = 0
+                    limited_in_wave = 0
                     lote_msg = (
                         f"Recuperando lote {processed + 1}-{processed + len(chunk)}/"
                         f"{pending_total} · {len(chunk)} proxy(s) em paralelo"
@@ -2104,7 +2125,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         }
 
                         def on_done(future, futures=futures):
-                            nonlocal proxy_failures
+                            nonlocal proxy_failures, limited_in_wave
                             offset = futures[future]
                             try:
                                 item, xml, last_download_error, failure_kind = future.result()
@@ -2114,12 +2135,15 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                                 xml, last_download_error, failure_kind = None, str(exc), "timeout"
                             if not xml and failure_kind == "proxy":
                                 proxy_failures += 1
+                            if not xml and failure_kind in {"rate_limit", "circuit_open"}:
+                                limited_in_wave += 1
                             apply_pending_result(
                                 processed + offset + 1,
                                 item,
                                 xml,
                                 last_download_error,
                                 failure_kind,
+                                pause_on_limit=False,
                             )
 
                         def on_timeout(future, futures=futures):
@@ -2131,6 +2155,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                                 None,
                                 download_failure_message("timeout"),
                                 "timeout",
+                                pause_on_limit=False,
                             )
 
                         def on_heartbeat(done_n, total):
@@ -2162,6 +2187,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     if proxy_failures == len(chunk):
                         pending_proxy_unavailable = True
                         break
+                    # Só pausa quando a SVRS barrou todos os IPs da onda.
+                    if limited_in_wave == len(chunk):
+                        paused_for_svrs = True
             else:
                 for pending_index, pending in enumerate(pending_queue, 1):
                     item = pending_download_item(pending)
@@ -2356,7 +2384,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
 
         halt_reason: str | None = None
 
-        def download_found(aamm: str, n_nf: int, found_key: str, *, result=None) -> None:
+        def download_found(
+            aamm: str, n_nf: int, found_key: str, *, result=None, pause_on_limit: bool = True,
+        ) -> None:
             """Baixa toda chave encontrada; só pausa se a SVRS pedir contenção."""
             nonlocal halt_reason, pending_saved, pending_failed, paused_for_svrs
 
@@ -2423,7 +2453,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     found=len(found),
                     mode="discovery",
                 )
-                if kind in {"rate_limit", "circuit_open"}:
+                if pause_on_limit and kind in {"rate_limit", "circuit_open"}:
                     paused_for_svrs = True
                     return "pause"
                 return "failed"
@@ -2439,7 +2469,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         discovery_queue: dict[str, dict[str, Any]] = {}
 
         def flush_discovered() -> None:
-            nonlocal halt_reason
+            nonlocal halt_reason, paused_for_svrs
             candidates = list(discovery_queue.values())
             discovery_queue.clear()
             if not candidates:
@@ -2447,13 +2477,16 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             saved_before = pending_saved
             saw_transport_failure = False
             saw_other_failure = False
+            limited_in_wave = 0
 
             def note_batch_result(result: tuple) -> None:
-                nonlocal saw_transport_failure, saw_other_failure
+                nonlocal saw_transport_failure, saw_other_failure, limited_in_wave
                 xml = result[1] if len(result) > 1 else None
                 kind = result[3] if len(result) > 3 else "timeout"
                 if xml:
                     return
+                if kind in {"rate_limit", "circuit_open"}:
+                    limited_in_wave += 1
                 if kind in {"proxy", "timeout"}:
                     saw_transport_failure = True
                 else:
@@ -2462,6 +2495,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             routes = [OutboundTransportManager([route], enabled=True) for route in pilot_routes]
             for offset in range(0, len(candidates), len(routes)):
                 batch = candidates[offset:offset + len(routes)]
+                limited_in_wave = 0
                 stop_wave = threading.Event()
                 pilot_pool = ThreadPoolExecutor(max_workers=len(batch))
                 try:
@@ -2484,7 +2518,10 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         except Exception as exc:
                             result = (item, None, str(exc), "timeout")
                         note_batch_result(result)
-                        download_found(item["AAMM"], item["nNF"], item["chave_real"], result=result)
+                        download_found(
+                            item["AAMM"], item["nNF"], item["chave_real"],
+                            result=result, pause_on_limit=False,
+                        )
 
                     def on_timeout(future, futures=futures):
                         item = futures[future]
@@ -2492,7 +2529,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         note_batch_result(result)
                         download_found(
                             item["AAMM"], item["nNF"], item["chave_real"],
-                            result=result,
+                            result=result, pause_on_limit=False,
                         )
 
                     def on_heartbeat(done_n, total):
@@ -2510,6 +2547,10 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 finally:
                     stop_wave.set()
                     pilot_pool.shutdown(wait=True, cancel_futures=True)
+                # Só pausa quando a SVRS barrou todos os IPs da onda.
+                if limited_in_wave == len(batch) and not halt_reason:
+                    paused_for_svrs = True
+                    halt_reason = "hold"
                 if (
                     pending_saved == saved_before
                     and saw_transport_failure

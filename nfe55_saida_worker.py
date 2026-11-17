@@ -331,7 +331,7 @@ def _baixar_na_faixa(
         return xml, ""
     except requests.HTTPError as exc:
         if _categoria_download(exc) == "limite":
-            limitador.note_remote_limit()
+            limitador.note_remote_limit(faixa)
         return "", _categoria_download(exc)
     except (requests.RequestException, RuntimeError) as exc:
         return "", _categoria_download(exc)

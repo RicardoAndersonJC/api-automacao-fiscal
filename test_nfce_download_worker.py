@@ -36,7 +36,8 @@ class RemoteResponseLoggingTests(unittest.TestCase):
         self.assertEqual(decision, "call")
         self.assertIsNotNone(probe)
         self.assertEqual(now[0], 150)
-        self.assertEqual(limiter.begin_download(), ("skip", None))
+        # A próxima chave do mesmo IP espera a sonda; não vira falha local.
+        self.assertFalse(limiter.download_admission())
 
     def test_retry_cannot_shorten_shared_download_interval(self):
         now = [0.0]
@@ -419,7 +420,7 @@ class NfceWorkerTest(unittest.TestCase):
         self.assertIsNotNone(probe)
         self.assertGreaterEqual(now[0], 60)
         self.assertEqual(limiter.download_state(), "half_open")
-        self.assertEqual(limiter.begin_download(), ("skip", None))
+        self.assertFalse(limiter.download_admission())
         limiter.finish_download_probe(probe, succeeded=True)
         self.assertEqual(limiter.download_state(), "available")
         recovered_at = now[0]
@@ -1308,22 +1309,24 @@ class DownloadFifoTests(unittest.TestCase):
             clock=lambda: now[0],
             sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
         )
-        _, normal_request = limiter.begin_download(lane="proxy-ip:192.0.2.1")
-        limiter.note_remote_limit()
-        _, stale_probe = limiter.begin_download(lane="proxy-ip:192.0.2.2")
-        limiter.note_remote_limit()
-        _, current_probe = limiter.begin_download(lane="proxy-ip:192.0.2.3")
+        lane = "proxy-ip:192.0.2.1"
+        _, normal_request = limiter.begin_download(lane=lane)
+        limiter.note_remote_limit(lane)
+        _, stale_probe = limiter.begin_download(lane=lane)
+        limiter.note_remote_limit(lane)
+        _, current_probe = limiter.begin_download(lane=lane)
 
+        self.assertIsNone(normal_request)
         self.assertIsNotNone(stale_probe)
         self.assertIsNotNone(current_probe)
         limiter.finish_download_probe(normal_request, succeeded=True)
         limiter.finish_download_probe(stale_probe, succeeded=True)
-        self.assertEqual(limiter.download_state(), "half_open")
-        self.assertEqual(limiter.begin_download(lane="proxy-ip:192.0.2.4"), ("skip", None))
+        self.assertEqual(limiter.download_state(lane), "half_open")
+        self.assertFalse(limiter.download_admission(lane))
         limiter.finish_download_probe(current_probe, succeeded=True)
-        self.assertEqual(limiter.download_state(), "available")
+        self.assertEqual(limiter.download_state(lane), "available")
 
-    def test_local_probe_skip_is_separate_from_portal_rate_limit(self):
+    def test_portal_limit_on_one_ip_does_not_block_other_ips(self):
         now = [0.0]
         limiter = worker.SvrsRateLimiter(
             download_seconds=60,
@@ -1331,19 +1334,37 @@ class DownloadFifoTests(unittest.TestCase):
             clock=lambda: now[0],
             sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
         )
-        limiter.note_remote_limit()
-        _, probe = limiter.begin_download(lane="proxy-ip:192.0.2.1")
-        with patch.object(worker, "_download") as download, requests.Session() as session:
+        limiter.note_remote_limit("proxy-ip:192.0.2.1")
+        self.assertEqual(limiter.download_state("proxy-ip:192.0.2.1"), "cooldown")
+        self.assertEqual(limiter.download_state("proxy-ip:192.0.2.2"), "available")
+        with (
+            patch.object(worker, "_download", return_value=("<nfeProc/>", "ok", "", 200)) as download,
+            requests.Session() as session,
+        ):
             result = worker._download_one(
                 None, None, "", {"chave_real": "0" * 44}, limiter,
                 session=session, lane="proxy-ip:192.0.2.2",
             )
 
-        download.assert_not_called()
-        self.assertEqual(result[3], "circuit_open")
-        self.assertEqual(limiter.download_state(), "half_open")
-        limiter.finish_download_probe(probe, succeeded=True)
-        self.assertEqual(limiter.download_state(), "available")
+        download.assert_called_once()
+        self.assertEqual(result[3], "ok")
+        self.assertEqual(now[0], 0.0)
+        self.assertEqual(limiter.download_state("proxy-ip:192.0.2.1"), "cooldown")
+
+    def test_rate_limit_puts_only_the_limited_ip_in_cooldown(self):
+        limiter = worker.SvrsRateLimiter(download_seconds=60, cooldown_seconds=60, clock=lambda: 0.0)
+        with (
+            patch.object(worker, "_download", return_value=(None, "rate_limit", "bloqueado", 200)),
+            requests.Session() as session,
+        ):
+            result = worker._download_one(
+                None, None, "", {"chave_real": "0" * 44}, limiter,
+                session=session, lane="proxy-ip:192.0.2.1",
+            )
+
+        self.assertEqual(result[3], "rate_limit")
+        self.assertEqual(limiter.download_state("proxy-ip:192.0.2.1"), "cooldown")
+        self.assertTrue(limiter.download_admission("proxy-ip:192.0.2.2"))
 
     def test_transport_error_with_429_in_message_is_not_a_rate_limit(self):
         limiter = worker.SvrsRateLimiter(download_seconds=60)
