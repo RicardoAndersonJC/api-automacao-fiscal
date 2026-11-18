@@ -878,6 +878,41 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.assertEqual(completed["pending_saved"], 4)
         self.assertFalse(completed["pause_for_svrs"])
 
+    def test_xml_budget_stops_the_company_turn_before_the_svrs_limit(self):
+        import os
+
+        def download(*args, **kwargs):
+            item = args[3]
+            return item, "<nfeProc><NFe /></nfeProc>", "", "ok"
+
+        pendings = [
+            dict(aamm="2611", nnf=100 + index, chave=f"{index:044d}")
+            for index in range(1, 6)
+        ]
+        env = {
+            "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+            "NFCE_PROXY_BATCH_SIZE": "2",
+            "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.12:8080",
+        }
+        with patch.dict(os.environ, env), patch.object(worker, "XML_BUDGET_PER_RUN", 3):
+            job, callbacks, _consults = self.run_worker(
+                [],
+                dict(pending_only=True, pending_items=pendings),
+                downloads=download,
+            )
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(sum(call.args[1] == "file" for call in callbacks), 3)
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertTrue(completed["budget_reached"])
+        self.assertFalse(completed["pause_for_svrs"])
+        self.assertIn("Pausa preventiva da SVRS", completed["message"])
+
+    def test_xml_budget_helper(self):
+        self.assertIsNone(worker.xml_budget_left(500, budget=0))
+        self.assertEqual(worker.xml_budget_left(100, budget=120), 20)
+        self.assertEqual(worker.xml_budget_left(130, budget=120), 0)
+
     def test_proxy_failure_does_not_pause_the_other_notes(self):
         import os
 

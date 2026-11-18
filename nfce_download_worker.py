@@ -90,6 +90,26 @@ _export_slots = threading.BoundedSemaphore(MAX_QUEUED_JOBS + 1)
 DOWNLOAD_CONCURRENCY = 1
 # Compatibilidade com o health-check da API. Zero significa sem limite por lote.
 MAX_PENDING_PER_RUN = 0
+
+
+def _xml_budget_from_env() -> int:
+    try:
+        return max(0, int(os.getenv("NFCE_XML_BUDGET_PER_RUN", "120")))
+    except ValueError:
+        return 120
+
+
+# Teto de XMLs por vez da empresa na fila. A SVRS barrou certificados depois de
+# ~150-200 downloads seguidos (observado, não documentado). 0 = sem teto.
+XML_BUDGET_PER_RUN = _xml_budget_from_env()
+
+
+def xml_budget_left(saved: int, budget: int | None = None) -> int | None:
+    """Quantos XMLs ainda cabem nesta vez da empresa; None = sem teto."""
+    budget = XML_BUDGET_PER_RUN if budget is None else budget
+    if budget <= 0:
+        return None
+    return max(0, budget - saved)
 # Piso de 1 min entre downloads. Limite não confirmado pela documentação oficial.
 SVRS_INTERVAL_MIN_SECONDS = 60
 SVRS_INTERVAL_MAX_SECONDS = 120
@@ -659,6 +679,13 @@ def apply_discovery_step(
     if action == "hold" or not acked:
         return safe_aamm, safe_nnf, action, key
     return aamm, number, action, key
+
+
+def budget_reached_message(saved: int) -> str:
+    return (
+        f"Pausa preventiva da SVRS · {saved} XML salvos nesta vez. "
+        "A empresa cede a vez e o restante continua na fila."
+    )
 
 
 def discovery_scan_complete(reason: str, found_count: int = 0) -> bool:
@@ -1954,6 +1981,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             int(options.get("download_interval_seconds", SVRS_INTERVAL_MIN_SECONDS))
         )
         paused_for_svrs = False
+        budget_reached = False
         limiter = shared_rate_limiter(
             float(options.get("query_interval_ms", 100)) / 1000,
             interval_seconds,
@@ -2074,7 +2102,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 routes = [OutboundTransportManager([route], enabled=True) for route in pilot_routes]
                 processed = 0
                 while processed < pending_total and not paused_for_svrs:
-                    chunk = pending_queue[processed:processed + pending_batch]
+                    room = xml_budget_left(pending_saved)
+                    if room == 0:
+                        budget_reached = True
+                        break
+                    chunk = pending_queue[processed:processed + min(pending_batch, room or pending_batch)]
                     proxy_failures = 0
                     limited_in_wave = 0
                     lote_msg = (
@@ -2206,6 +2238,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         paused_for_svrs = True
             else:
                 for pending_index, pending in enumerate(pending_queue, 1):
+                    if xml_budget_left(pending_saved) == 0:
+                        budget_reached = True
+                        break
                     item = pending_download_item(pending)
 
                     def notify_attempt(attempt: int, index=pending_index) -> None:
@@ -2299,7 +2334,10 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 ),
             )
 
-            if (pending_only and not options.get("missing_notes")) or paused_for_svrs or pending_proxy_unavailable:
+            if (
+                (pending_only and not options.get("missing_notes"))
+                or paused_for_svrs or budget_reached or pending_proxy_unavailable
+            ):
                 if pending_proxy_unavailable:
                     message = (
                         f"Recuperação interrompida: todas as saídas de rede do lote falharam. "
@@ -2315,6 +2353,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     message=(
                         "Pausa temporária na SVRS"
                         if paused_for_svrs
+                        else "Pausa preventiva da SVRS"
+                        if budget_reached
                         else "Todas as pendências prontas foram processadas"
                     ),
                     progress=100,
@@ -2329,6 +2369,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     pending_saved=pending_saved,
                     pending_failed=pending_failed,
                     pause_for_svrs=paused_for_svrs,
+                    budget_reached=budget_reached and not paused_for_svrs,
                     include_cursor=False,
                     message=(
                         (
@@ -2336,6 +2377,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                             "As demais NFC-e continuam na fila e seguem em 1 min."
                         )
                         if paused_for_svrs
+                        else budget_reached_message(pending_saved)
+                        if budget_reached
                         else (
                             f"Pendências processadas: {pending_saved} salvas · "
                             f"{pending_failed} sem XML"
@@ -2483,7 +2526,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         discovery_queue: dict[str, dict[str, Any]] = {}
 
         def flush_discovered() -> None:
-            nonlocal halt_reason, paused_for_svrs
+            nonlocal halt_reason, paused_for_svrs, budget_reached
             candidates = list(discovery_queue.values())
             discovery_queue.clear()
             if not candidates:
@@ -2508,7 +2551,13 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
 
             routes = [OutboundTransportManager([route], enabled=True) for route in pilot_routes]
             for offset in range(0, len(candidates), len(routes)):
-                batch = candidates[offset:offset + len(routes)]
+                room = xml_budget_left(pending_saved)
+                if room == 0:
+                    # Chaves restantes já estão na fila (evento discovered).
+                    budget_reached = True
+                    halt_reason = halt_reason or "budget"
+                    break
+                batch = candidates[offset:offset + min(len(routes), room or len(routes))]
                 limited_in_wave = 0
                 stop_wave = threading.Event()
                 pilot_pool = ThreadPoolExecutor(max_workers=len(batch))
@@ -2577,6 +2626,12 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     break
 
         def download_or_queue(aamm: str, n_nf: int, key: str) -> None:
+            nonlocal halt_reason, budget_reached
+            if xml_budget_left(pending_saved) == 0:
+                # A chave já foi gravada na fila; a empresa cede a vez.
+                budget_reached = True
+                halt_reason = halt_reason or "budget"
+                return
             # Com lote contratado, nunca baixar 1 a 1: enfileira e dispara por IP.
             if not use_proxy_batch:
                 download_found(aamm, n_nf, key)
@@ -2667,7 +2722,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 break
 
         # Descarrega lacunas enfileiradas antes da varredura (ou no fim se pending_only).
-        if use_proxy_batch and discovery_queue and not paused_for_svrs:
+        if use_proxy_batch and discovery_queue and not paused_for_svrs and not budget_reached:
             flush_discovered()
             missing_recovered = max(0, pending_saved - saved_before_missing)
             _update(job, missing_attempted=missing_attempted,
@@ -2784,7 +2839,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             number += 1
 
         # Sempre esgota a fila paralela remanescente (descoberta ou lacunas).
-        if use_proxy_batch and discovery_queue and not paused_for_svrs:
+        if use_proxy_batch and discovery_queue and not paused_for_svrs and not budget_reached:
             flush_discovered()
 
         _update(
@@ -2821,7 +2876,10 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         if scan_reason in {"hold", "ack"}:
             paused_for_svrs = True
         completion_message = "Processamento concluído"
-        if paused_for_svrs:
+        budget_reached = budget_reached and not paused_for_svrs
+        if budget_reached:
+            completion_message = budget_reached_message(downloaded)
+        elif paused_for_svrs:
             completion_message = (
                 f"Pausa temporária na SVRS · {downloaded} XML salvos. "
                 "O restante continua na fila e segue em 1 min."
@@ -2866,6 +2924,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             missing_not_located=missing_not_located,
             missing_backlog=defer_discovery,
             pause_for_svrs=paused_for_svrs,
+            budget_reached=budget_reached,
             message=completion_message,
         )
     except Exception as exc:
