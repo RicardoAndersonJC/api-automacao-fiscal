@@ -1449,3 +1449,15 @@ class DownloadFifoTests(unittest.TestCase):
         )
 
         self.assertEqual(heartbeats, [(2, 3)])
+
+class BlockExcerptTests(unittest.TestCase):
+    def test_excerpt_drops_scripts_markup_and_digits(self):
+        page = (
+            "<html><script>var bloqueado = 1;</script><div>Menu</div>"
+            "<p>Acesso bloqueado para o CNPJ 21583852000129.</p></html>"
+        )
+        excerpt = worker._block_excerpt(page, ["bloqueado"])
+        self.assertEqual(excerpt, "Menu Acesso bloqueado para o CNPJ ##############.")
+
+    def test_no_hint_no_excerpt(self):
+        self.assertEqual(worker._block_excerpt("<p>bloqueado</p>", []), "")

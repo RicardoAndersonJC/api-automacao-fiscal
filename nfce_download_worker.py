@@ -1110,6 +1110,19 @@ class _PortalDiagnostics(HTMLParser):
             self.title.append(data)
 
 
+def _block_excerpt(text: str, hints: list[str]) -> str:
+    """Trecho curto e sem marcação do aviso de bloqueio; dígitos viram # (sem CNPJ/chave)."""
+    if not hints:
+        return ""
+    plain = re.sub(r"(?is)<(script|style)\b.*?</\1\s*>", " ", text or "")
+    plain = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", plain)))
+    index = plain.lower().find(hints[0])
+    if index < 0:
+        return ""
+    excerpt = plain[max(0, index - 120):index + 120].strip()
+    return re.sub(r"\d", "#", excerpt)
+
+
 def _log_remote_response(response: requests.Response, phase: str, started: float,
                          context: dict[str, Any] | None = None) -> None:
     text = response.text
@@ -1126,6 +1139,7 @@ def _log_remote_response(response: requests.Response, phase: str, started: float
         "response_bytes": len(response.content),
         "redirect_statuses": [item.status_code for item in response.history],
         "block_signals": [hint for hint in _RATE_LIMIT_HINTS if hint in sample],
+        "block_excerpt": _block_excerpt(text, [hint for hint in _RATE_LIMIT_HINTS if hint in sample]),
         "unavailable_signals": [hint for hint in _UNAVAILABLE_HINTS if hint in sample],
         "xMotivo": _redact_log_value(reason[:500]),
         "has_xml": bool(extract_downloaded_xml(text)) if phase == "portal_post" else False,
