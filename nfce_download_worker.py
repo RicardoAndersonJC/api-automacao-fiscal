@@ -1001,16 +1001,38 @@ def reset_webshare_routes_cache() -> None:
         _webshare_cache.clear()
 
 
-def webshare_pilot_routes(api_key: str, plan_id: str, limit: int = 100, clock=None) -> list[OutboundRoute]:
-    """Lista da Webshare; se a chamada falhar, reaproveita a última lista completa ainda válida."""
-    now = float((clock or time.monotonic)())
-    routes, complete = _fetch_webshare_routes(api_key, plan_id, limit)
+# A API da Webshare oscila (0,6 s, 9,6 s, sem resposta em 30 s em 18/11): sem lista guardada,
+# tenta de novo antes de cair nos proxies fixos.
+WEBSHARE_LIST_ATTEMPTS = max(1, int(os.getenv("NFCE_WEBSHARE_LIST_ATTEMPTS", "3")))
+WEBSHARE_RETRY_PAUSE_SECONDS = 2.0
+
+
+def webshare_pilot_routes(
+    api_key: str, plan_id: str, limit: int = 100, clock=None, sleep=None,
+) -> list[OutboundRoute]:
+    """Lista da Webshare; se a chamada falhar, reaproveita a última lista completa ainda válida.
+
+    Sem lista válida guardada (processo recém-iniciado), tenta até WEBSHARE_LIST_ATTEMPTS vezes.
+    """
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
     cache_key = plan_id or "-"
-    with _webshare_cache_lock:
-        if complete and routes:
-            _webshare_cache[cache_key] = (now, list(routes))
-            return routes
-        cached = _webshare_cache.get(cache_key)
+    routes: list[OutboundRoute] = []
+    for attempt in range(WEBSHARE_LIST_ATTEMPTS):
+        now = float(clock())
+        fetched, complete = _fetch_webshare_routes(api_key, plan_id, limit)
+        if len(fetched) > len(routes):
+            routes = fetched
+        with _webshare_cache_lock:
+            if complete and fetched:
+                _webshare_cache[cache_key] = (now, list(fetched))
+                return fetched
+            cached = _webshare_cache.get(cache_key)
+        if cached and now - cached[0] < WEBSHARE_CACHE_TTL_SECONDS:
+            break
+        if attempt + 1 < WEBSHARE_LIST_ATTEMPTS:
+            sleep(WEBSHARE_RETRY_PAUSE_SECONDS)
+    now = float(clock())
     if cached and now - cached[0] < WEBSHARE_CACHE_TTL_SECONDS and len(cached[1]) > len(routes):
         _logger.warning(json.dumps({
             "event": "nfce_webshare_list_cached",
@@ -1083,6 +1105,25 @@ def reset_shared_outbound_transport() -> None:
     global _shared_transport
     with _shared_transport_guard:
         _shared_transport = None
+
+
+def warm_webshare_routes(environ: dict[str, str] | None = None) -> threading.Thread | None:
+    """Carrega a lista da Webshare ao subir o processo, para o 1º lote não depender da API lenta."""
+    env = os.environ if environ is None else environ
+    key = env.get("NFCE_PROXY_PILOT_WEBSHARE_API_KEY", "").strip()
+    if not key or env.get("NFCE_WEBSHARE_WARMUP", "true").lower() == "false":
+        return None
+    try:
+        limit = max(1, min(100, int(env.get("NFCE_PROXY_BATCH_SIZE", "100"))))
+    except ValueError:
+        limit = 100
+    plan = env.get("NFCE_PROXY_PILOT_WEBSHARE_PLAN_ID", "").strip()
+    thread = threading.Thread(
+        target=lambda: webshare_pilot_routes(key, plan, limit),
+        name="nfce-webshare-warmup", daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def callback_backoff_seconds(attempt: int, jitter_seconds: float = 0) -> float:

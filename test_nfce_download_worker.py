@@ -1088,11 +1088,11 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.assertEqual(len(fresh), 5)
         now[0] += 60
         with patch.object(worker.requests, "get", side_effect=requests.ReadTimeout()):
-            cached = worker.webshare_pilot_routes("k", "plan", limit=5, clock=lambda: now[0])
+            cached = worker.webshare_pilot_routes("k", "plan", limit=5, clock=lambda: now[0], sleep=lambda s: None)
         self.assertEqual([r.proxy_url for r in cached], [r.proxy_url for r in fresh])
         now[0] += worker.WEBSHARE_CACHE_TTL_SECONDS
         with patch.object(worker.requests, "get", side_effect=requests.ReadTimeout()):
-            expired = worker.webshare_pilot_routes("k", "plan", limit=5, clock=lambda: now[0])
+            expired = worker.webshare_pilot_routes("k", "plan", limit=5, clock=lambda: now[0], sleep=lambda s: None)
         self.assertEqual(expired, [], "an expired cache is not reused")
 
     def test_webshare_error_without_cache_returns_partial_list(self):
@@ -1100,7 +1100,28 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.addCleanup(worker.reset_webshare_routes_cache)
         with patch.object(worker.requests, "get") as get:
             get.return_value.status_code = 503
-            self.assertEqual(worker.webshare_pilot_routes("k", "", limit=5), [])
+            self.assertEqual(worker.webshare_pilot_routes("k", "", limit=5, sleep=lambda s: None), [])
+        self.assertEqual(get.call_count, worker.WEBSHARE_LIST_ATTEMPTS)
+
+    def test_webshare_cold_start_retries_until_the_list_arrives(self):
+        worker.reset_webshare_routes_cache()
+        self.addCleanup(worker.reset_webshare_routes_cache)
+        ok = requests.Response()
+        ok.status_code = 200
+        rows = [dict(proxy_address="192.0.2.9", port=8080, valid=True, username="u", password="p")]
+        pauses = []
+        with patch.object(worker.requests, "get", side_effect=[requests.ReadTimeout(), ok]),                 patch.object(ok, "json", return_value={"results": rows, "next": None}, create=True):
+            routes = worker.webshare_pilot_routes("k", "", limit=5, sleep=pauses.append)
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(pauses, [worker.WEBSHARE_RETRY_PAUSE_SECONDS])
+
+    def test_webshare_warmup_only_with_key(self):
+        self.assertIsNone(worker.warm_webshare_routes({}))
+        self.assertIsNone(worker.warm_webshare_routes({"NFCE_PROXY_PILOT_WEBSHARE_API_KEY": "k", "NFCE_WEBSHARE_WARMUP": "false"}))
+        with patch.object(worker, "webshare_pilot_routes") as fetch:
+            thread = worker.warm_webshare_routes({"NFCE_PROXY_PILOT_WEBSHARE_API_KEY": "k", "NFCE_PROXY_BATCH_SIZE": "30"})
+            thread.join(timeout=5)
+        fetch.assert_called_once_with("k", "", 30)
 
     def test_six_saved_then_timeout_keeps_cursor_and_requests_resume(self):
         responses = [("100", "Autorizada", str(index) * 44) for index in range(1, 7)] + [("", "timeout", "")]

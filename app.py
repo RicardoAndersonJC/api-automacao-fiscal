@@ -29,6 +29,7 @@ from nfce_download_worker import (
     discovery_scan_complete,
     router as nfce_download_router,
     shared_outbound_transport,
+    warm_webshare_routes,
 )
 from nfe55_saida_worker import router as nfe55_saida_router
 
@@ -81,6 +82,8 @@ app = FastAPI()
 install_nfse_zip_routes(app)
 install_nfe_danfe_routes(app)
 app.include_router(nfce_download_router)
+# Lista da Webshare em segundo plano: o 1º lote após um restart não depende da API lenta.
+warm_webshare_routes()
 app.include_router(nfe55_saida_router)
 app.add_middleware(
     CORSMiddleware,
