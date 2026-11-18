@@ -1521,6 +1521,126 @@ class DownloadFifoTests(unittest.TestCase):
 
         self.assertEqual(heartbeats, [(2, 3)])
 
+class WaveStabilizationTests(unittest.TestCase):
+    """Estabilização 18/11: adiamento não é falha, XML em voo não se perde, bloqueio fecha a vez."""
+
+    def test_stop_before_http_returns_deferred_without_calling_the_portal(self):
+        stop = threading.Event()
+        stop.set()
+        limiter = worker.SvrsRateLimiter(download_seconds=60, clock=lambda: 0.0, sleep=lambda s: None)
+        with patch.object(worker, "_download", side_effect=AssertionError("no HTTP")), requests.Session() as session:
+            result = worker._download_one(
+                None, None, "", {"chave_real": "0" * 44}, limiter,
+                session=session, lane="proxy-ip:192.0.2.1", stop_event=stop,
+            )
+        self.assertEqual(result[3], worker.DEFERRED_KIND)
+        self.assertIsNone(result[1])
+        self.assertIn("continua na fila", result[2])
+
+    def test_cancelled_probe_is_released_without_a_new_cooldown(self):
+        now = [0.0]
+        limiter = worker.SvrsRateLimiter(
+            download_seconds=60, cooldown_seconds=60,
+            clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s),
+        )
+        lane = "proxy-ip:192.0.2.1"
+        limiter.note_remote_limit(lane)
+        now[0] = 61.0
+        slot, probe = limiter.begin_download(lane=lane)
+        self.assertEqual(slot, "call")
+        self.assertIsNotNone(probe)
+        limiter.release_download_probe(probe)
+        self.assertEqual(limiter.download_state(lane), "half_open")
+        self.assertTrue(limiter.download_admission(lane), "another probe may leave after the cancelled one")
+
+    def test_deadline_keeps_in_flight_xml_instead_of_timeout(self):
+        import concurrent.futures
+
+        in_flight = concurrent.futures.Future()
+        now = [0.0]
+        stop_wave = threading.Event()
+        seen = []
+
+        def fake_wait(pending, timeout, return_when):
+            now[0] += timeout
+            if stop_wave.is_set() and not in_flight.done():
+                in_flight.set_result("late-xml")
+            finished = {future for future in pending if future.done()}
+            return finished, pending - finished
+
+        worker.collect_parallel_downloads(
+            {in_flight: 1},
+            on_done=lambda future: seen.append(future.result()),
+            on_timeout=lambda future: seen.append("timeout"),
+            on_heartbeat=lambda done_n, total: None,
+            stop_event=stop_wave,
+            deadline_seconds=30, heartbeat_seconds=20, grace_seconds=60,
+            clock=lambda: now[0], wait_fn=fake_wait,
+        )
+        self.assertTrue(stop_wave.is_set(), "the deadline stops new calls")
+        self.assertEqual(seen, ["late-xml"])
+
+
+class WaveBlockRecoveryTests(unittest.TestCase):
+    run_worker = MissingNotesRecoveryTests.run_worker
+
+    def test_block_defers_unsent_notes_and_opens_no_new_wave(self):
+        import os
+
+        calls = []
+
+        def download(*args, **kwargs):
+            item = args[3]
+            calls.append(int(item["nNF"]))
+            if int(item["nNF"]) == 101:
+                return item, None, worker.download_failure_message("rate_limit"), "rate_limit"
+            return item, None, worker.download_failure_message(worker.DEFERRED_KIND), worker.DEFERRED_KIND
+
+        pending = [dict(aamm="2611", nnf=n, chave=f"{n:044d}") for n in range(101, 105)]
+        env = {
+            "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+            "NFCE_PROXY_BATCH_SIZE": "2",
+            "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.12:8080",
+        }
+        with patch.dict(os.environ, env):
+            job, callbacks, _consults = self.run_worker(
+                [], dict(pending_only=True, pending_items=pending), downloads=download,
+            )
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(sorted(calls), [101, 102], "no new wave after the block")
+        failed = [call.kwargs for call in callbacks if call.args[1] == "download_failed"]
+        self.assertEqual([f["number"] for f in failed], [101], "deferred note is not reported as failure")
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertTrue(completed["svrs_download_blocked"])
+        self.assertEqual(completed["pending_failed"], 1)
+
+    def test_partial_success_with_block_keeps_saved_xml(self):
+        import os
+
+        def download(*args, **kwargs):
+            item = args[3]
+            if int(item["nNF"]) == 101:
+                return item, "<nfeProc><NFe /></nfeProc>", "", "ok"
+            return item, None, worker.download_failure_message("rate_limit"), "rate_limit"
+
+        pending = [dict(aamm="2611", nnf=n, chave=f"{n:044d}") for n in (101, 102)]
+        env = {
+            "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+            "NFCE_PROXY_BATCH_SIZE": "2",
+            "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.12:8080",
+        }
+        with patch.dict(os.environ, env):
+            job, callbacks, _consults = self.run_worker(
+                [], dict(pending_only=True, pending_items=pending), downloads=download,
+            )
+        self.assertEqual(sum(call.args[1] == "file" for call in callbacks), 1)
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertTrue(completed["svrs_download_blocked"], "explicit block is reported even with XML saved")
+        self.assertEqual(completed["downloaded"], 1)
+
+
 class BlockExcerptTests(unittest.TestCase):
     def test_excerpt_drops_scripts_markup_and_digits(self):
         page = (

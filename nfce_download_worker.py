@@ -69,6 +69,10 @@ PORTAL_CONNECT_TIMEOUT = 15
 PARALLEL_HEARTBEAT_SECONDS = 20
 # Uma onda de 100 IPs termina antes dos 8 min em que a Edge declara o worker morto.
 PARALLEL_WAVE_DEADLINE_SECONDS = 6 * 60
+# Depois do prazo da onda, quem já está no HTTP termina (GET+POST) e o XML é aproveitado.
+PARALLEL_IN_FLIGHT_GRACE_SECONDS = 2 * (PORTAL_CONNECT_TIMEOUT + REQUEST_TIMEOUT) + 10
+# Tarefa interrompida antes de chamar a SVRS: não é falha, a chave continua na fila.
+DEFERRED_KIND = "deferred"
 JOB_TTL_SECONDS = int(os.getenv("NFCE_JOB_TTL_SECONDS", "21600"))
 MAX_UPLOAD_BYTES = int(os.getenv("NFCE_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024)))
 MAX_NUMERACOES = int(os.getenv("NFCE_MAX_NUMERACOES", "10000"))
@@ -515,6 +519,15 @@ class SvrsRateLimiter:
             else:
                 self._enter_cooldown_locked(probe.lane, float(self._clock()))
 
+    def release_download_probe(self, probe: object | None) -> None:
+        """Sonda que não chegou à SVRS: o IP segue em half_open, sem novo cooldown."""
+        if not isinstance(probe, _DownloadProbe):
+            return
+        with self._lock:
+            if self._lane_probe.get(probe.lane) is probe:
+                self._lane_probe.pop(probe.lane, None)
+                self._download_condition.notify_all()
+
     @property
     def _download_tickets(self) -> list:
         return [ticket for queue in self._lane_tickets.values() for ticket in queue]
@@ -611,16 +624,23 @@ def collect_parallel_downloads(
     stop_event=None,
     deadline_seconds: float = PARALLEL_WAVE_DEADLINE_SECONDS,
     heartbeat_seconds: float = PARALLEL_HEARTBEAT_SECONDS,
+    grace_seconds: float = PARALLEL_IN_FLIGHT_GRACE_SECONDS,
     clock=None,
     wait_fn=None,
 ) -> None:
-    """Cada IP devolve a sua nota. Quem não volta vira timeout e não segura o lote."""
+    """Cada IP devolve a sua nota.
+
+    No prazo da onda, o stop_event impede novas chamadas (quem não saiu volta adiado)
+    e quem já está no HTTP ganha `grace_seconds` para terminar; o XML que chegar é salvo.
+    Só quem não volta nem na tolerância vira timeout.
+    """
     clock = clock or time.monotonic
     wait_fn = wait_fn or wait
     pending = set(futures)
     started = clock()
     last_beat = started
     total = len(pending)
+    deadline = deadline_seconds
 
     def report_if_due(completed: int) -> None:
         nonlocal last_beat
@@ -636,7 +656,11 @@ def collect_parallel_downloads(
             report_if_due(total - len(pending))
         if not pending:
             return
-        remaining = deadline_seconds - (clock() - started)
+        remaining = deadline - (clock() - started)
+        if remaining <= 0 and deadline == deadline_seconds and stop_event is not None and grace_seconds > 0:
+            stop_event.set()
+            deadline = deadline_seconds + grace_seconds
+            continue
         if remaining <= 0:
             if stop_event is not None:
                 stop_event.set()
@@ -1243,6 +1267,11 @@ def download_failure_message(kind: str, status_code: int = 0) -> str:
             "NFC-e sem XML no portal da SVRS (cancelada ou indisponível). "
             "Não é falha de conexão."
         )
+    if kind == DEFERRED_KIND:
+        return (
+            "Download adiado: o lote parou antes de chamar a SVRS. "
+            "Esta NFC-e continua na fila, sem contar como falha."
+        )
     if kind == "timeout":
         return (
             "A SVRS não respondeu a tempo. "
@@ -1662,7 +1691,7 @@ def _download_one(
         message = download_failure_message("no_xml")
         for attempt in range(sefaz_max_retries()):
             if stop_event is not None and stop_event.is_set():
-                return item, None, download_failure_message("timeout"), "timeout"
+                return item, None, download_failure_message(DEFERRED_KIND), DEFERRED_KIND
             if breaker and not breaker.allow_call():
                 kind = "circuit_open"
                 message = download_failure_message("circuit_open")
@@ -1701,9 +1730,10 @@ def _download_one(
             error_type = ""
             failover = False
             probe_succeeded = False
+            if slot == "cancelled" or (stop_event is not None and stop_event.is_set()):
+                active.release_download_probe(probe)
+                return item, None, download_failure_message(DEFERRED_KIND), DEFERRED_KIND
             try:
-                if slot == "cancelled" or (stop_event is not None and stop_event.is_set()):
-                    return item, None, download_failure_message("timeout"), "timeout"
                 if notify and attempt == 0:
                     notify(attempt)
                 xml, kind, message, http_status = _download(active_session, item["chave_real"], {
@@ -1995,6 +2025,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         # SVRS pausa a execução; não existe mais corte artificial em 6 notas.
         pending_saved = 0
         pending_failed = 0
+        pending_deferred = 0
         if pending_items:
             pending_queue = list(pending_items)
             pending_total = len(pending_queue)
@@ -2027,7 +2058,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             def apply_pending_result(
                 pending_index, item, xml, last_download_error, failure_kind, pause_on_limit=True,
             ):
-                nonlocal pending_saved, pending_failed, paused_for_svrs
+                nonlocal pending_saved, pending_failed, pending_deferred, paused_for_svrs
                 if xml:
                     full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
                     _callback(
@@ -2051,6 +2082,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     )
                     pending_saved += 1
                     saved_keys.add(str(item["chave_real"]))
+                elif failure_kind == DEFERRED_KIND:
+                    # Não chegou à SVRS: a pendência segue como está, sem falha nem callback.
+                    pending_deferred += 1
                 else:
                     failure_reason = last_download_error or download_failure_message(failure_kind)
                     pending_failed += 1
@@ -2071,10 +2105,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     if pause_on_limit and failure_kind in {"rate_limit", "circuit_open"}:
                         paused_for_svrs = True
 
-                completed_count = pending_saved + pending_failed
+                completed_count = pending_saved + pending_failed + pending_deferred
                 message = (
                     f"Recuperando pendências: {completed_count}/{pending_total} · "
                     f"{pending_saved} salvas · {pending_failed} falhas"
+                    + (f" · {pending_deferred} adiadas" if pending_deferred else "")
                 )
                 _update(
                     job,
@@ -2504,6 +2539,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     pending_saved += 1
                     saved_keys.add(found_key)
                     return "ok"
+                if kind == DEFERRED_KIND:
+                    # A chave já está na fila (evento discovered) e não chegou à SVRS.
+                    return DEFERRED_KIND
                 pending_failed += 1
                 _callback(
                     job,
@@ -2548,7 +2586,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 nonlocal saw_transport_failure, saw_other_failure, limited_in_wave, blocked_in_wave
                 xml = result[1] if len(result) > 1 else None
                 kind = result[3] if len(result) > 3 else "timeout"
-                if xml:
+                if xml or kind == DEFERRED_KIND:
                     return
                 if kind in {"rate_limit", "circuit_open"}:
                     limited_in_wave += 1
