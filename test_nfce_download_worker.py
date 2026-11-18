@@ -651,6 +651,7 @@ class MissingNotesRecoveryTests(unittest.TestCase):
             return {}, "<nfeProc><NFe /></nfeProc>", "", "ok"
 
         env = {
+            "NFCE_DOWNLOAD_PROBE": "false",
             "NFCE_PROXY_PILOT_EMPRESA_ID": "test-company",
             "NFCE_PROXY_PILOT_URL": "http://first.invalid:8080",
             "NFCE_PROXY_PILOT_DISCOVERY_BATCH": "true",
@@ -815,6 +816,7 @@ class MissingNotesRecoveryTests(unittest.TestCase):
             ("613", "Autorizada", "2" * 44),
         ]
         env = {
+            "NFCE_DOWNLOAD_PROBE": "false",
             "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
             "NFCE_PROXY_BATCH_SIZE": "2",
             "NFCE_PROXY_PILOT_URL": "http://192.0.2.21:8080",
@@ -858,6 +860,7 @@ class MissingNotesRecoveryTests(unittest.TestCase):
             for index in range(1, 5)
         ]
         env = {
+            "NFCE_DOWNLOAD_PROBE": "false",
             "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
             "NFCE_PROXY_BATCH_SIZE": "2",
             "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
@@ -895,6 +898,7 @@ class MissingNotesRecoveryTests(unittest.TestCase):
             for index in range(1, 7)
         ]
         env = {
+            "NFCE_DOWNLOAD_PROBE": "false",
             "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
             "NFCE_PROXY_BATCH_SIZE": "2",
             "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
@@ -1000,6 +1004,7 @@ class MissingNotesRecoveryTests(unittest.TestCase):
             for number in range(101, 105)
         ]
         env = {
+            "NFCE_DOWNLOAD_PROBE": "false",
             "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
             "NFCE_PROXY_BATCH_SIZE": "2",
             "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
@@ -1648,6 +1653,7 @@ class WaveBlockRecoveryTests(unittest.TestCase):
 
         pending = [dict(aamm="2611", nnf=n, chave=f"{n:044d}") for n in range(101, 105)]
         env = {
+            "NFCE_DOWNLOAD_PROBE": "false",
             "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
             "NFCE_PROXY_BATCH_SIZE": "2",
             "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
@@ -1740,6 +1746,72 @@ class WaveBlockRecoveryTests(unittest.TestCase):
         completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
         self.assertTrue(completed["svrs_download_blocked"], "explicit block is reported even with XML saved")
         self.assertEqual(completed["downloaded"], 1)
+
+
+class DownloadProbeAndBlockTimeTests(unittest.TestCase):
+    """18/11: certificado já bloqueado recebia 85 pedidos de uma vez; a SVRS informa até quando bloqueia."""
+
+    run_worker = MissingNotesRecoveryTests.run_worker
+    ENV = {
+        "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+        "NFCE_PROXY_BATCH_SIZE": "3",
+        "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
+        "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.12:8080",
+        "NFCE_PROXY_PILOT_URL_3": "http://192.0.2.13:8080",
+    }
+    BLOCK_PAGE = (
+        "Download do XML do NFCe Acesso ao Download do XML bloqueado at&eacute; "
+        "18/11/2026 14:05 por uso indevido do servi&ccedil;o"
+    )
+
+    def test_parses_block_end_time_in_brasilia(self):
+        until = worker.svrs_blocked_until(self.BLOCK_PAGE)
+        self.assertEqual(until.isoformat(), "2026-11-18T17:05:00+00:00")
+        message = worker.rate_limit_message(self.BLOCK_PAGE)
+        self.assertIn("Bloqueio da SVRS até 2026-11-18T14:05:00-03:00", message)
+        self.assertEqual(worker.blocked_until_from_message(message), until)
+        self.assertIsNone(worker.svrs_blocked_until("bloqueado temporariamente"))
+        self.assertNotIn("Bloqueio da SVRS até", worker.rate_limit_message("muitas consultas"))
+
+    def test_blocked_certificate_costs_one_request_and_reports_the_end_time(self):
+        import os
+
+        calls = []
+        message = worker.rate_limit_message(self.BLOCK_PAGE)
+
+        def download(*args, **kwargs):
+            calls.append(int(args[3]["nNF"]))
+            return args[3], None, message, "rate_limit"
+
+        pending = [dict(aamm="2611", nnf=n, chave=f"{n:044d}") for n in range(101, 108)]
+        with patch.dict(os.environ, self.ENV):
+            job, callbacks, _ = self.run_worker([], dict(pending_only=True, pending_items=pending), downloads=download)
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(calls, [101], "only the probe reaches the SVRS while the certificate is blocked")
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertTrue(completed["svrs_download_blocked"])
+        self.assertEqual(completed["svrs_blocked_until"], "2026-11-18T17:05:00+00:00")
+
+    def test_probe_success_releases_the_parallel_wave_on_other_ips(self):
+        import os
+
+        calls = []
+
+        def download(*args, **kwargs):
+            calls.append((int(args[3]["nNF"]), kwargs["lane"]))
+            return args[3], "<nfeProc><NFe /></nfeProc>", "", "ok"
+
+        pending = [dict(aamm="2611", nnf=n, chave=f"{n:044d}") for n in range(101, 105)]
+        with patch.dict(os.environ, self.ENV):
+            job, callbacks, _ = self.run_worker([], dict(pending_only=True, pending_items=pending), downloads=download)
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(calls[0], (101, "proxy-ip:192.0.2.11"))
+        wave = sorted(calls[1:4])
+        self.assertEqual([n for n, _lane in wave], [102, 103, 104])
+        self.assertEqual(dict(wave)[102], "proxy-ip:192.0.2.12", "the wave starts on the IP after the probe")
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertEqual(completed["pending_saved"], 4)
+        self.assertEqual(completed["svrs_blocked_until"], "")
 
 
 class BlockExcerptTests(unittest.TestCase):

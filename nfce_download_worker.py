@@ -1294,6 +1294,45 @@ _UNAVAILABLE_HINTS = (
 )
 
 
+_SVRS_TZ = timezone(timedelta(hours=-3))
+_BLOCKED_UNTIL_RE = re.compile(
+    r"bloquead[oa]\s+at[ée]\s+(\d{2})/(\d{2})/(\d{4})\s+(\d{2}):(\d{2})", re.IGNORECASE,
+)
+_BLOCKED_UNTIL_MESSAGE_RE = re.compile(r"Bloqueio da SVRS até (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2})")
+
+
+def svrs_blocked_until(text: str) -> datetime | None:
+    """Horário de "Acesso ao Download do XML bloqueado até dd/mm/aaaa hh:mm" (Brasília), em UTC."""
+    match = _BLOCKED_UNTIL_RE.search(html.unescape(text or ""))
+    if not match:
+        return None
+    day, month, year, hour, minute = (int(part) for part in match.groups())
+    try:
+        local = datetime(year, month, day, hour, minute, tzinfo=_SVRS_TZ)
+    except ValueError:
+        return None
+    return local.astimezone(timezone.utc)
+
+
+def rate_limit_message(text: str, status_code: int = 0) -> str:
+    """Mensagem de limite; quando a SVRS informa o fim do bloqueio, ele vai junto (ISO, -03:00)."""
+    message = download_failure_message("rate_limit", status_code)
+    until = svrs_blocked_until(text)
+    if until is not None:
+        message += f" Bloqueio da SVRS até {until.astimezone(_SVRS_TZ).isoformat(timespec='seconds')}."
+    return message
+
+
+def blocked_until_from_message(message: str | None) -> datetime | None:
+    match = _BLOCKED_UNTIL_MESSAGE_RE.search(message or "")
+    if not match:
+        return None
+    try:
+        return datetime.fromisoformat(match.group(1)).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
 def classify_portal_body(status_code: int, text: str) -> str:
     """rate_limit no 429 ou no HTML de bloqueio. 503 sem esse texto é falha transitória."""
     sample = html.unescape(text or "")[:8000].lower()
@@ -1713,7 +1752,7 @@ def _portal_http_failure(response: requests.Response) -> tuple[str, str] | None:
         return None
     kind = classify_portal_body(response.status_code, response.text)
     if kind == "rate_limit" or response.status_code == 429:
-        return "rate_limit", download_failure_message("rate_limit", response.status_code)
+        return "rate_limit", rate_limit_message(response.text, response.status_code)
     if kind == "unavailable":
         return "unavailable", download_failure_message("unavailable")
     return "http", download_failure_message("http", response.status_code)
@@ -1929,6 +1968,8 @@ def _download(session: requests.Session, key: str,
     if xml:
         return xml, "ok", "", post_response.status_code
     kind = classify_portal_body(post_response.status_code, post_response.text)
+    if kind == "rate_limit":
+        return None, kind, rate_limit_message(post_response.text, post_response.status_code), post_response.status_code
     return None, kind, download_failure_message(kind, post_response.status_code), post_response.status_code
 
 
@@ -2072,6 +2113,19 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         )
         paused_for_svrs = False
         budget_reached = False
+        # Antes de soltar uma onda em paralelo, 1 nota sozinha confirma que a SVRS não está
+        # bloqueando o certificado (18/11: 85 pedidos simultâneos num certificado já bloqueado).
+        download_probe_pending = os.getenv("NFCE_DOWNLOAD_PROBE", "true").strip().lower() != "false"
+        blocked_until_seen: datetime | None = None
+
+        def note_blocked_until(message: str | None) -> None:
+            nonlocal blocked_until_seen
+            until = blocked_until_from_message(message)
+            if until is not None and (blocked_until_seen is None or until > blocked_until_seen):
+                blocked_until_seen = until
+
+        def blocked_until_iso() -> str:
+            return blocked_until_seen.isoformat() if blocked_until_seen else ""
         limiter = shared_rate_limiter(
             float(options.get("query_interval_ms", 100)) / 1000,
             interval_seconds,
@@ -2147,6 +2201,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     pending_deferred += 1
                 else:
                     failure_reason = last_download_error or download_failure_message(failure_kind)
+                    if failure_kind == "rate_limit":
+                        note_blocked_until(failure_reason)
                     pending_failed += 1
                     _callback(
                         job,
@@ -2196,12 +2252,16 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             if pending_batch:
                 routes = [OutboundTransportManager([route], enabled=True) for route in pilot_routes]
                 processed = 0
+                route_shift = 0
                 while processed < pending_total and not paused_for_svrs:
                     room = xml_budget_left(pending_saved)
                     if room == 0:
                         budget_reached = True
                         break
-                    chunk = pending_queue[processed:processed + min(pending_batch, room or pending_batch)]
+                    probe_wave = download_probe_pending
+                    size = 1 if probe_wave else min(pending_batch, room or pending_batch)
+                    chunk = pending_queue[processed:processed + size]
+                    wave_routes = routes[route_shift:] + routes[:route_shift]
                     proxy_failures = 0
                     limited_in_wave = 0
                     blocked_in_wave = 0
@@ -2243,7 +2303,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                                 lane=proxy_lane(route),
                                 stop_event=stop_wave,
                             ): offset
-                            for offset, (pending, route) in enumerate(zip(chunk, routes))
+                            for offset, (pending, route) in enumerate(zip(chunk, wave_routes))
                         }
 
                         def on_done(future, futures=futures, stop_wave=stop_wave):
@@ -2311,7 +2371,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         stop_wave.set()
                         pilot_pool.shutdown(wait=True, cancel_futures=True)
                     processed += len(chunk)
-                    if proxy_failures == len(chunk):
+                    # Depois da sonda, a onda começa no IP seguinte (o da sonda ainda espera o intervalo).
+                    route_shift = 1 if probe_wave else 0
+                    if probe_wave and not blocked_in_wave:
+                        download_probe_pending = False
+                    if proxy_failures == len(chunk) and not probe_wave:
                         pending_proxy_unavailable = True
                         break
                     # Primeiro "bloqueado" real da SVRS encerra a vez da empresa.
@@ -2451,6 +2515,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     pending_failed=pending_failed,
                     pause_for_svrs=paused_for_svrs,
                     svrs_download_blocked=paused_for_svrs,
+                    svrs_blocked_until=blocked_until_iso(),
                     budget_reached=budget_reached and not paused_for_svrs,
                     include_cursor=False,
                     message=(
@@ -2582,6 +2647,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 if kind == DEFERRED_KIND:
                     # A chave já está na fila (evento discovered) e não chegou à SVRS.
                     return DEFERRED_KIND
+                if kind == "rate_limit":
+                    note_blocked_until(error)
                 pending_failed += 1
                 _callback(
                     job,
@@ -2611,7 +2678,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
         discovery_queue: dict[str, dict[str, Any]] = {}
 
         def flush_discovered() -> None:
-            nonlocal halt_reason, paused_for_svrs, budget_reached
+            nonlocal halt_reason, paused_for_svrs, budget_reached, download_probe_pending
             candidates = list(discovery_queue.values())
             discovery_queue.clear()
             if not candidates:
@@ -2638,14 +2705,19 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     saw_other_failure = True
 
             routes = [OutboundTransportManager([route], enabled=True) for route in pilot_routes]
-            for offset in range(0, len(candidates), len(routes)):
+            offset = 0
+            route_shift = 0
+            while offset < len(candidates):
                 room = xml_budget_left(pending_saved)
                 if room == 0:
                     # Chaves restantes já estão na fila (evento discovered).
                     budget_reached = True
                     halt_reason = halt_reason or "budget"
                     break
-                batch = candidates[offset:offset + min(len(routes), room or len(routes))]
+                probe_wave = download_probe_pending
+                size = 1 if probe_wave else min(len(routes), room or len(routes))
+                batch = candidates[offset:offset + size]
+                wave_routes = routes[route_shift:] + routes[:route_shift]
                 limited_in_wave = 0
                 blocked_in_wave = 0
                 stop_wave = threading.Event()
@@ -2660,7 +2732,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                             lane=proxy_lane(route),
                             stop_event=stop_wave,
                         ): item
-                        for item, route in zip(batch, routes)
+                        for item, route in zip(batch, wave_routes)
                     }
 
                     def on_done(future, futures=futures, stop_wave=stop_wave):
@@ -2702,12 +2774,17 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 finally:
                     stop_wave.set()
                     pilot_pool.shutdown(wait=True, cancel_futures=True)
+                offset += len(batch)
+                route_shift = 1 if probe_wave else 0
+                if probe_wave and not blocked_in_wave:
+                    download_probe_pending = False
                 # Primeiro "bloqueado" real da SVRS encerra a vez da empresa.
                 if (blocked_in_wave or limited_in_wave == len(batch)) and not halt_reason:
                     paused_for_svrs = True
                     halt_reason = "hold"
                 if (
-                    pending_saved == saved_before
+                    not probe_wave
+                    and pending_saved == saved_before
                     and saw_transport_failure
                     and not saw_other_failure
                     and not paused_for_svrs
@@ -3020,6 +3097,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             missing_backlog=defer_discovery,
             pause_for_svrs=paused_for_svrs,
             svrs_download_blocked=svrs_download_blocked,
+            svrs_blocked_until=blocked_until_iso(),
             budget_reached=budget_reached,
             message=completion_message,
         )
