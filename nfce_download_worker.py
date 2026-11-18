@@ -94,13 +94,13 @@ MAX_PENDING_PER_RUN = 0
 
 def _xml_budget_from_env() -> int:
     try:
-        return max(0, int(os.getenv("NFCE_XML_BUDGET_PER_RUN", "120")))
+        return max(0, int(os.getenv("NFCE_XML_BUDGET_PER_RUN", "0")))
     except ValueError:
-        return 120
+        return 0
 
 
 # Teto de XMLs por vez da empresa na fila. A SVRS barrou certificados depois de
-# ~150-200 downloads seguidos (observado, não documentado). 0 = sem teto.
+# ~150-200 downloads seguidos (observado, não documentado). Desligado por padrão (0); ligue com NFCE_XML_BUDGET_PER_RUN.
 XML_BUDGET_PER_RUN = _xml_budget_from_env()
 
 
