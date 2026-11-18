@@ -2,8 +2,10 @@ import unittest
 
 from nfe55_saida_discovery import (
     avancar,
+    avancar_sobre_recuperadas,
     cfg_da_chave,
     chave_artificial,
+    chaves_para_recuperar,
     extrair_xml_portal,
     interpretar_consulta,
     ler_xml_semente,
@@ -94,6 +96,21 @@ class Nfe55DiscoveryTest(unittest.TestCase):
     def test_proximo_mes_vira_o_ano(self):
         self.assertEqual(proximo_aamm("2612"), "2701")
         self.assertEqual(len(modulo11_dv("1" * 43)), 1)
+
+    def test_faltante_com_xml_vem_antes_da_nota_nova(self):
+        cfg = {
+            "cUF": "27", "AAMM": "2609", "CNPJ": "12345678000199",
+            "modelo": "55", "serie": "001", "tpEmis": "1",
+        }
+        chaves = chaves_para_recuperar(cfg, [
+            {"aamm": "2609", "nnf": 109457, "ultimo_erro": "Chave localizada; XML aguardando download"},
+            {"aamm": "2609", "nnf": 109458, "ultimo_erro": "Numeração ainda não localizada na consulta"},
+        ])
+        self.assertEqual(chaves, [chave_artificial(cfg, 109457, "2609")])
+        self.assertEqual(
+            avancar_sobre_recuperadas("2609", 109457, {("2609", 109457), ("2609", 109458)}),
+            ("2609", 109459),
+        )
 
 
 if __name__ == "__main__":

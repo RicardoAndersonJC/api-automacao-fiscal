@@ -6,7 +6,8 @@ from unittest.mock import patch
 import requests
 
 import nfe55_saida_worker as worker
-from nfce_download_worker import OutboundRoute
+import nfe55_saida_transport as saida_rede
+from nfe55_saida_transport import Rota as OutboundRoute
 
 
 class Transporte:
@@ -68,9 +69,9 @@ class ProxySaidaTest(unittest.TestCase):
         self.assertEqual(sessao.proxies["https"], "http://proxy-2.example:8080")
 
     def test_teto_do_lote_e_100(self):
-        with patch.dict(os.environ, {"NFCE_PROXY_BATCH_SIZE": "500"}):
+        with patch.dict(os.environ, {"NFE55_PROXY_BATCH_SIZE": "500"}):
             self.assertEqual(worker._tamanho_lote(), 100)
-        with patch.dict(os.environ, {"NFCE_PROXY_BATCH_SIZE": "0"}):
+        with patch.dict(os.environ, {"NFE55_PROXY_BATCH_SIZE": "0"}):
             self.assertEqual(worker._tamanho_lote(), 1)
 
     def test_cursor_continua_depois_da_semente(self):
@@ -87,10 +88,10 @@ class ProxySaidaTest(unittest.TestCase):
     def test_webshare_pede_no_maximo_100(self):
         rotas = [OutboundRoute(f"outbound-{i}", f"http://10.0.0.{i}:8080") for i in range(1, 5)]
         with patch.dict(os.environ, {
-            "NFCE_PROXY_BATCH_SIZE": "250",
-            "NFCE_PROXY_PILOT_WEBSHARE_API_KEY": "chave-teste",
-            "NFCE_PROXY_PILOT_WEBSHARE_PLAN_ID": "plano",
-        }), patch("nfce_download_worker.webshare_pilot_routes", return_value=rotas) as lista:
+            "NFE55_PROXY_BATCH_SIZE": "250",
+            "NFE55_PROXY_WEBSHARE_API_KEY": "chave-teste",
+            "NFE55_PROXY_WEBSHARE_PLAN_ID": "plano",
+        }), patch("nfe55_saida_transport.rotas_webshare", return_value=rotas) as lista:
             recebidas = worker._rotas_proxy()
         lista.assert_called_once_with("chave-teste", "plano", 100)
         self.assertEqual(len(recebidas), 4)
@@ -98,8 +99,8 @@ class ProxySaidaTest(unittest.TestCase):
 
     def test_uma_rota_nao_ativa_o_lote(self):
         rota = [OutboundRoute("outbound-1", "http://10.0.0.1:8080")]
-        with patch.dict(os.environ, {"NFCE_PROXY_PILOT_WEBSHARE_API_KEY": "chave-teste"}), patch(
-            "nfce_download_worker.webshare_pilot_routes", return_value=rota,
+        with patch.dict(os.environ, {"NFE55_PROXY_WEBSHARE_API_KEY": "chave-teste"}), patch(
+            "nfe55_saida_transport.rotas_webshare", return_value=rota,
         ):
             recebidas = worker._rotas_proxy()
         self.assertEqual(len(recebidas), 1)
@@ -123,7 +124,7 @@ class ProxySaidaTest(unittest.TestCase):
             def finish_download_probe(self, probe, *, succeeded):
                 return None
 
-            def note_remote_limit(self, lane="download"):
+            def note_remote_limit(self):
                 raise AssertionError("sucesso não pode marcar limite")
 
         with patch.object(worker, "_baixar", side_effect=baixar), patch.object(worker, "_limitador", return_value=Limitador()):
@@ -155,10 +156,8 @@ class ProxySaidaTest(unittest.TestCase):
         self.assertEqual(sorted(avisos), ["a", "b", "c"])
 
     def test_limite_na_rota_nao_troca_o_ip(self):
-        from nfce_download_worker import OutboundTransportManager
-
         rota = OutboundRoute("outbound-1", "http://10.9.9.9:8080", "user", "secret")
-        gestor = OutboundTransportManager([rota], enabled=True)
+        gestor = saida_rede.GestorSaida([rota], enabled=True)
         respostas = [
             unittest.mock.Mock(status_code=429, ok=False, text="limite"),
             unittest.mock.Mock(status_code=429, ok=False, text="limite"),
@@ -180,7 +179,7 @@ class ProxySaidaTest(unittest.TestCase):
                 if succeeded:
                     raise AssertionError("429 não é sucesso")
 
-            def note_remote_limit(self, lane="download"):
+            def note_remote_limit(self):
                 self.limite += 1
 
         limitador = Limitador()

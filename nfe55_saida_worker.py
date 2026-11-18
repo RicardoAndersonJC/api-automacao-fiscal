@@ -32,6 +32,7 @@ from nfe55_saida_discovery import (
     proximo_aamm,
     xml_modelo_55,
 )
+import nfe55_saida_transport as saida_rede
 
 URL_CONSULTA = "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx"
 URL_PORTAL = "https://dfe-portal.svrs.rs.gov.br/NFeSSL/DownloadXMLDFe"
@@ -105,10 +106,8 @@ def _pfx(dados: bytes, senha: str, pasta: Path) -> tuple[Path, Path]:
 
 
 def _transporte():
-    """Mesma saída da NFC-e. Limite da SVRS não troca o proxy."""
-    from nfce_download_worker import shared_outbound_transport
-
-    return shared_outbound_transport()
+    """Saída própria da NF-e de saída. Limite da SVRS não troca o proxy."""
+    return saida_rede.transporte_compartilhado()
 
 
 def _abrir_sessao(cert_path: Path, key_path: Path) -> requests.Session:
@@ -120,9 +119,7 @@ def _abrir_sessao(cert_path: Path, key_path: Path) -> requests.Session:
 
 
 def _esperar_limite() -> None:
-    from nfce_download_worker import sefaz_cooldown_seconds
-
-    time.sleep(sefaz_cooldown_seconds())
+    time.sleep(saida_rede.cooldown_segundos())
 
 
 def _enviar_rota(sessao: requests.Session, transporte: Any, metodo: str, url: str, **kwargs: Any) -> requests.Response:
@@ -193,41 +190,12 @@ def _consultar(sessao: requests.Session, cfg: dict, nnf: int, aamm: str) -> str:
 
 
 def _tamanho_lote() -> int:
-    try:
-        tamanho = int(os.getenv("NFCE_PROXY_BATCH_SIZE", "100"))
-    except (TypeError, ValueError):
-        tamanho = 100
-    return max(1, min(100, tamanho))
+    return saida_rede.tamanho_lote()
 
 
 def _rotas_proxy() -> list[Any]:
-    """Mesmo pool da NFC-e. Sem duas rotas, o download segue um a um."""
-    from nfce_download_worker import OutboundRoute, webshare_pilot_routes
-
-    tamanho = _tamanho_lote()
-    chave = os.getenv("NFCE_PROXY_PILOT_WEBSHARE_API_KEY", "").strip()
-    rotas: list[Any] = []
-    if chave:
-        rotas = webshare_pilot_routes(
-            chave,
-            os.getenv("NFCE_PROXY_PILOT_WEBSHARE_PLAN_ID", "").strip(),
-            tamanho,
-        )
-    if rotas:
-        return rotas[:tamanho]
-    vistas: set[str] = set()
-    for slot in range(1, tamanho + 1):
-        sufixo = "" if slot == 1 else f"_{slot}"
-        url = os.getenv(f"NFCE_PROXY_PILOT_URL{sufixo}", "").strip()
-        if not url or url in vistas:
-            continue
-        vistas.add(url)
-        usuario = os.getenv(f"NFCE_PROXY_PILOT_USERNAME{sufixo}") or os.getenv("NFCE_PROXY_PILOT_USERNAME", "")
-        senha = os.getenv(f"NFCE_PROXY_PILOT_PASSWORD{sufixo}") or os.getenv("NFCE_PROXY_PILOT_PASSWORD", "")
-        rotas.append(OutboundRoute(f"outbound-{slot}", url, usuario, senha))
-        if len(rotas) == tamanho:
-            break
-    return rotas[:tamanho]
+    """NFE55_PROXY_* ou, se vazias, os mesmos proxies da NFC-e. Sem duas rotas, o download segue um a um."""
+    return saida_rede.rotas_configuradas()
 
 
 def _lote_ativo(rotas: list[Any]) -> bool:
@@ -260,9 +228,7 @@ def _faixa_proxy(transporte: Any) -> str:
 
 
 def _limitador() -> Any:
-    from nfce_download_worker import clamp_download_interval, shared_rate_limiter
-
-    return shared_rate_limiter(0.1, clamp_download_interval(60))
+    return saida_rede.limitador_compartilhado()
 
 
 def _abrir_sessao_rota(cert_path: Path, key_path: Path, transporte: Any) -> requests.Session:
@@ -331,7 +297,7 @@ def _baixar_na_faixa(
         return xml, ""
     except requests.HTTPError as exc:
         if _categoria_download(exc) == "limite":
-            limitador.note_remote_limit(faixa)
+            limitador.note_remote_limit()
         return "", _categoria_download(exc)
     except (requests.RequestException, RuntimeError) as exc:
         return "", _categoria_download(exc)
@@ -348,13 +314,11 @@ def _descarregar_lote(
     ao_concluir: Any = None,
 ) -> list[tuple[str, str, str]]:
     """Uma chave por IP. O intervalo de 1 min vale ao reutilizar a mesma faixa."""
-    from nfce_download_worker import OutboundTransportManager
-
     quantidade = min(len(chaves), len(rotas), _tamanho_lote())
     if quantidade < 1:
         return []
     pedaco = chaves[:quantidade]
-    gestores = [OutboundTransportManager([rota], enabled=True) for rota in rotas[:quantidade]]
+    gestores = [saida_rede.GestorSaida([rota], enabled=True) for rota in rotas[:quantidade]]
     limitador = _limitador()
     resultados: dict[int, tuple[str, str, str]] = {}
 
@@ -482,7 +446,7 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
 
             if lote:
                 aviso = f"Lote de {len(rotas)} proxies pronto"
-            elif os.getenv("NFCE_PROXY_PILOT_WEBSHARE_API_KEY", "").strip() or os.getenv("NFCE_PROXY_PILOT_URL", "").strip():
+            elif saida_rede.proxy_configurado():
                 aviso = f"Lote de proxies indisponível ({len(rotas)} rota(s)); download 1 a 1"
             else:
                 aviso = ""
