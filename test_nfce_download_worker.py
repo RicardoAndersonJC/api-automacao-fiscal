@@ -1070,6 +1070,37 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.assertEqual(len({route.proxy_url for route in routes}), 10)
         self.assertEqual(get.call_args.kwargs["params"]["mode"], "direct")
         self.assertFalse(get.call_args.kwargs["allow_redirects"])
+        self.assertEqual(get.call_args.kwargs["timeout"], (3, worker.WEBSHARE_READ_TIMEOUT))
+        self.assertGreaterEqual(worker.WEBSHARE_READ_TIMEOUT, 20)
+
+    def test_webshare_timeout_reuses_last_complete_list(self):
+        worker.reset_webshare_routes_cache()
+        self.addCleanup(worker.reset_webshare_routes_cache)
+        rows = [
+            dict(proxy_address=f"192.0.2.{index}", port=8080, valid=True, username="u", password="p")
+            for index in range(1, 6)
+        ]
+        now = [1000.0]
+        with patch.object(worker.requests, "get") as get:
+            get.return_value.status_code = 200
+            get.return_value.json.return_value = {"results": rows, "next": None}
+            fresh = worker.webshare_pilot_routes("k", "plan", limit=5, clock=lambda: now[0])
+        self.assertEqual(len(fresh), 5)
+        now[0] += 60
+        with patch.object(worker.requests, "get", side_effect=requests.ReadTimeout()):
+            cached = worker.webshare_pilot_routes("k", "plan", limit=5, clock=lambda: now[0])
+        self.assertEqual([r.proxy_url for r in cached], [r.proxy_url for r in fresh])
+        now[0] += worker.WEBSHARE_CACHE_TTL_SECONDS
+        with patch.object(worker.requests, "get", side_effect=requests.ReadTimeout()):
+            expired = worker.webshare_pilot_routes("k", "plan", limit=5, clock=lambda: now[0])
+        self.assertEqual(expired, [], "an expired cache is not reused")
+
+    def test_webshare_error_without_cache_returns_partial_list(self):
+        worker.reset_webshare_routes_cache()
+        self.addCleanup(worker.reset_webshare_routes_cache)
+        with patch.object(worker.requests, "get") as get:
+            get.return_value.status_code = 503
+            self.assertEqual(worker.webshare_pilot_routes("k", "", limit=5), [])
 
     def test_six_saved_then_timeout_keeps_cursor_and_requests_resume(self):
         responses = [("100", "Autorizada", str(index) * 44) for index in range(1, 7)] + [("", "timeout", "")]

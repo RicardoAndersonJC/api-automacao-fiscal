@@ -985,7 +985,41 @@ _shared_transport: OutboundTransportManager | None = None
 _shared_transport_guard = threading.Lock()
 
 
-def webshare_pilot_routes(api_key: str, plan_id: str, limit: int = 100) -> list[OutboundRoute]:
+# A API da Webshare chegou a levar ~5 s só para responder 401 (18/11); 5 s de leitura derrubava a lista.
+WEBSHARE_READ_TIMEOUT = float(os.getenv("NFCE_WEBSHARE_READ_TIMEOUT", "20"))
+# Última lista completa: usada quando a Webshare fica lenta, em vez de cair nos 2 proxies fixos.
+WEBSHARE_CACHE_TTL_SECONDS = float(os.getenv("NFCE_WEBSHARE_CACHE_TTL_SECONDS", str(6 * 3600)))
+_webshare_cache_lock = threading.Lock()
+_webshare_cache: dict[str, tuple[float, list[OutboundRoute]]] = {}
+
+
+def reset_webshare_routes_cache() -> None:
+    with _webshare_cache_lock:
+        _webshare_cache.clear()
+
+
+def webshare_pilot_routes(api_key: str, plan_id: str, limit: int = 100, clock=None) -> list[OutboundRoute]:
+    """Lista da Webshare; se a chamada falhar, reaproveita a última lista completa ainda válida."""
+    now = float((clock or time.monotonic)())
+    routes, complete = _fetch_webshare_routes(api_key, plan_id, limit)
+    cache_key = plan_id or "-"
+    with _webshare_cache_lock:
+        if complete and routes:
+            _webshare_cache[cache_key] = (now, list(routes))
+            return routes
+        cached = _webshare_cache.get(cache_key)
+    if cached and now - cached[0] < WEBSHARE_CACHE_TTL_SECONDS and len(cached[1]) > len(routes):
+        _logger.warning(json.dumps({
+            "event": "nfce_webshare_list_cached",
+            "routes_fetched": len(routes),
+            "routes_cached": len(cached[1][:limit]),
+            "cache_age_s": int(now - cached[0]),
+        }))
+        return list(cached[1][:limit])
+    return routes
+
+
+def _fetch_webshare_routes(api_key: str, plan_id: str, limit: int) -> tuple[list[OutboundRoute], bool]:
     routes: list[OutboundRoute] = []
     seen_addresses: set[str] = set()
     try:
@@ -996,7 +1030,7 @@ def webshare_pilot_routes(api_key: str, plan_id: str, limit: int = 100) -> list[
             response = requests.get(
                 "https://proxy.webshare.io/api/v2/proxy/list/",
                 params=params, headers={"Authorization": f"Token {api_key}"},
-                timeout=(3, 5), allow_redirects=False,
+                timeout=(3, WEBSHARE_READ_TIMEOUT), allow_redirects=False,
             )
             if response.status_code != 200:
                 _logger.warning(json.dumps({
@@ -1005,7 +1039,7 @@ def webshare_pilot_routes(api_key: str, plan_id: str, limit: int = 100) -> list[
                     "page": page,
                     "plan_set": bool(plan_id),
                 }))
-                return routes
+                return routes, False
             data = response.json()
             for proxy in data["results"]:
                 try:
@@ -1021,7 +1055,7 @@ def webshare_pilot_routes(api_key: str, plan_id: str, limit: int = 100) -> list[
                     str(proxy["username"]), str(proxy["password"]),
                 ))
                 if len(routes) == limit:
-                    return routes
+                    return routes, True
             if not data.get("next"):
                 break
     except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
@@ -1030,8 +1064,8 @@ def webshare_pilot_routes(api_key: str, plan_id: str, limit: int = 100) -> list[
             "error": type(exc).__name__,
             "routes_so_far": len(routes),
         }))
-        return routes
-    return routes
+        return routes, False
+    return routes, True
 
 
 def shared_outbound_transport() -> OutboundTransportManager:
