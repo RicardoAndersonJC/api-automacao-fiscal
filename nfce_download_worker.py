@@ -64,13 +64,16 @@ SVRS_DOWNLOAD_GET_URL = "https://dfe-portal.svrs.rs.gov.br/NFCESSL/DownloadXMLDF
 SVRS_DOWNLOAD_POST_URL = "https://dfe-portal.svrs.rs.gov.br/BpeSSL/DownloadXmlDfe"
 SOAP_ACTION = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF"
 REQUEST_TIMEOUT = int(os.getenv("NFCE_REQUEST_TIMEOUT", "45"))
+# Download no portal: a 1ª tentativa de cada nota chegou a 37–61 s em 18/11 e caía no limite de 45 s.
+# A consulta SOAP continua em REQUEST_TIMEOUT.
+DOWNLOAD_READ_TIMEOUT = int(os.getenv("NFCE_DOWNLOAD_READ_TIMEOUT", "90"))
 # Conexão morta de proxy não pode segurar o lote até a Edge encerrar a empresa.
 PORTAL_CONNECT_TIMEOUT = 15
 PARALLEL_HEARTBEAT_SECONDS = 20
 # Uma onda de 100 IPs termina antes dos 8 min em que a Edge declara o worker morto.
 PARALLEL_WAVE_DEADLINE_SECONDS = 6 * 60
 # Depois do prazo da onda, quem já está no HTTP termina (GET+POST) e o XML é aproveitado.
-PARALLEL_IN_FLIGHT_GRACE_SECONDS = 2 * (PORTAL_CONNECT_TIMEOUT + REQUEST_TIMEOUT) + 10
+PARALLEL_IN_FLIGHT_GRACE_SECONDS = 2 * (PORTAL_CONNECT_TIMEOUT + DOWNLOAD_READ_TIMEOUT) + 10
 # Tarefa interrompida antes de chamar a SVRS: não é falha, a chave continua na fila.
 DEFERRED_KIND = "deferred"
 JOB_TTL_SECONDS = int(os.getenv("NFCE_JOB_TTL_SECONDS", "21600"))
@@ -1867,7 +1870,7 @@ def _download(session: requests.Session, key: str,
         SVRS_DOWNLOAD_GET_URL,
         params={"OrigemSite": "2", "Ambiente": "1", "ChaveAcessoDfe": key},
         headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html,application/xml;q=0.9,*/*;q=0.8"},
-        timeout=(PORTAL_CONNECT_TIMEOUT, REQUEST_TIMEOUT),
+        timeout=(PORTAL_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT),
     )
     _log_remote_response(get_response, "portal_get", started, context)
     blocked = _portal_http_failure(get_response)
@@ -1893,7 +1896,7 @@ def _download(session: requests.Session, key: str,
             "Origin": "https://dfe-portal.svrs.rs.gov.br",
             "Referer": get_response.url,
         },
-        timeout=(PORTAL_CONNECT_TIMEOUT, REQUEST_TIMEOUT),
+        timeout=(PORTAL_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT),
     )
     _log_remote_response(post_response, "portal_post", started, context)
     blocked = _portal_http_failure(post_response)
@@ -2196,28 +2199,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         message=lote_msg,
                     )
 
-                    def notify_batch_wait(
-                        saved=pending_saved,
-                        failed=pending_failed,
-                        batch_n=pending_batch,
-                    ):
-                        message = (
-                            f"Aguardando intervalo de 1 min para reutilizar "
-                            f"o lote de {batch_n} IPs · {saved} salvas"
-                        )
-                        _update(job, message=message, downloaded=saved)
-                        _callback(
-                            job,
-                            "progress",
-                            consulted=0,
-                            found=0,
-                            downloaded=saved,
-                            pending_total=pending_total,
-                            pending_failed=failed,
-                            mode="pending_recovery",
-                            message=message,
-                        )
-
+                    # Sem aviso por thread: com até 100 notas esperando o intervalo, cada uma
+                    # mandava progresso a cada 30 s e disputava a CPU (0,15) com os downloads.
+                    # O on_heartbeat da onda já mantém a Edge informada.
                     stop_wave = threading.Event()
                     pilot_pool = ThreadPoolExecutor(max_workers=len(chunk))
                     try:
@@ -2231,7 +2215,6 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                                 limiter,
                                 run_id=job.external_run_id or "",
                                 empresa_id=job.empresa_id,
-                                notify_wait=notify_batch_wait,
                                 transport=route,
                                 circuit=circuit,
                                 lane=proxy_lane(route),

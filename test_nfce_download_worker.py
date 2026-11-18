@@ -1646,6 +1646,57 @@ class WaveBlockRecoveryTests(unittest.TestCase):
         self.assertTrue(completed["svrs_download_blocked"])
         self.assertEqual(completed["pending_failed"], 1)
 
+    def test_recovery_wave_threads_do_not_send_their_own_progress(self):
+        import os
+
+        seen_kwargs = []
+
+        def download(*args, **kwargs):
+            seen_kwargs.append(kwargs)
+            return args[3], "<nfeProc><NFe /></nfeProc>", "", "ok"
+
+        pending = [dict(aamm="2611", nnf=n, chave=f"{n:044d}") for n in (101, 102)]
+        env = {
+            "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+            "NFCE_PROXY_BATCH_SIZE": "2",
+            "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.12:8080",
+        }
+        with patch.dict(os.environ, env):
+            job, _callbacks, _consults = self.run_worker(
+                [], dict(pending_only=True, pending_items=pending), downloads=download,
+            )
+        self.assertEqual(job.status, "completed", job.error)
+        self.assertEqual(len(seen_kwargs), 2)
+        for kwargs in seen_kwargs:
+            self.assertNotIn("notify_wait", kwargs, "each thread must not post progress while waiting")
+            self.assertIsNotNone(kwargs.get("stop_event"))
+
+    def test_portal_download_uses_its_own_read_timeout(self):
+        self.assertGreaterEqual(worker.DOWNLOAD_READ_TIMEOUT, 90)
+        seen = []
+
+        class FakeResponse:
+            status_code = 200
+            text = "<html></html>"
+            url = worker.SVRS_DOWNLOAD_GET_URL
+            headers = {}
+            elapsed = None
+
+        class FakeSession:
+            def get(self, *args, **kwargs):
+                seen.append(kwargs["timeout"])
+                return FakeResponse()
+
+            def post(self, *args, **kwargs):
+                seen.append(kwargs["timeout"])
+                return FakeResponse()
+
+        with patch.object(worker, "_log_remote_response"):
+            worker._download(FakeSession(), "0" * 44)
+        expected = (worker.PORTAL_CONNECT_TIMEOUT, worker.DOWNLOAD_READ_TIMEOUT)
+        self.assertEqual(seen, [expected, expected])
+
     def test_partial_success_with_block_keeps_saved_xml(self):
         import os
 
