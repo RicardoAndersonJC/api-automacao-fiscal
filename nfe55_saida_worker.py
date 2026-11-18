@@ -251,6 +251,19 @@ def _categoria_download(exc: Exception) -> str:
     return "http"
 
 
+MOTIVO_DOWNLOAD = {
+    "proxy": "Falha no proxy ao baixar o XML desta chave.",
+    "timeout": "Tempo esgotado no portal ao baixar o XML desta chave.",
+    "limite": "Limite da SVRS (429) ao baixar o XML desta chave.",
+    "sem_xml": "O portal não devolveu o XML desta chave.",
+    "http": "Erro HTTP do portal ao baixar o XML desta chave.",
+}
+
+
+def _motivo_download(categoria: str) -> str:
+    return MOTIVO_DOWNLOAD.get(categoria, MOTIVO_DOWNLOAD["sem_xml"])
+
+
 def _baixar(cert_path: Path, key_path: Path, chave: str, transporte: Any = None) -> str:
     dono = _transporte() if transporte is None else transporte
     with _abrir_sessao_rota(cert_path, key_path, dono) as sessao:
@@ -338,6 +351,7 @@ def _descarregar_lote(
 
 def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, opcoes: dict[str, Any]) -> None:
     pasta = Path(tempfile.mkdtemp(prefix="nfe55_saida_"))
+    aamm, nnf, consultadas = "", 0, 0
     try:
         cert_path, key_path = _pfx(pfx, senha, pasta)
         cfg = cfg_da_chave(opcoes["chave"]) if opcoes.get("chave") else ler_xml_semente(semente)
@@ -401,12 +415,14 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                         _callback(run_id, token, "done", mensagem="Busca cancelada.", consultadas=consultadas, encontradas=len(encontradas))
                         return True
                     feitos = 0
+                    baixados_na_onda = 0
                     houve_limite = False
 
                     def ao_concluir(chave: str, xml: str, erro: str) -> None:
-                        nonlocal feitos, houve_limite, falhas
+                        nonlocal feitos, houve_limite, falhas, baixados_na_onda
                         feitos += 1
                         if xml:
+                            baixados_na_onda += 1
                             publicar(chave, xml)
                         else:
                             falhas += 1
@@ -414,7 +430,7 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                             _callback(
                                 run_id, token, "download_falhou", chave=chave,
                                 aamm=chave[2:6], nnf=int(chave[25:34]),
-                                erro="O portal não devolveu o XML desta chave.",
+                                erro=_motivo_download(erro),
                             )
                         _callback(
                             run_id, token, "progress",
@@ -426,6 +442,19 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                         cert_path, key_path, pedaco, rotas, avisar_espera if onda_inicio > 1 else None, ao_concluir,
                     )
                     onda_inicio = fim + 1
+                    if not baixados_na_onda and salvas:
+                        # Os mesmos IPs já baixaram nesta execução e agora nada voltou:
+                        # o portal está recusando. O restante já está nas lacunas.
+                        _callback(
+                            run_id, token, "done",
+                            mensagem=(
+                                "O portal recusou o lote seguinte nos mesmos IPs. "
+                                "As chaves restantes ficam para a próxima vez da saída."
+                            ),
+                            consultadas=consultadas, encontradas=len(encontradas), salvas=salvas,
+                            aamm=aamm, nnf=nnf, lacunas=lacunas[-200:],
+                        )
+                        return True
                     if houve_limite:
                         _callback(
                             run_id, token, "done",
@@ -529,7 +558,9 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
         )
     except Exception as exc:
         erro = "Falha de proxy no download." if isinstance(exc, requests.exceptions.ProxyError) else str(exc)[:500]
-        _callback(run_id, token, "error", erro=erro)
+        # Guarda onde a consulta parou; as chaves já localizadas estão nas lacunas.
+        cursor = {"aamm": aamm, "nnf": nnf, "consultadas": consultadas} if aamm and nnf else {}
+        _callback(run_id, token, "error", erro=erro, **cursor)
     finally:
         shutil.rmtree(pasta, ignore_errors=True)
         _vaga.release()
