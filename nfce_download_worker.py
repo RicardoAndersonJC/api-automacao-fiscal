@@ -2369,6 +2369,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     pending_saved=pending_saved,
                     pending_failed=pending_failed,
                     pause_for_svrs=paused_for_svrs,
+                    svrs_download_blocked=paused_for_svrs,
                     budget_reached=budget_reached and not paused_for_svrs,
                     include_cursor=False,
                     message=(
@@ -2873,6 +2874,9 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             archive.writestr("resumo.csv", summary.getvalue().encode("utf-8-sig"))
             for xml_path in xml_dir.glob("*.xml"):
                 archive.write(xml_path, arcname=f"XML/{xml_path.name}")
+        # Até aqui, a pausa só vem de onda de download barrada pela SVRS. Hold/ack da
+        # consulta (timeout, cStat inesperado) pausa, mas não é bloqueio do certificado.
+        svrs_download_blocked = paused_for_svrs
         if scan_reason in {"hold", "ack"}:
             paused_for_svrs = True
         completion_message = "Processamento concluído"
@@ -2924,6 +2928,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             missing_not_located=missing_not_located,
             missing_backlog=defer_discovery,
             pause_for_svrs=paused_for_svrs,
+            svrs_download_blocked=svrs_download_blocked,
             budget_reached=budget_reached,
             message=completion_message,
         )
