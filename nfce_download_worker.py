@@ -2109,6 +2109,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     chunk = pending_queue[processed:processed + min(pending_batch, room or pending_batch)]
                     proxy_failures = 0
                     limited_in_wave = 0
+                    blocked_in_wave = 0
                     lote_msg = (
                         f"Recuperando lote {processed + 1}-{processed + len(chunk)}/"
                         f"{pending_total} · {len(chunk)} proxy(s) em paralelo"
@@ -2170,8 +2171,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                             for offset, (pending, route) in enumerate(zip(chunk, routes))
                         }
 
-                        def on_done(future, futures=futures):
-                            nonlocal proxy_failures, limited_in_wave
+                        def on_done(future, futures=futures, stop_wave=stop_wave):
+                            nonlocal proxy_failures, limited_in_wave, blocked_in_wave
                             offset = futures[future]
                             try:
                                 item, xml, last_download_error, failure_kind = future.result()
@@ -2183,6 +2184,11 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                                 proxy_failures += 1
                             if not xml and failure_kind in {"rate_limit", "circuit_open"}:
                                 limited_in_wave += 1
+                            if not xml and failure_kind == "rate_limit":
+                                # O bloqueio é do certificado (como em 12/11): as chaves que
+                                # ainda não saíram não vão, e o lote não abre outra onda.
+                                blocked_in_wave += 1
+                                stop_wave.set()
                             apply_pending_result(
                                 processed + offset + 1,
                                 item,
@@ -2233,8 +2239,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     if proxy_failures == len(chunk):
                         pending_proxy_unavailable = True
                         break
-                    # Só pausa quando a SVRS barrou todos os IPs da onda.
-                    if limited_in_wave == len(chunk):
+                    # Primeiro "bloqueado" real da SVRS encerra a vez da empresa.
+                    if blocked_in_wave or limited_in_wave == len(chunk):
                         paused_for_svrs = True
             else:
                 for pending_index, pending in enumerate(pending_queue, 1):
@@ -2536,15 +2542,18 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
             saw_transport_failure = False
             saw_other_failure = False
             limited_in_wave = 0
+            blocked_in_wave = 0
 
             def note_batch_result(result: tuple) -> None:
-                nonlocal saw_transport_failure, saw_other_failure, limited_in_wave
+                nonlocal saw_transport_failure, saw_other_failure, limited_in_wave, blocked_in_wave
                 xml = result[1] if len(result) > 1 else None
                 kind = result[3] if len(result) > 3 else "timeout"
                 if xml:
                     return
                 if kind in {"rate_limit", "circuit_open"}:
                     limited_in_wave += 1
+                if kind == "rate_limit":
+                    blocked_in_wave += 1
                 if kind in {"proxy", "timeout"}:
                     saw_transport_failure = True
                 else:
@@ -2560,6 +2569,7 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                     break
                 batch = candidates[offset:offset + min(len(routes), room or len(routes))]
                 limited_in_wave = 0
+                blocked_in_wave = 0
                 stop_wave = threading.Event()
                 pilot_pool = ThreadPoolExecutor(max_workers=len(batch))
                 try:
@@ -2575,13 +2585,16 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                         for item, route in zip(batch, routes)
                     }
 
-                    def on_done(future, futures=futures):
+                    def on_done(future, futures=futures, stop_wave=stop_wave):
                         item = futures[future]
                         try:
                             result = future.result()
                         except Exception as exc:
                             result = (item, None, str(exc), "timeout")
                         note_batch_result(result)
+                        if not result[1] and len(result) > 3 and result[3] == "rate_limit":
+                            # Bloqueio do certificado: as chaves que ainda não saíram ficam na fila.
+                            stop_wave.set()
                         download_found(
                             item["AAMM"], item["nNF"], item["chave_real"],
                             result=result, pause_on_limit=False,
@@ -2611,8 +2624,8 @@ def run_job(job: Job, seed_bytes: bytes, pfx_bytes: bytes, password: str, option
                 finally:
                     stop_wave.set()
                     pilot_pool.shutdown(wait=True, cancel_futures=True)
-                # Só pausa quando a SVRS barrou todos os IPs da onda.
-                if limited_in_wave == len(batch) and not halt_reason:
+                # Primeiro "bloqueado" real da SVRS encerra a vez da empresa.
+                if (blocked_in_wave or limited_in_wave == len(batch)) and not halt_reason:
                     paused_for_svrs = True
                     halt_reason = "hold"
                 if (

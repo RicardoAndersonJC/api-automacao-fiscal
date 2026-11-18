@@ -878,6 +878,42 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.assertEqual(completed["pending_saved"], 4)
         self.assertFalse(completed["pause_for_svrs"])
 
+    def test_first_svrs_block_ends_the_company_turn_like_before(self):
+        import os
+
+        calls = []
+
+        def download(*args, **kwargs):
+            item = args[3]
+            calls.append(int(item["nNF"]))
+            if int(item["nNF"]) == 101:
+                return item, None, "Limite da SVRS: muitas consultas em sequência.", "rate_limit"
+            return item, "<nfeProc><NFe /></nfeProc>", "", "ok"
+
+        pendings = [
+            dict(aamm="2611", nnf=100 + index, chave=f"{index:044d}")
+            for index in range(1, 7)
+        ]
+        env = {
+            "NFCE_PROXY_BATCH_ALL_COMPANIES": "true",
+            "NFCE_PROXY_BATCH_SIZE": "2",
+            "NFCE_PROXY_PILOT_URL": "http://192.0.2.11:8080",
+            "NFCE_PROXY_PILOT_URL_2": "http://192.0.2.12:8080",
+        }
+        with patch.dict(os.environ, env):
+            job, callbacks, _consults = self.run_worker(
+                [],
+                dict(pending_only=True, pending_items=pendings),
+                downloads=download,
+            )
+        self.assertEqual(job.status, "completed", job.error)
+        # Só a primeira onda sai; a SVRS barrou uma chave e as outras 4 não são tentadas.
+        self.assertEqual(sorted(calls), [101, 102])
+        completed = [call.kwargs for call in callbacks if call.args[1] == "completed"][-1]
+        self.assertTrue(completed["pause_for_svrs"])
+        self.assertTrue(completed["svrs_download_blocked"])
+        self.assertEqual(completed["pending_saved"], 1)
+
     def test_xml_budget_stops_the_company_turn_before_the_svrs_limit(self):
         import os
 
