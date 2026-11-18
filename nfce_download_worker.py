@@ -1107,24 +1107,6 @@ def reset_shared_outbound_transport() -> None:
         _shared_transport = None
 
 
-def warm_webshare_routes(environ: dict[str, str] | None = None) -> threading.Thread | None:
-    """Carrega a lista da Webshare ao subir o processo, para o 1º lote não depender da API lenta."""
-    env = os.environ if environ is None else environ
-    key = env.get("NFCE_PROXY_PILOT_WEBSHARE_API_KEY", "").strip()
-    if not key or env.get("NFCE_WEBSHARE_WARMUP", "true").lower() == "false":
-        return None
-    try:
-        limit = max(1, min(100, int(env.get("NFCE_PROXY_BATCH_SIZE", "100"))))
-    except ValueError:
-        limit = 100
-    plan = env.get("NFCE_PROXY_PILOT_WEBSHARE_PLAN_ID", "").strip()
-    thread = threading.Thread(
-        target=lambda: webshare_pilot_routes(key, plan, limit),
-        name="nfce-webshare-warmup", daemon=True,
-    )
-    thread.start()
-    return thread
-
 
 def callback_backoff_seconds(attempt: int, jitter_seconds: float = 0) -> float:
     return (0.5 * (2 ** attempt)) + max(0.0, jitter_seconds)

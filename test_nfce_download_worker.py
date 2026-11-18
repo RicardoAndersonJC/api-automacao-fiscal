@@ -1115,13 +1115,11 @@ class MissingNotesRecoveryTests(unittest.TestCase):
         self.assertEqual(len(routes), 1)
         self.assertEqual(pauses, [worker.WEBSHARE_RETRY_PAUSE_SECONDS])
 
-    def test_webshare_warmup_only_with_key(self):
-        self.assertIsNone(worker.warm_webshare_routes({}))
-        self.assertIsNone(worker.warm_webshare_routes({"NFCE_PROXY_PILOT_WEBSHARE_API_KEY": "k", "NFCE_WEBSHARE_WARMUP": "false"}))
-        with patch.object(worker, "webshare_pilot_routes") as fetch:
-            thread = worker.warm_webshare_routes({"NFCE_PROXY_PILOT_WEBSHARE_API_KEY": "k", "NFCE_PROXY_BATCH_SIZE": "30"})
-            thread.join(timeout=5)
-        fetch.assert_called_once_with("k", "", 30)
+    def test_app_does_not_start_webshare_thread_on_import(self):
+        # Carregar a lista na subida travou o worker (WORKER TIMEOUT 5 min após o boot, 18/11).
+        source = open("app.py", encoding="utf-8").read()
+        self.assertNotIn("warm_webshare_routes", source)
+        self.assertFalse(hasattr(worker, "warm_webshare_routes"))
 
     def test_six_saved_then_timeout_keeps_cursor_and_requests_resume(self):
         responses = [("100", "Autorizada", str(index) * 44) for index in range(1, 7)] + [("", "timeout", "")]
