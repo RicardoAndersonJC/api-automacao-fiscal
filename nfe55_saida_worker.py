@@ -571,6 +571,11 @@ def _ritmo_do_certificado(cnpj: str) -> RitmoCertificado:
         return ritmo
 
 
+def _paralelo_por_certificado() -> int:
+    """Downloads simultâneos do mesmo certificado, cada um em um IP diferente (padrão 10)."""
+    return _inteiro_env("NFE55_PARALELO_POR_CERTIFICADO", 10, 1, 100)
+
+
 def _descarregar_em_ritmo(
     cert_path: Path,
     key_path: Path,
@@ -580,46 +585,96 @@ def _descarregar_em_ritmo(
     ao_concluir: Any = None,
     bloqueio: Bloqueio | None = None,
     avisar: Any = None,
+    paralelo: int | None = None,
 ) -> None:
-    """Um download por vez para o certificado, trocando de IP a cada tentativa.
+    """Blocos de até `paralelo` chaves do mesmo certificado, cada uma em um IP do rodízio.
 
-    Repete a mesma chave até 3 vezes (nota indisponível ou acesso negado não repetem).
-    Bloqueio com horário da SVRS encerra na hora. avisar(texto) devolve True para cancelar.
+    Entre um bloco e o seguinte vale o ritmo do certificado (55 s desde o último sucesso, +5/-5 s).
+    A chave recusada volta no bloco seguinte por outro IP, até 3 tentativas; nota indisponível ou
+    acesso negado não repetem. Bloqueio com horário da SVRS encerra na hora.
+    avisar(texto, posicao) devolve True para cancelar.
     """
     limitador = _limitador()
+    largura = max(1, min(paralelo or _paralelo_por_certificado(), len(rotas) or 1))
     proxima_rota = 0
-    for posicao, chave in enumerate(chaves, start=1):
-        espera = ritmo.restante()
+    tentativas: dict[str, int] = {}
+    pendentes = list(chaves)
+    concluidas = 0
+    bloco = 0
+
+    def gestor_seguinte() -> Any:
+        nonlocal proxima_rota
+        if not rotas:
+            return _transporte()
+        gestor = saida_rede.GestorSaida([rotas[proxima_rota % len(rotas)]], enabled=True)
+        proxima_rota += 1
+        return gestor
+
+    while pendentes:
+        espera = ritmo.restante() if bloco else 0.0
         if espera > 0:
-            if avisar and avisar(f"aguardando {int(round(espera))} s (ritmo do certificado {int(ritmo.intervalo)} s)", posicao):
+            if avisar and avisar(
+                f"aguardando {int(round(espera))} s (ritmo do certificado {int(ritmo.intervalo)} s, {largura} por bloco)",
+                concluidas + 1,
+            ):
                 return
             ritmo.dormir(espera)
-        xml, erro = "", ""
-        for tentativa in range(1, TENTATIVAS_POR_CHAVE + 1):
-            gestor = saida_rede.GestorSaida([rotas[proxima_rota % len(rotas)]], enabled=True) if rotas else _transporte()
-            proxima_rota += 1
-            xml, erro = _baixar_na_faixa(cert_path, key_path, chave, gestor, limitador, None, bloqueio)
+        # O primeiro bloco é a sonda: 1 chave só; com o certificado bloqueado, gasta 1 tentativa e não 10.
+        tamanho = 1 if bloco == 0 else largura
+        bloco += 1
+        atual, pendentes = pendentes[:tamanho], pendentes[tamanho:]
+        trabalhos = [(chave, gestor_seguinte()) for chave in atual]
+        resultados: dict[str, tuple[str, str]] = {}
+        if len(trabalhos) == 1:
+            chave, gestor = trabalhos[0]
+            resultados[chave] = _baixar_na_faixa(cert_path, key_path, chave, gestor, limitador, None, bloqueio)
+        else:
+            with ThreadPoolExecutor(max_workers=len(trabalhos), thread_name_prefix="nfe55-saida-cert") as pool:
+                futuros = {
+                    pool.submit(_baixar_na_faixa, cert_path, key_path, chave, gestor, limitador, None, bloqueio): chave
+                    for chave, gestor in trabalhos
+                }
+                for futuro in as_completed(futuros):
+                    resultados[futuros[futuro]] = futuro.result()
+        sucesso_de_primeira = False
+        houve_sucesso = False
+        houve_recusa = False
+        repetir: list[str] = []
+        parar = bool(bloqueio is not None and bloqueio.ate)
+        for chave in atual:
+            xml, erro = resultados[chave]
+            tentativas[chave] = tentativas.get(chave, 0) + 1
             if xml:
-                ritmo.sucesso(primeira=tentativa == 1)
-                break
-            if erro in {"indisponivel", "acesso"} or (bloqueio is not None and bloqueio.ate):
-                break
+                houve_sucesso = True
+                sucesso_de_primeira = sucesso_de_primeira or tentativas[chave] == 1
+            else:
+                houve_recusa = houve_recusa or erro not in {"indisponivel", "acesso"}
+                final = (
+                    parar
+                    or erro in {"indisponivel", "acesso"}
+                    or tentativas[chave] >= TENTATIVAS_POR_CHAVE
+                )
+                if not final:
+                    repetir.append(chave)
+                    continue
+            concluidas += 1
+            if ao_concluir:
+                ao_concluir(chave, xml, erro)
+        if houve_sucesso:
+            ritmo.sucesso(primeira=sucesso_de_primeira and not houve_recusa)
+        if houve_recusa:
             ritmo.recusa()
-            if tentativa < TENTATIVAS_POR_CHAVE:
-                repetir = ritmo.espera_repeticao()
-                if avisar and avisar(
-                    f"recusa ({erro}); repetindo em {int(round(repetir))} s, tentativa {tentativa + 1}/{TENTATIVAS_POR_CHAVE}",
-                    posicao,
-                ):
-                    return
-                ritmo.dormir(repetir)
-        if ao_concluir:
-            ao_concluir(chave, xml, erro)
-        if bloqueio is not None and bloqueio.ate:
+        if parar:
             return
-        if not xml and erro == "limite":
-            # Três recusas seguidas por limite: os IPs estão recusando; o resto fica para a próxima vez.
+        esgotadas_por_limite = [
+            chave for chave in atual
+            if not resultados[chave][0] and resultados[chave][1] == "limite" and tentativas[chave] >= TENTATIVAS_POR_CHAVE
+        ]
+        if esgotadas_por_limite and not houve_sucesso:
+            # Bloco inteiro recusado por limite na última tentativa: os IPs estão recusando.
             return
+        # As recusadas voltam na frente, por outro IP, no próximo bloco.
+        pendentes = repetir + pendentes
 
 
 def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, opcoes: dict[str, Any]) -> None:
@@ -690,7 +745,7 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                     del fila[:capacidade]
                     fim = onda_inicio + len(pedaco) - 1
                     mensagem = (
-                        f"{origem} lote {onda_inicio}-{fim} · um por vez, ritmo do certificado "
+                        f"{origem} lote {onda_inicio}-{fim} · {_paralelo_por_certificado()} por vez, ritmo do certificado "
                         f"{int(ritmo.intervalo)} s · {len(rotas)} IP(s) em rodízio"
                     )
                     if _callback(run_id, token, "progress", mensagem=mensagem, aamm=aamm, nnf=nnf, consultadas=consultadas, encontradas=len(encontradas)):

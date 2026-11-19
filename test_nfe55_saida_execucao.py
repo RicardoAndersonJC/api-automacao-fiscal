@@ -255,7 +255,7 @@ class RitmoTest(unittest.TestCase):
         ritmo.recusa()
         self.assertEqual(ritmo.espera_repeticao(), 5.0)
 
-    def baixar_em_ritmo(self, respostas, chaves, bloqueio=None):
+    def baixar_em_ritmo(self, respostas, chaves, bloqueio=None, paralelo=1):
         estado, clock, sleep = self.relogio()
         ritmo = worker.RitmoCertificado(55, 5, clock=clock, sleep=sleep)
         rotas = [Rota(f"r{i}", f"http://10.0.0.{i}:8080") for i in range(1, 4)]
@@ -273,6 +273,7 @@ class RitmoTest(unittest.TestCase):
             worker._descarregar_em_ritmo(
                 Path("c"), Path("k"), chaves, rotas, ritmo,
                 ao_concluir=lambda c, x, e: concluidas.append((c, bool(x), e)), bloqueio=bloqueio,
+                paralelo=paralelo,
             )
         return chamadas, concluidas
 
@@ -304,6 +305,52 @@ class RitmoTest(unittest.TestCase):
         )
         self.assertEqual([c for _t, c, _p in chamadas], ["a" * 44, "b" * 44])
         self.assertEqual([ok for _c, ok, _e in concluidas], [False, True])
+
+    def test_blocos_em_paralelo_por_ip_diferente(self):
+        estado, clock, sleep = self.relogio()
+        ritmo = worker.RitmoCertificado(55, 5, clock=clock, sleep=sleep)
+        rotas = [Rota(f"r{i}", f"http://10.0.0.{i}:8080") for i in range(1, 11)]
+        chamadas = []
+        trava = __import__("threading").Lock()
+
+        def baixar(cert, key, ch, transporte, limitador, avisar=None, bloqueio=None):
+            with trava:
+                chamadas.append((estado["t"], ch, transporte.current().proxy_url))
+            return "<x/>", ""
+
+        chaves = [f"{n:044d}" for n in range(12)]
+        concluidas = []
+        with patch.object(worker, "_baixar_na_faixa", side_effect=baixar):
+            worker._descarregar_em_ritmo(Path("c"), Path("k"), chaves, rotas, ritmo,
+                                         ao_concluir=lambda c, x, e: concluidas.append(c), paralelo=5)
+        tempos = sorted({t for t, _c, _p in chamadas})
+        # sonda de 1, depois blocos de 5, 5 e 1; após 3 blocos com sucesso de primeira o ritmo cai 5 s
+        self.assertEqual(tempos, [0.0, 55.0, 110.0, 160.0])
+        self.assertEqual(sorted(concluidas), chaves)
+        self.assertEqual(len([1 for t, _c, _p in chamadas if t == 0.0]), 1)
+        segundo_bloco = [p for t, _c, p in chamadas if t == 55.0]
+        self.assertEqual(len(set(segundo_bloco)), 5)
+
+    def test_recusada_volta_no_bloco_seguinte_por_outro_ip(self):
+        estado, clock, sleep = self.relogio()
+        ritmo = worker.RitmoCertificado(55, 5, clock=clock, sleep=sleep)
+        rotas = [Rota(f"r{i}", f"http://10.0.0.{i}:8080") for i in range(1, 5)]
+        vistos = {}
+
+        def baixar(cert, key, ch, transporte, limitador, avisar=None, bloqueio=None):
+            vistos.setdefault(ch, []).append(transporte.current().proxy_url)
+            if ch == "a" * 44 and len(vistos[ch]) == 1:
+                return "", "limite"
+            return "<x/>", ""
+
+        concluidas = []
+        with patch.object(worker, "_baixar_na_faixa", side_effect=baixar):
+            worker._descarregar_em_ritmo(Path("c"), Path("k"), ["a" * 44, "b" * 44], rotas, ritmo,
+                                         ao_concluir=lambda c, x, e: concluidas.append((c, bool(x))), paralelo=2)
+        self.assertEqual(len(vistos["a" * 44]), 2)
+        self.assertNotEqual(vistos["a" * 44][0], vistos["a" * 44][1])
+        self.assertEqual(sorted(concluidas), [("a" * 44, True), ("b" * 44, True)])
+        self.assertEqual(ritmo.intervalo, 60.0)  # houve recusa: +5 s
 
 
 if __name__ == "__main__":
