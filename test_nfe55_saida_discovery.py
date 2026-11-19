@@ -6,6 +6,7 @@ from nfe55_saida_discovery import (
     cfg_da_chave,
     chave_artificial,
     chaves_para_recuperar,
+    numeros_sem_chave,
     extrair_xml_portal,
     interpretar_consulta,
     ler_xml_semente,
@@ -102,11 +103,17 @@ class Nfe55DiscoveryTest(unittest.TestCase):
             "cUF": "27", "AAMM": "2609", "CNPJ": "12345678000199",
             "modelo": "55", "serie": "001", "tpEmis": "1",
         }
-        chaves = chaves_para_recuperar(cfg, [
-            {"aamm": "2609", "nnf": 109457, "ultimo_erro": "Chave localizada; XML aguardando download"},
+        base = chave_artificial(cfg, 109457, "2609")[:35] + "73918264"
+        real = base + modulo11_dv(base)
+        pendencias = [
+            {"aamm": "2609", "nnf": 109457, "chave": real, "ultimo_erro": "Chave localizada; XML aguardando download"},
             {"aamm": "2609", "nnf": 109458, "ultimo_erro": "Numeração ainda não localizada na consulta"},
-        ])
-        self.assertEqual(chaves, [chave_artificial(cfg, 109457, "2609")])
+            {"aamm": "2609", "nnf": 109460, "ultimo_erro": "O portal não devolveu o XML desta chave."},
+            {"aamm": "2609", "nnf": 109461, "chave": "1" * 44, "ultimo_erro": "O portal não devolveu o XML desta chave."},
+        ]
+        self.assertEqual(chaves_para_recuperar(cfg, pendencias), [real])
+        self.assertNotIn(chave_artificial(cfg, 109460, "2609"), chaves_para_recuperar(cfg, pendencias))
+        self.assertEqual(numeros_sem_chave(cfg, pendencias), [("2609", 109460), ("2609", 109461)])
         self.assertEqual(
             avancar_sobre_recuperadas("2609", 109457, {("2609", 109457), ("2609", 109458)}),
             ("2609", 109459),

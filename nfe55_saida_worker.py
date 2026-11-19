@@ -25,6 +25,7 @@ from nfe55_saida_discovery import (
     cfg_da_chave,
     chave_artificial,
     chaves_para_recuperar,
+    numeros_sem_chave,
     extrair_xml_portal,
     interpretar_consulta,
     ler_xml_semente,
@@ -216,6 +217,15 @@ def _ponto_de_partida(cfg: dict[str, Any], opcoes: dict[str, Any]) -> tuple[str,
     return aamm, semente + 1
 
 
+def _ondas_por_execucao() -> int:
+    """Os mesmos IPs são recusados no lote seguinte; por padrão, uma onda por execução."""
+    try:
+        valor = int(os.environ.get("NFE55_ONDAS_POR_EXECUCAO") or 1)
+    except ValueError:
+        valor = 1
+    return max(1, min(valor, 10))
+
+
 def _dispara_lote(pendentes: int, rotas: int) -> bool:
     if rotas < 2:
         return False
@@ -352,6 +362,7 @@ def _descarregar_lote(
 def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, opcoes: dict[str, Any]) -> None:
     pasta = Path(tempfile.mkdtemp(prefix="nfe55_saida_"))
     aamm, nnf, consultadas = "", 0, 0
+    lacunas: list[dict[str, Any]] = []
     try:
         cert_path, key_path = _pfx(pfx, senha, pasta)
         cfg = cfg_da_chave(opcoes["chave"]) if opcoes.get("chave") else ler_xml_semente(semente)
@@ -376,11 +387,12 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
             consecutivos = 0
             consultadas = 0
             encontradas: list[str] = []
-            lacunas: list[dict[str, Any]] = []
             fila: list[str] = []
             salvas = 0
             falhas = 0
             onda_inicio = 1
+            ondas = 0
+            downloads_parados = ""
             limite = min(int(opcoes.get("max_numeracoes") or 300), MAX_NUMEROS)
             parada = max(1, min(int(opcoes.get("stop_217") or 15), 100))
 
@@ -399,8 +411,11 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                 salvas += 1
 
             def esvaziar(final: bool = False, origem: str = "Baixando") -> bool:
-                nonlocal onda_inicio, falhas
+                nonlocal onda_inicio, falhas, ondas, downloads_parados
                 if not lote:
+                    return False
+                if downloads_parados:
+                    fila.clear()
                     return False
                 while fila:
                     capacidade = min(_tamanho_lote(), len(rotas))
@@ -442,33 +457,34 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                         cert_path, key_path, pedaco, rotas, avisar_espera if onda_inicio > 1 else None, ao_concluir,
                     )
                     onda_inicio = fim + 1
-                    if not baixados_na_onda and salvas:
-                        # Os mesmos IPs já baixaram nesta execução e agora nada voltou:
-                        # o portal está recusando. O restante já está nas lacunas.
-                        _callback(
-                            run_id, token, "done",
-                            mensagem=(
-                                "O portal recusou o lote seguinte nos mesmos IPs. "
-                                "As chaves restantes ficam para a próxima vez da saída."
-                            ),
-                            consultadas=consultadas, encontradas=len(encontradas), salvas=salvas,
-                            aamm=aamm, nnf=nnf, lacunas=lacunas[-200:],
-                        )
-                        return True
+                    ondas += 1
                     if houve_limite:
-                        _callback(
-                            run_id, token, "done",
-                            mensagem="Limite da SVRS no download. A busca para neste ponto.",
-                            consultadas=consultadas, encontradas=len(encontradas), salvas=salvas,
-                            aamm=aamm, nnf=nnf, lacunas=lacunas[-200:],
-                        )
-                        return True
+                        downloads_parados = "Limite da SVRS (429) no download."
+                    elif not baixados_na_onda:
+                        downloads_parados = "O portal não devolveu XML neste lote."
+                    elif ondas >= _ondas_por_execucao():
+                        downloads_parados = "Lote de download desta execução concluído."
+                    if downloads_parados:
+                        # As chaves que ficaram já estão nas lacunas com a chave real.
+                        fila.clear()
+                        break
                 return False
 
             def guardar(chave: str, origem: str = "Baixando") -> bool:
+                nonlocal downloads_parados, falhas
+                if downloads_parados:
+                    return False
                 if not lote:
                     time.sleep(60)
-                    publicar(chave, _baixar(cert_path, key_path, chave))
+                    try:
+                        publicar(chave, _baixar(cert_path, key_path, chave))
+                    except (requests.RequestException, RuntimeError) as exc:
+                        falhas += 1
+                        downloads_parados = _motivo_download(_categoria_download(exc))
+                        _callback(
+                            run_id, token, "download_falhou", chave=chave,
+                            aamm=chave[2:6], nnf=int(chave[25:34]), erro=downloads_parados,
+                        )
                     return False
                 fila.append(chave)
                 return esvaziar(False, origem)
@@ -483,6 +499,22 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                 _callback(run_id, token, "done", mensagem="Busca cancelada.", consultadas=0, encontradas=0)
                 return
             chaves_faltantes = chaves_para_recuperar(cfg, opcoes.get("lacunas_abertas"))
+            vaga_recuperacao = max(1, min(_tamanho_lote(), len(rotas))) if lote else 1
+            for aamm_antigo, nnf_antigo in numeros_sem_chave(cfg, opcoes.get("lacunas_abertas")):
+                if len(chaves_faltantes) >= vaga_recuperacao:
+                    break
+                # Pendência antiga sem chave real: a consulta devolve a chave verdadeira.
+                _codigo, _motivo, real = interpretar_consulta(
+                    _consultar(sessao, cfg, nnf_antigo, aamm_antigo), cfg, nnf_antigo, aamm_antigo,
+                )
+                if real and real not in chaves_faltantes:
+                    chaves_faltantes.append(real)
+                    _callback(
+                        run_id, token, "descoberta", chave=real, aamm=aamm_antigo, nnf=nnf_antigo,
+                        erro="Chave localizada; XML aguardando download",
+                    )
+                time.sleep(0.7)
+            chaves_faltantes = chaves_faltantes[:vaga_recuperacao]
             if chaves_faltantes:
                 if _callback(run_id, token, "progress", mensagem=f"Recuperando {len(chaves_faltantes)} nota(s) faltante(s) antes das novas", aamm=aamm, nnf=nnf, consultadas=0, encontradas=len(chaves_faltantes)):
                     _callback(run_id, token, "done", mensagem="Busca cancelada.", consultadas=0, encontradas=len(chaves_faltantes))
@@ -529,8 +561,13 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                         nnf = int(recuperada[25:34]) + 1
                         consecutivos = 0
                         continue
-                    lacunas.append({"aamm": aamm, "nnf": nnf, "erro": "Numeração ainda não localizada na consulta"})
-                    _callback(run_id, token, "descoberta", aamm=aamm, nnf=nnf, erro="Numeração ainda não localizada na consulta")
+                    # Fim da numeração: os números vazios do fim não são lacunas e o
+                    # cursor volta ao primeiro deles, para a próxima volta reconsultar.
+                    lacunas[:] = [
+                        item for item in lacunas
+                        if not (item["aamm"] == aamm and item["nnf"] >= inicio)
+                    ]
+                    nnf = inicio
                     break
                 aamm, nnf, consecutivos = passo.aamm, passo.nnf, passo.consecutivos_217
                 if passo.encontrada:
@@ -544,13 +581,15 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                         return
                 elif passo.lacuna:
                     lacunas.append({"aamm": aamm, "nnf": nnf - 1, "erro": "Numeração ainda não localizada na consulta"})
-                    _callback(run_id, token, "descoberta", aamm=aamm, nnf=nnf - 1, erro="Numeração ainda não localizada na consulta")
                 time.sleep(0.7)
             if esvaziar(True):
                 return
-        mensagem = "Busca de NF-e de saída concluída."
+        mensagem = f"Busca de NF-e de saída concluída. {salvas} XML(s) salvos."
         if falhas:
             mensagem += f" {falhas} download(s) ficaram sem XML."
+        if downloads_parados:
+            pendentes = max(0, len(encontradas) - salvas - falhas)
+            mensagem += f" {downloads_parados} {pendentes} chave(s) guardadas para a próxima vez."
         _callback(
             run_id, token, "done", mensagem=mensagem,
             consultadas=consultadas, encontradas=len(encontradas), salvas=salvas,
@@ -559,7 +598,7 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
     except Exception as exc:
         erro = "Falha de proxy no download." if isinstance(exc, requests.exceptions.ProxyError) else str(exc)[:500]
         # Guarda onde a consulta parou; as chaves já localizadas estão nas lacunas.
-        cursor = {"aamm": aamm, "nnf": nnf, "consultadas": consultadas} if aamm and nnf else {}
+        cursor = {"aamm": aamm, "nnf": nnf, "consultadas": consultadas, "lacunas": lacunas[-200:]} if aamm and nnf else {}
         _callback(run_id, token, "error", erro=erro, **cursor)
     finally:
         shutil.rmtree(pasta, ignore_errors=True)

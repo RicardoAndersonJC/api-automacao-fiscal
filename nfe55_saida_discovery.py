@@ -229,7 +229,8 @@ def faltante_tem_xml(erro: str) -> bool:
     return "localizada" in texto or "aguardando" in texto or "não devolveu" in texto or "nao devolveu" in texto
 
 
-def chaves_para_recuperar(cfg: dict, bruto: object) -> list[str]:
+def _itens_pendentes(cfg: dict, bruto: object) -> list[tuple[str, int, str]]:
+    """Pendências com XML a baixar: (aamm, nNF, chave real ou "")."""
     if isinstance(bruto, str):
         try:
             itens = json.loads(bruto or "[]")
@@ -239,8 +240,7 @@ def chaves_para_recuperar(cfg: dict, bruto: object) -> list[str]:
         itens = bruto
     else:
         return []
-    chaves: list[str] = []
-    vistas: set[str] = set()
+    saida: list[tuple[str, int, str]] = []
     for item in itens:
         if not isinstance(item, dict) or not faltante_tem_xml(str(item.get("ultimo_erro") or "")):
             continue
@@ -251,11 +251,29 @@ def chaves_para_recuperar(cfg: dict, bruto: object) -> list[str]:
             continue
         if len(aamm) != 4 or nnf <= 0:
             continue
-        chave = chave_artificial(cfg, nnf, aamm)
-        if chave not in vistas:
-            vistas.add(chave)
+        chave = somente_digitos(str(item.get("chave") or ""))
+        if not chave_corresponde(chave, cfg, nnf, aamm, aceitar_mes_diferente=True):
+            chave = ""
+        saida.append((aamm, nnf, chave))
+    return saida
+
+
+def chaves_para_recuperar(cfg: dict, bruto: object) -> list[str]:
+    """Só chaves reais. Uma chave montada com cNF fictício o portal não encontra."""
+    chaves: list[str] = []
+    for _aamm, _nnf, chave in _itens_pendentes(cfg, bruto):
+        if chave and chave not in chaves:
             chaves.append(chave)
     return chaves
+
+
+def numeros_sem_chave(cfg: dict, bruto: object) -> list[tuple[str, int]]:
+    """Pendências antigas sem chave real: precisam de nova consulta antes do download."""
+    numeros: list[tuple[str, int]] = []
+    for aamm, nnf, chave in _itens_pendentes(cfg, bruto):
+        if not chave and (aamm, nnf) not in numeros:
+            numeros.append((aamm, nnf))
+    return numeros
 
 
 def avancar_sobre_recuperadas(aamm: str, nnf: int, notas: set[tuple[str, int]]) -> tuple[str, int]:
