@@ -119,5 +119,32 @@ class ExecucaoTest(unittest.TestCase):
         self.assertIn("timed out", dados["erro"])
 
 
+class PaginaPortalTest(unittest.TestCase):
+    def test_classifica_pagina_sem_xml(self):
+        self.assertEqual(worker.classificar_pagina(200, "", "<p>Muitas consultas. Tente novamente mais tarde</p>")[0], "limite")
+        self.assertEqual(worker.classificar_pagina(200, "", "<div>NF-e inexistente na base</div>")[0], "indisponivel")
+        self.assertEqual(worker.classificar_pagina(200, "https://x/Erro/Forbidden", "")[0], "acesso")
+        self.assertEqual(worker.classificar_pagina(200, "", "<html>ok</html>")[0], "sem_xml")
+        self.assertIn("indisponível", worker._motivo_download("indisponivel"))
+
+    def test_pagina_de_limite_vira_limite_no_download(self):
+        class Limitador:
+            limitado = 0
+
+            def begin_download(self, notify_wait=None, lane="download"):
+                return "call", None
+
+            def note_remote_limit(self):
+                self.limitado += 1
+
+            def finish_download_probe(self, probe, *, succeeded):
+                return None
+
+        limitador = Limitador()
+        with patch.object(worker, "_baixar", side_effect=worker.PortalSemXml("limite", "bloqueio")):
+            xml, erro = worker._baixar_na_faixa(Path("c"), Path("k"), "1" * 44, worker.saida_rede.GestorSaida([Rota("r", "http://10.0.0.9:8080")], enabled=True), limitador)
+        self.assertEqual((xml, erro, limitador.limitado), ("", "limite", 1))
+
+
 if __name__ == "__main__":
     unittest.main()

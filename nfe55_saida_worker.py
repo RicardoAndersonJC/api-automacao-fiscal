@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import os
 import re
 import shutil
@@ -249,7 +250,41 @@ def _abrir_sessao_rota(cert_path: Path, key_path: Path, transporte: Any) -> requ
     return sessao
 
 
+_DICAS_LIMITE = (
+    "muitas consultas", "muitas requisi", "excesso de requis", "too many", "bloqueio",
+    "bloqueado", "tente novamente mais tarde", "limite de acesso", "acesso temporariamente",
+)
+_DICAS_INDISPONIVEL = (
+    "cancelad", "inexistente", "não encontr", "nao encontr", "documento inválido",
+    "documento invalido", "denegad", "chave de acesso inválida", "chave de acesso invalida",
+)
+_DICAS_ACESSO = ("/erro/forbidden", "acesso negado", "access denied")
+
+
+class PortalSemXml(RuntimeError):
+    def __init__(self, categoria: str, dica: str = "") -> None:
+        super().__init__(f"O portal não devolveu o XML modelo 55 desta chave ({categoria}).")
+        self.categoria = categoria
+        self.dica = dica
+
+
+def classificar_pagina(status: int, url: str, texto: str) -> tuple[str, str]:
+    """Mesma leitura da página que a NFC-e faz, sem compartilhar código."""
+    amostra = html.unescape(texto or "")[:8000].lower()
+    if status in {401, 403} or "/erro/forbidden" in (url or "").lower():
+        return "acesso", "forbidden"
+    for categoria, dicas in (("acesso", _DICAS_ACESSO), ("limite", _DICAS_LIMITE), ("indisponivel", _DICAS_INDISPONIVEL)):
+        for dica in dicas:
+            if dica in amostra:
+                return categoria, dica
+    if status == 429:
+        return "limite", "http 429"
+    return "sem_xml", ""
+
+
 def _categoria_download(exc: Exception) -> str:
+    if isinstance(exc, PortalSemXml):
+        return exc.categoria
     if isinstance(exc, requests.exceptions.ProxyError):
         return "proxy"
     if isinstance(exc, requests.Timeout):
@@ -266,6 +301,8 @@ MOTIVO_DOWNLOAD = {
     "timeout": "Tempo esgotado no portal ao baixar o XML desta chave.",
     "limite": "Limite da SVRS (429) ao baixar o XML desta chave.",
     "sem_xml": "O portal não devolveu o XML desta chave.",
+    "indisponivel": "Portal informou nota indisponível (cancelada, denegada ou inexistente).",
+    "acesso": "Portal recusou o acesso do certificado a esta chave.",
     "http": "Erro HTTP do portal ao baixar o XML desta chave.",
 }
 
@@ -297,7 +334,14 @@ def _baixar(cert_path: Path, key_path: Path, chave: str, transporte: Any = None)
         )
     xml = extrair_xml_portal(resposta.text)
     if not xml or not xml_modelo_55(xml, chave):
-        raise RuntimeError("O portal não devolveu o XML modelo 55 desta chave.")
+        categoria, dica = classificar_pagina(resposta.status_code, str(resposta.url or ""), resposta.text)
+        # Só categoria e dica: nunca o corpo da página nem a chave completa.
+        print(
+            f"[nfe55-saida] download sem XML http={resposta.status_code} categoria={categoria} "
+            f"dica={dica!r} tamanho={len(resposta.text or '')} chave=...{chave[-6:]}",
+            flush=True,
+        )
+        raise PortalSemXml(categoria, dica)
     return xml
 
 
@@ -323,6 +367,8 @@ def _baixar_na_faixa(
             limitador.note_remote_limit()
         return "", _categoria_download(exc)
     except (requests.RequestException, RuntimeError) as exc:
+        if _categoria_download(exc) == "limite":
+            limitador.note_remote_limit()
         return "", _categoria_download(exc)
     finally:
         limitador.finish_download_probe(sonda, succeeded=sucesso)
