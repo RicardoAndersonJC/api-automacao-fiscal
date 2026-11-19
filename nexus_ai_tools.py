@@ -88,6 +88,29 @@ class SnapshotProvider(EvidenceProvider):
                 or (self.filters.empresa_id and str((value.get('empresa') or {}).get('id')) != str(self.filters.empresa_id))
                 or len(json.dumps(value, ensure_ascii=True)) > 26000):
             raise CoreError('invalid_evidence')
+        # Detalhe das notas (por mes, fornecedor, fila NFC-e) para a propria IA decidir o que usar.
+        # So entra com a capacidade de notas; o banco checa de novo. Falha aqui nao derruba a resposta.
+        if 'read_fiscal' in context.permissions:
+            try:
+                snap = await self.session.rpc('nexus_ai_snapshot', {
+                    'p_user_id': context.user_id, 'p_org_id': context.org_id, 'p_audience': self.agent.audience,
+                    'p_capability': 'read_fiscal', 'p_date_from': self.filters.date_from.isoformat(),
+                    'p_date_to': self.filters.date_to.isoformat(),
+                    'p_empresa_id': str(self.filters.empresa_id) if self.filters.empresa_id else None,
+                    'p_limit': 1, 'p_offset': 0, 'p_period_basis': self.filters.period_basis,
+                }, server=True, timeout=10)
+            except Exception:
+                snap = None
+            if (type(snap) is dict and snap.get('source') == 'fiscal_documents' and snap.get('org_id') == context.org_id
+                    and snap.get('date_from') == self.filters.date_from.isoformat()
+                    and snap.get('date_to') == self.filters.date_to.isoformat()):
+                detail = {k: snap[k] for k in ('period_basis','total_count','total_value','missing_values','by_module',
+                          'by_month','by_supplier','pending_count','undated_documents') if k in snap}
+                value['documentos_detalhe'] = detail
+                if len(json.dumps(value, ensure_ascii=True)) > 30000:
+                    detail.pop('by_supplier', None)
+                if len(json.dumps(value, ensure_ascii=True)) > 30000:
+                    value.pop('documentos_detalhe', None)
         value['rows'] = []
         return value
 

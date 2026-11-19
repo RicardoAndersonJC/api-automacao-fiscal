@@ -67,7 +67,10 @@ AGENT_FOCUS = {
         'If the asked module is listed in modulos_sem_acesso, say the user has no access to it in the system; never guess its data. '
         'Samples are partial lists; use the totals for counts. '
         'For broad requests (resumo de tudo, o que precisa de atencao), cover documentos_fiscais and every included module, '
-        'prioritizing pending items, overdue messages, open debts and blocked downloads.',
+        'prioritizing pending items, overdue messages, open debts and blocked downloads. '
+        'documentos_detalhe holds stored fiscal document aggregates (by_module, by_month, by_supplier, pending NFC-e queue) '
+        'for questions about NF-e, NFC-e, NFS-e, suppliers and values. The evidence covers everything the user may see: '
+        'decide yourself which sections answer the question and ignore the rest; for a narrow question, answer only that topic.',
 }
 
 
