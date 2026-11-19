@@ -168,10 +168,17 @@ class BodyLimit:
             await send({'type':'http.response.body','body':b'{"detail":"origin_denied"}'})
             return
         if scope['method']=='OPTIONS':
-            await send({'type':'http.response.start','status':204,'headers':[
+            # Preflight goes straight to original_send: the wrapper above strips every
+            # access-control-* header, which would drop allow-methods/allow-headers and
+            # make the browser block Authorization and X-Organization-ID.
+            headers=[(b'x-correlation-id',correlation_id.encode()),(b'cache-control',b'no-store'),
                 (b'access-control-allow-methods',b'GET, POST, DELETE, OPTIONS'),
-                (b'access-control-allow-headers',b'Authorization, Content-Type, X-Organization-ID')]})
-            await send({'type':'http.response.body','body':b''});return
+                (b'access-control-allow-headers',b'Authorization, Content-Type, X-Organization-ID'),
+                (b'access-control-max-age',b'600')]
+            if origin:
+                headers+=[(b'access-control-allow-origin',origin.encode()),(b'vary',b'Origin')]
+            await original_send({'type':'http.response.start','status':204,'headers':headers})
+            await original_send({'type':'http.response.body','body':b''});return
         body_buffer = bytearray()
         deadline, message_count = started + 10, 0
         while True:
