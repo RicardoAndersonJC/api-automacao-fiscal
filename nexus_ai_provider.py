@@ -55,6 +55,12 @@ AGENT_FOCUS = {
     'nfse':'Focus on normalized stored NFS-e documents. Stored records do not prove the current remote issuance or cancellation status.',
     'reports':'Explain period comparisons and supplier aggregates from supplied exact totals, distinguishing aggregates from the limited document page.',
     'financial_analysis':'Analyze gross known document values only, never cashflow, profit, accounting revenue or tax liabilities.',
+    'modulos':'Answer about the app modules in the evidence (obrigacoes acessorias, malhas, Portal e-CAC/Caixa Postal RFB, DET/DP trabalhista, '
+        'debitos SEFAZ AL, antecipado/ST/ANTEF, parcelamentos SEFAZ, Simples Nacional/PGDAS, cobranca NF-e, debitos da Prefeitura de Maceio). '
+        'Imported spreadsheets reflect the latest import date (importado_em), not necessarily the current month; say so when relevant. '
+        'Each section is the current state of the latest import unless it says no_periodo/recebidas_no_periodo. '
+        'If the asked module is listed in modulos_sem_acesso, say the user has no access to it in the system; never guess its data. '
+        'Samples are partial lists; use the totals for counts.',
 }
 
 

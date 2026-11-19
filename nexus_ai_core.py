@@ -57,7 +57,8 @@ CLIENT_CATALOG = MappingProxyType({name: Agent(name, "client", frozenset({tool})
     for name, tool in (
         ("fiscal", "read_fiscal"), ("nfe", "read_nfe"),
         ("nfce", "read_nfce"), ("nfse", "read_nfse"),
-        ("reports", "read_reports"), ("financial_analysis", "read_financial"))})
+        ("reports", "read_reports"), ("financial_analysis", "read_financial"),
+        ("modulos", "read_modules"))})
 TOOL_NAMES = frozenset(tool for catalog in (ADMIN_CATALOG, CLIENT_CATALOG)
                        for agent in catalog.values() for tool in agent.tools)
 

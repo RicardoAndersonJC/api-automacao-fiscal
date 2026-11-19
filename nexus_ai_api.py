@@ -588,7 +588,7 @@ def install_nexus_ai_routes(app: FastAPI, *, settings: Settings | None = None,
             return {"conversation_id": conversation_id, "message": answer,
                     'resolution':'local' if local_gate and not local_gate.used_model else 'model',
                     "references": getattr(provider, 'references', []), "correlation_id": correlation_id,
-                    "evidence": {k:v for k,v in (getattr(provider,'evidence',None) or {}).items()
+                    "evidence": None if (getattr(provider,'evidence',None) or {}).get('source') == 'modules' else {k:v for k,v in (getattr(provider,'evidence',None) or {}).items()
                         if k not in ('org_id','company_scope')} if settings.read_tools_enabled else None,
                     "usage": {"input_tokens": provider.input_tokens,
                               "output_tokens": provider.output_tokens}, "writes_enabled": False}

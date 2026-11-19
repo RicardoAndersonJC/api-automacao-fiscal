@@ -35,6 +35,8 @@ class SnapshotProvider(EvidenceProvider):
         self.knowledge=[]
 
     async def read_snapshot(self, context, arguments):
+        if self.capability == 'read_modules':
+            return await self.read_modules(context)
         value = await self.session.rpc('nexus_ai_snapshot', {
             'p_user_id': context.user_id, 'p_org_id': context.org_id,
             'p_audience': self.agent.audience, 'p_capability': self.capability,
@@ -69,12 +71,30 @@ class SnapshotProvider(EvidenceProvider):
                 raise CoreError('invalid_evidence') from None
         return value
 
+    async def read_modules(self, context):
+        value = await self.session.rpc('nexus_ai_modules_snapshot', {
+            'p_user_id': context.user_id, 'p_org_id': context.org_id, 'p_audience': self.agent.audience,
+            'p_date_from': self.filters.date_from.isoformat(), 'p_date_to': self.filters.date_to.isoformat(),
+        }, server=True)
+        allowed = {'source','scope','org_id','date_from','date_to','modulos_incluidos','modulos_sem_acesso',
+                   'obrigacoes','malhas','situacao_fiscal_ecac','caixa_postal_rfb','det_caixa_postal','dp_processos',
+                   'debitos_sefaz','antecipacao_st','parcelamentos_sefaz','simples_nacional','cobranca_nfe','debitos_prefeitura'}
+        if (type(value) is not dict or set(value)-allowed or value.get('source') != 'modules'
+                or value.get('org_id') != context.org_id
+                or value.get('date_from') != self.filters.date_from.isoformat()
+                or value.get('date_to') != self.filters.date_to.isoformat()
+                or type(value.get('modulos_incluidos')) is not list
+                or len(json.dumps(value, ensure_ascii=True)) > 26000):
+            raise CoreError('invalid_evidence')
+        value['rows'] = []
+        return value
+
     async def respond(self, *, agent, prompt, observations):
         if self.evidence is None:
             self.evidence = await self.registry.execute(self.context, self.agent, self.capability,
                 {'org_id': self.context.org_id, 'limit': 25, 'offset': 0})
             self.references = [{'source': self.evidence['source'], 'id': row['id']}
-                               for row in self.evidence['rows']]
+                               for row in self.evidence.get('rows', [])]
             self.references += [{'source':'nfce_download_pending','id':row['id']}
                                 for row in self.evidence.get('pending_rows',[])]
             if self.knowledge_enabled:
