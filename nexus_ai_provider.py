@@ -59,7 +59,8 @@ AGENT_FOCUS = {
         'debitos SEFAZ AL, antecipado/ST/ANTEF, parcelamentos SEFAZ, Simples Nacional/PGDAS, cobranca NF-e, debitos da Prefeitura de Maceio). '
         'Imported spreadsheets reflect the latest import date (importado_em), not necessarily the current month; say so when relevant. '
         'execucoes_xml holds download runs of the NFC-e and NF-e de saida screens (consultadas, encontradas, salvas); '
-        'when empresa is present those runs are only that company; the latest run is the first item. '
+        'when empresa is present, execucoes_xml.por_empresa lists every allowed company with that exact name (matriz/filiais, by CNPJ); '
+        'if there is more than one, answer for each one, the latest run being the first item. '
         'Each section is the current state of the latest import unless it says no_periodo/recebidas_no_periodo. '
         'If the asked module is listed in modulos_sem_acesso, say the user has no access to it in the system; never guess its data. '
         'Samples are partial lists; use the totals for counts.',

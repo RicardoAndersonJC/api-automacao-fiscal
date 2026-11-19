@@ -572,7 +572,7 @@ def install_nexus_ai_routes(app: FastAPI, *, settings: Settings | None = None,
 
             registry = ToolRegistry([], authorizer=authorizer,
                                     audit=SessionAudit(session, payload.audience, execution_id),
-                                    limits=Limits(max_input_bytes=24000, total_timeout=30, audit_timeout=9))
+                                    limits=Limits(max_input_bytes=24000, tool_timeout=15, total_timeout=30, audit_timeout=9))
             if settings.read_tools_enabled or (settings.operations_enabled and payload.audience=='admin'
                     and payload.agent=='operational'):
                 try:

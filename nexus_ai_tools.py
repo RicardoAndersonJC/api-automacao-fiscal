@@ -76,7 +76,7 @@ class SnapshotProvider(EvidenceProvider):
             'p_user_id': context.user_id, 'p_org_id': context.org_id, 'p_audience': self.agent.audience,
             'p_date_from': self.filters.date_from.isoformat(), 'p_date_to': self.filters.date_to.isoformat(),
             'p_empresa_id': str(self.filters.empresa_id) if self.filters.empresa_id else None,
-        }, server=True)
+        }, server=True, timeout=15)
         allowed = {'source','scope','org_id','date_from','date_to','modulos_incluidos','modulos_sem_acesso','empresa','execucoes_xml',
                    'obrigacoes','malhas','situacao_fiscal_ecac','caixa_postal_rfb','det_caixa_postal','dp_processos',
                    'debitos_sefaz','antecipacao_st','parcelamentos_sefaz','simples_nacional','cobranca_nfe','debitos_prefeitura'}
