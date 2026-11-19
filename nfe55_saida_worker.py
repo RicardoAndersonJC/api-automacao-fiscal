@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -39,6 +40,22 @@ import nfe55_saida_transport as saida_rede
 
 URL_CONSULTA = "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx"
 URL_PORTAL = "https://dfe-portal.svrs.rs.gov.br/NFeSSL/DownloadXMLDFe"
+ORIGEM_PORTAL = "https://dfe-portal.svrs.rs.gov.br"
+# Mesmos cabeçalhos de navegador do fluxo capturado no Chrome (código base da saída).
+CABECALHOS_NAVEGADOR = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,"
+        "image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+    ),
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+}
 SOAP_ACTION = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF"
 MAX_NUMEROS = 10000
 JANELA_MES_SEGUINTE = 3
@@ -251,6 +268,8 @@ def _abrir_sessao_rota(cert_path: Path, key_path: Path, transporte: Any) -> requ
     return sessao
 
 
+# Bloqueio por IP do portal de download: "IP não autorizado devido múltiplas consultas".
+_DICAS_BLOQUEIO_IP = ("ip nao autorizado",)
 _DICAS_LIMITE = (
     "muitas consultas", "muitas requisi", "excesso de requis", "too many", "bloqueio",
     "bloqueado", "tente novamente mais tarde", "limite de acesso", "acesso temporariamente",
@@ -315,6 +334,10 @@ class PortalSemXml(RuntimeError):
 def classificar_pagina(status: int, url: str, texto: str) -> tuple[str, str]:
     """Mesma leitura da página que a NFC-e faz, sem compartilhar código."""
     amostra = html.unescape(texto or "")[:8000].lower()
+    sem_acento = unicodedata.normalize("NFKD", amostra).encode("ascii", "ignore").decode("ascii")
+    for dica in _DICAS_BLOQUEIO_IP:
+        if dica in sem_acento:
+            return "limite", "ip bloqueado"
     if status in {401, 403} or "/erro/forbidden" in (url or "").lower():
         return "acesso", "forbidden"
     for categoria, dicas in (("acesso", _DICAS_ACESSO), ("limite", _DICAS_LIMITE), ("indisponivel", _DICAS_INDISPONIVEL)):
@@ -358,7 +381,7 @@ def _motivo_download(categoria: str) -> str:
 def _baixar(cert_path: Path, key_path: Path, chave: str, transporte: Any = None) -> str:
     dono = _transporte() if transporte is None else transporte
     with _abrir_sessao_rota(cert_path, key_path, dono) as sessao:
-        pagina = _enviar_rota(sessao, dono, "get", URL_PORTAL, timeout=45)
+        pagina = _enviar_rota(sessao, dono, "get", URL_PORTAL, timeout=45, headers=dict(CABECALHOS_NAVEGADOR))
         campos: dict[str, str] = {}
         for tag in re.findall(r"<input\b[^>]*>", pagina.text, flags=re.I):
             nome = re.search(r"\bname=[\"']([^\"']+)[\"']", tag, flags=re.I)
@@ -374,7 +397,12 @@ def _baixar(cert_path: Path, key_path: Path, chave: str, transporte: Any = None)
             URL_PORTAL,
             data=campos,
             timeout=45,
-            headers={"Referer": URL_PORTAL, "Content-Type": "application/x-www-form-urlencoded"},
+            headers={
+                **CABECALHOS_NAVEGADOR,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": ORIGEM_PORTAL,
+                "Referer": str(getattr(pagina, "url", "") or URL_PORTAL),
+            },
         )
     xml = extrair_xml_portal(resposta.text)
     if not xml or not xml_modelo_55(xml, chave):

@@ -192,6 +192,32 @@ class PaginaPortalTest(unittest.TestCase):
         bloqueio.registrar(datetime.now(timezone.utc) + timedelta(days=5))
         self.assertLessEqual(bloqueio.ate, datetime.now(timezone.utc) + timedelta(hours=24, seconds=1))
 
+    def test_frase_de_bloqueio_de_ip_e_limite(self):
+        for texto in ("IP não autorizado devido múltiplas consultas", "IP n&atilde;o autorizado devido m&uacute;ltiplas consultas"):
+            self.assertEqual(worker.classificar_pagina(200, "", texto), ("limite", "ip bloqueado"))
+
+    def test_download_usa_cabecalhos_de_navegador(self):
+        chamadas = []
+
+        class Resposta:
+            def __init__(self, url, texto):
+                self.url, self.text, self.status_code = url, texto, 200
+
+        def enviar(sessao, dono, metodo, url, **kwargs):
+            chamadas.append((metodo, kwargs.get("headers") or {}))
+            if metodo == "get":
+                return Resposta("https://dfe-portal.svrs.rs.gov.br/NFeSSL/DownloadXMLDFe?x=1", '<input name="__T" value="1">')
+            return Resposta(url, "IP não autorizado devido múltiplas consultas")
+
+        with patch.object(worker, "_abrir_sessao_rota", return_value=MagicMock()),                 patch.object(worker, "_enviar_rota", side_effect=enviar):
+            with self.assertRaises(worker.PortalSemXml) as erro:
+                worker._baixar(Path("c"), Path("k"), "1" * 44, transporte=MagicMock())
+        self.assertEqual(erro.exception.categoria, "limite")
+        get, post = chamadas
+        self.assertIn("Mozilla/5.0", get[1]["User-Agent"])
+        self.assertEqual(post[1]["Origin"], "https://dfe-portal.svrs.rs.gov.br")
+        self.assertEqual(post[1]["Referer"], "https://dfe-portal.svrs.rs.gov.br/NFeSSL/DownloadXMLDFe?x=1")
+
 
 if __name__ == "__main__":
     unittest.main()
