@@ -93,6 +93,28 @@ def estimate_cost(settings,input_tokens,output_tokens):
         Decimal(output_tokens or 0)*settings.output_price_per_million)/Decimal(1000000)).quantize(Decimal('0.000001'),rounding=ROUND_UP)
 
 
+EXPORT_KINDS = ('fiscal','nfe','nfce','nfse','obrigacoes','malhas','caixa_postal_rfb','det_mensagens','dp_processos',
+                'debitos_sefaz','antecipacao_st','parcelamentos_sefaz','simples_nacional','cobranca_nfe','debitos_prefeitura')
+
+
+EXPORT_PAGE = 5000
+
+
+class ExportRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    audience: Literal['client'] = 'client'
+    kind: Literal[EXPORT_KINDS]
+    date_from: date
+    date_to: date
+    offset: int = Field(default=0, ge=0, le=200000)
+
+    @model_validator(mode='after')
+    def bounded_period(self):
+        if self.date_to < self.date_from or (self.date_to-self.date_from).days > 366:
+            raise ValueError('invalid_period')
+        return self
+
+
 class Filters(BaseModel):
     model_config = ConfigDict(extra='forbid')
     date_from: date = Field(default_factory=lambda: datetime.now(timezone.utc).date().replace(day=1))
@@ -391,6 +413,26 @@ def install_nexus_ai_routes(app: FastAPI, *, settings: Settings | None = None,
             await session.authenticate(audience)
             return await session.rpc('nexus_ai_companies',{'p_user_id':session.user_id,'p_org_id':session.org_id,
                 'p_audience':audience},server=True)
+
+    @router.post('/export')
+    async def export_rows(payload: ExportRequest, authorization: str | None=Header(default=None),
+                          x_organization_id: UUID=Header()):
+        # Exportação completa somente leitura: não chama o modelo nem consome cota de IA.
+        # O banco aplica as mesmas regras do chat (empresas permitidas / acesso ao módulo).
+        token=credentials(authorization)
+        async with httpx.AsyncClient(transport=transport,trust_env=False) as client:
+            session=Session(settings,client,token,x_organization_id)
+            await session.authenticate(payload.audience)
+            value=await session.rpc('nexus_ai_export_rows',{'p_user_id':session.user_id,'p_org_id':session.org_id,
+                'p_audience':payload.audience,'p_kind':payload.kind,'p_date_from':payload.date_from.isoformat(),
+                'p_date_to':payload.date_to.isoformat(),'p_limit':EXPORT_PAGE,'p_offset':payload.offset},server=True)
+            if (type(value) is not dict or value.get('source')!='export' or value.get('kind')!=payload.kind
+                    or value.get('org_id')!=session.org_id or type(value.get('total')) is not int
+                    or type(value.get('rows')) is not list or len(value['rows'])>EXPORT_PAGE
+                    or any(type(row) is not dict for row in value['rows'])):
+                raise HTTPException(503,'invalid_export')
+            return {'kind':payload.kind,'total':value['total'],'offset':payload.offset,'rows':value['rows'],
+                    'page_size':EXPORT_PAGE}
 
     @router.get("/conversations/{conversation_id}")
     async def conversation(conversation_id: UUID, audience: Literal["client", "admin"] = "client",
