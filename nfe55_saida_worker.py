@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -261,11 +262,54 @@ _DICAS_INDISPONIVEL = (
 _DICAS_ACESSO = ("/erro/forbidden", "acesso negado", "access denied")
 
 
+_FUSO_SVRS = timezone(timedelta(hours=-3))
+_BLOQUEADO_ATE_RE = re.compile(
+    r"bloquead[oa]\s+at[ée]\s+(\d{2})/(\d{2})/(\d{4})\s+(\d{2}):(\d{2})", re.IGNORECASE,
+)
+BLOQUEIO_MAXIMO = timedelta(hours=24)
+
+
+def bloqueado_ate_svrs(texto: str) -> datetime | None:
+    """Fim do bloqueio "Acesso ao Download do XML bloqueado até dd/mm/aaaa hh:mm" (Brasília), em UTC."""
+    achado = _BLOQUEADO_ATE_RE.search(html.unescape(texto or ""))
+    if not achado:
+        return None
+    dia, mes, ano, hora, minuto = (int(parte) for parte in achado.groups())
+    try:
+        return datetime(ano, mes, dia, hora, minuto, tzinfo=_FUSO_SVRS).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def texto_bloqueio(ate: datetime) -> str:
+    return ate.astimezone(_FUSO_SVRS).strftime("%d/%m/%Y %H:%M")
+
+
+class Bloqueio:
+    """Maior horário de bloqueio visto numa execução (as threads do lote registram aqui)."""
+
+    def __init__(self) -> None:
+        self._trava = threading.Lock()
+        self.ate: datetime | None = None
+
+    def registrar(self, ate: datetime | None) -> None:
+        if ate is None:
+            return
+        agora = datetime.now(timezone.utc)
+        ate = min(ate, agora + BLOQUEIO_MAXIMO)
+        if ate <= agora:
+            return
+        with self._trava:
+            if self.ate is None or ate > self.ate:
+                self.ate = ate
+
+
 class PortalSemXml(RuntimeError):
-    def __init__(self, categoria: str, dica: str = "") -> None:
+    def __init__(self, categoria: str, dica: str = "", bloqueado_ate: datetime | None = None) -> None:
         super().__init__(f"O portal não devolveu o XML modelo 55 desta chave ({categoria}).")
         self.categoria = categoria
         self.dica = dica
+        self.bloqueado_ate = bloqueado_ate
 
 
 def classificar_pagina(status: int, url: str, texto: str) -> tuple[str, str]:
@@ -335,13 +379,15 @@ def _baixar(cert_path: Path, key_path: Path, chave: str, transporte: Any = None)
     xml = extrair_xml_portal(resposta.text)
     if not xml or not xml_modelo_55(xml, chave):
         categoria, dica = classificar_pagina(resposta.status_code, str(resposta.url or ""), resposta.text)
-        # Só categoria e dica: nunca o corpo da página nem a chave completa.
+        ate = bloqueado_ate_svrs(resposta.text) if categoria == "limite" else None
+        # Só categoria, dica e horário do bloqueio: nunca o corpo da página nem a chave completa.
         print(
             f"[nfe55-saida] download sem XML http={resposta.status_code} categoria={categoria} "
-            f"dica={dica!r} tamanho={len(resposta.text or '')} chave=...{chave[-6:]}",
+            f"dica={dica!r} bloqueado_ate={texto_bloqueio(ate) if ate else '-'} "
+            f"tamanho={len(resposta.text or '')} chave=...{chave[-6:]}",
             flush=True,
         )
-        raise PortalSemXml(categoria, dica)
+        raise PortalSemXml(categoria, dica, ate)
     return xml
 
 
@@ -352,6 +398,7 @@ def _baixar_na_faixa(
     transporte: Any,
     limitador: Any,
     avisar_espera: Any = None,
+    bloqueio: Bloqueio | None = None,
 ) -> tuple[str, str]:
     faixa = _faixa_proxy(transporte)
     slot, sonda = limitador.begin_download(notify_wait=avisar_espera, lane=faixa)
@@ -369,6 +416,8 @@ def _baixar_na_faixa(
     except (requests.RequestException, RuntimeError) as exc:
         if _categoria_download(exc) == "limite":
             limitador.note_remote_limit()
+            if bloqueio is not None and isinstance(exc, PortalSemXml):
+                bloqueio.registrar(exc.bloqueado_ate)
         return "", _categoria_download(exc)
     finally:
         limitador.finish_download_probe(sonda, succeeded=sucesso)
@@ -381,8 +430,14 @@ def _descarregar_lote(
     rotas: list[Any],
     avisar_espera: Any = None,
     ao_concluir: Any = None,
+    bloqueio: Bloqueio | None = None,
+    sondar: bool = False,
 ) -> list[tuple[str, str, str]]:
-    """Uma chave por IP. O intervalo de 1 min vale ao reutilizar a mesma faixa."""
+    """Uma chave por IP. O intervalo de 1 min vale ao reutilizar a mesma faixa.
+
+    Com sondar, a primeira chave vai sozinha: se a SVRS responder limite, o lote para ali
+    e as outras chaves não gastam tentativas (o bloqueio é por certificado, não por IP).
+    """
     quantidade = min(len(chaves), len(rotas), _tamanho_lote())
     if quantidade < 1:
         return []
@@ -392,17 +447,27 @@ def _descarregar_lote(
     resultados: dict[int, tuple[str, str, str]] = {}
 
     def um(indice: int, chave: str, gestor: Any) -> tuple[int, str, str, str]:
-        xml, erro = _baixar_na_faixa(cert_path, key_path, chave, gestor, limitador, avisar_espera)
+        xml, erro = _baixar_na_faixa(cert_path, key_path, chave, gestor, limitador, avisar_espera, bloqueio)
         return indice, chave, xml, erro
 
-    with ThreadPoolExecutor(max_workers=quantidade, thread_name_prefix="nfe55-saida-proxy") as pool:
-        futuros = [pool.submit(um, indice, chave, gestor) for indice, (chave, gestor) in enumerate(zip(pedaco, gestores))]
-        for futuro in as_completed(futuros):
-            indice, chave, xml, erro = futuro.result()
-            resultados[indice] = (chave, xml, erro)
-            if ao_concluir:
-                ao_concluir(chave, xml, erro)
-    return [resultados[indice] for indice in range(quantidade)]
+    def registrar(indice: int, chave: str, xml: str, erro: str) -> None:
+        resultados[indice] = (chave, xml, erro)
+        if ao_concluir:
+            ao_concluir(chave, xml, erro)
+
+    inicio = 0
+    if sondar and quantidade > 1:
+        registrar(*um(0, pedaco[0], gestores[0]))
+        if resultados[0][2] == "limite":
+            return [resultados[0]]
+        inicio = 1
+    restantes = list(range(inicio, quantidade))
+    if restantes:
+        with ThreadPoolExecutor(max_workers=len(restantes), thread_name_prefix="nfe55-saida-proxy") as pool:
+            futuros = [pool.submit(um, indice, pedaco[indice], gestores[indice]) for indice in restantes]
+            for futuro in as_completed(futuros):
+                registrar(*futuro.result())
+    return [resultados[indice] for indice in sorted(resultados)]
 
 
 def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, opcoes: dict[str, Any]) -> None:
@@ -439,6 +504,7 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
             onda_inicio = 1
             ondas = 0
             downloads_parados = ""
+            bloqueio = Bloqueio()
             limite = min(int(opcoes.get("max_numeracoes") or 300), MAX_NUMEROS)
             parada = max(1, min(int(opcoes.get("stop_217") or 15), 100))
 
@@ -477,34 +543,51 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                         return True
                     feitos = 0
                     baixados_na_onda = 0
+                    sem_xml_na_onda = 0
                     houve_limite = False
+                    if len(pedaco) > 1:
+                        _callback(
+                            run_id, token, "progress",
+                            mensagem=f"{origem}: testando o portal com 1 chave antes do lote de {len(pedaco)}",
+                            aamm=aamm, nnf=nnf, consultadas=consultadas, encontradas=len(encontradas),
+                        )
 
                     def ao_concluir(chave: str, xml: str, erro: str) -> None:
-                        nonlocal feitos, houve_limite, falhas, baixados_na_onda
+                        nonlocal feitos, houve_limite, falhas, baixados_na_onda, sem_xml_na_onda
                         feitos += 1
                         if xml:
                             baixados_na_onda += 1
                             publicar(chave, xml)
                         else:
                             falhas += 1
+                            sem_xml_na_onda += 1
                             houve_limite = houve_limite or erro == "limite"
+                            motivo = _motivo_download(erro)
+                            if erro == "limite" and bloqueio.ate:
+                                motivo = f"Download bloqueado pela SVRS até {texto_bloqueio(bloqueio.ate)}."
                             _callback(
                                 run_id, token, "download_falhou", chave=chave,
                                 aamm=chave[2:6], nnf=int(chave[25:34]),
-                                erro=_motivo_download(erro),
+                                erro=motivo,
                             )
                         _callback(
                             run_id, token, "progress",
-                            mensagem=f"{origem} {feitos}/{len(pedaco)} · {salvas} salvas · {len(pedaco)} proxy(s) em paralelo",
+                            mensagem=(
+                                f"{origem} {feitos}/{len(pedaco)} · {salvas} salvas · {sem_xml_na_onda} sem XML"
+                                f" · {len(pedaco)} proxy(s) em paralelo"
+                            ),
                             aamm=aamm, nnf=nnf, consultadas=consultadas, encontradas=len(encontradas),
                         )
 
                     _descarregar_lote(
                         cert_path, key_path, pedaco, rotas, avisar_espera if onda_inicio > 1 else None, ao_concluir,
+                        bloqueio=bloqueio, sondar=True,
                     )
                     onda_inicio = fim + 1
                     ondas += 1
-                    if houve_limite:
+                    if houve_limite and bloqueio.ate:
+                        downloads_parados = f"Download bloqueado pela SVRS até {texto_bloqueio(bloqueio.ate)}."
+                    elif houve_limite:
                         downloads_parados = "Limite da SVRS (429) no download."
                     elif not baixados_na_onda:
                         downloads_parados = "O portal não devolveu XML neste lote."
@@ -636,10 +719,11 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
         if downloads_parados:
             pendentes = max(0, len(encontradas) - salvas - falhas)
             mensagem += f" {downloads_parados} {pendentes} chave(s) guardadas para a próxima vez."
+        extra = {"svrs_bloqueado_ate": bloqueio.ate.isoformat()} if bloqueio.ate else {}
         _callback(
             run_id, token, "done", mensagem=mensagem,
             consultadas=consultadas, encontradas=len(encontradas), salvas=salvas,
-            aamm=aamm, nnf=nnf, lacunas=lacunas[-200:],
+            aamm=aamm, nnf=nnf, lacunas=lacunas[-200:], **extra,
         )
     except Exception as exc:
         erro = "Falha de proxy no download." if isinstance(exc, requests.exceptions.ProxyError) else str(exc)[:500]

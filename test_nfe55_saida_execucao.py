@@ -1,6 +1,7 @@
 """Fluxo da execução: chave real nas pendências, uma onda por execução e cursor no fim."""
 
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -57,7 +58,7 @@ class ExecucaoTest(unittest.TestCase):
     def test_pendencia_usa_a_chave_real_e_uma_onda_por_execucao(self):
         chamadas = []
 
-        def baixar(cert, key, ch, transporte, limitador, avisar=None):
+        def baixar(cert, key, ch, transporte, limitador, avisar=None, bloqueio=None):
             chamadas.append(ch)
             return f"<nfeProc>{ch}</nfeProc>", ""
 
@@ -70,7 +71,7 @@ class ExecucaoTest(unittest.TestCase):
     def test_onda_sem_xml_para_os_downloads_e_informa_o_motivo(self):
         chamadas = []
 
-        def baixar(cert, key, ch, transporte, limitador, avisar=None):
+        def baixar(cert, key, ch, transporte, limitador, avisar=None, bloqueio=None):
             chamadas.append(ch)
             return "", "timeout"
 
@@ -90,7 +91,7 @@ class ExecucaoTest(unittest.TestCase):
                 return f"<cStat>613</cStat><xMotivo>Chave difere [{chave_real(5)}]</xMotivo>"
             return "<cStat>217</cStat>"
 
-        def baixar(cert, key, ch, transporte, limitador, avisar=None):
+        def baixar(cert, key, ch, transporte, limitador, avisar=None, bloqueio=None):
             chamadas.append(ch)
             return f"<nfeProc>{ch}</nfeProc>", ""
 
@@ -144,6 +145,52 @@ class PaginaPortalTest(unittest.TestCase):
         with patch.object(worker, "_baixar", side_effect=worker.PortalSemXml("limite", "bloqueio")):
             xml, erro = worker._baixar_na_faixa(Path("c"), Path("k"), "1" * 44, worker.saida_rede.GestorSaida([Rota("r", "http://10.0.0.9:8080")], enabled=True), limitador)
         self.assertEqual((xml, erro, limitador.limitado), ("", "limite", 1))
+
+    def test_sonda_com_limite_para_o_lote_e_guarda_o_horario_do_bloqueio(self):
+        chamadas = []
+        fim = datetime.now(timezone.utc) + timedelta(hours=3)
+
+        def baixar(cert, key, ch, transporte, limitador, avisar=None, bloqueio=None):
+            chamadas.append(ch)
+            if bloqueio is not None:
+                bloqueio.registrar(fim)
+            return "", "limite"
+
+        eventos = ExecucaoTest.executar(self, [pendencia(n) for n in range(1, 7)], baixar=baixar)
+        self.assertEqual(len(chamadas), 1)  # só a sonda: as outras chaves não gastam tentativa
+        done = [d for e, d in eventos if e == "done"][-1]
+        quando = worker.texto_bloqueio(fim.replace(second=0, microsecond=0))
+        self.assertIn(f"Download bloqueado pela SVRS até {quando}", done["mensagem"])
+        self.assertEqual(done["svrs_bloqueado_ate"][:16], fim.isoformat()[:16])
+        falha = [d for e, d in eventos if e == "download_falhou"][0]
+        self.assertIn("bloqueado pela SVRS até", falha["erro"])
+
+    def test_sonda_ok_libera_o_restante_do_lote(self):
+        chamadas = []
+
+        def baixar(cert, key, ch, transporte, limitador, avisar=None, bloqueio=None):
+            chamadas.append(ch)
+            return "<xml/>", ""
+
+        with patch.object(worker, "_callback", return_value=False):
+            rotas = [Rota(f"r{i}", f"http://10.0.0.{i}:8080") for i in range(1, 5)]
+            with patch.object(worker, "_baixar_na_faixa", side_effect=baixar),                     patch.object(worker, "_tamanho_lote", return_value=4):
+                saida = worker._descarregar_lote(Path("c"), Path("k"), [chave_real(n) for n in range(1, 5)], rotas, sondar=True)
+        self.assertEqual(len(chamadas), 4)
+        self.assertEqual(chamadas[0], chave_real(1))
+        self.assertEqual([c for c, _x, _e in saida], [chave_real(n) for n in range(1, 5)])
+
+    def test_le_o_horario_de_bloqueio_da_pagina(self):
+        ate = worker.bloqueado_ate_svrs("Acesso ao Download do XML bloqueado at&eacute; 19/11/2026 20:12")
+        self.assertEqual(ate, datetime(2026, 11, 19, 23, 12, tzinfo=timezone.utc))
+        self.assertIsNone(worker.bloqueado_ate_svrs("Consulta normal"))
+
+    def test_bloqueio_ignora_passado_e_limita_a_24h(self):
+        bloqueio = worker.Bloqueio()
+        bloqueio.registrar(datetime.now(timezone.utc) - timedelta(minutes=5))
+        self.assertIsNone(bloqueio.ate)
+        bloqueio.registrar(datetime.now(timezone.utc) + timedelta(days=5))
+        self.assertLessEqual(bloqueio.ate, datetime.now(timezone.utc) + timedelta(hours=24, seconds=1))
 
 
 if __name__ == "__main__":
