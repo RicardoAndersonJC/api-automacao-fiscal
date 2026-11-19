@@ -498,6 +498,130 @@ def _descarregar_lote(
     return [resultados[indice] for indice in sorted(resultados)]
 
 
+def _inteiro_env(nome: str, padrao: int, minimo: int, maximo: int) -> int:
+    try:
+        valor = int(os.environ.get(nome) or padrao)
+    except ValueError:
+        valor = padrao
+    return max(minimo, min(valor, maximo))
+
+
+TENTATIVAS_POR_CHAVE = 3
+INTERVALO_MINIMO = 5
+INTERVALO_MAXIMO = 180
+
+
+class RitmoCertificado:
+    """Ritmo do código base: um download por vez por certificado.
+
+    O intervalo conta desde o último download que deu certo (tentativa recusada não zera o relógio),
+    sobe um passo a cada recusa e desce um passo após 3 sucessos de primeira (entre 5 s e 180 s).
+    """
+
+    def __init__(self, intervalo: float, passo: float, clock: Any = None, sleep: Any = None) -> None:
+        self.intervalo = float(max(INTERVALO_MINIMO, min(intervalo, INTERVALO_MAXIMO)))
+        self.passo = float(max(1, passo))
+        self.ultimo_sucesso: float | None = None
+        self.seguidos = 0
+        self._clock = clock or time.monotonic
+        self._sleep = sleep or time.sleep
+
+    def restante(self) -> float:
+        if self.ultimo_sucesso is None:
+            return 0.0
+        return max(0.0, self.intervalo - (self._clock() - self.ultimo_sucesso))
+
+    def espera_repeticao(self) -> float:
+        # Sem sucesso de referência, repete após só um passo (como o base).
+        return self.restante() if self.ultimo_sucesso is not None else self.passo
+
+    def dormir(self, segundos: float) -> None:
+        if segundos > 0:
+            self._sleep(segundos)
+
+    def sucesso(self, primeira: bool) -> None:
+        self.ultimo_sucesso = self._clock()
+        if not primeira:
+            self.seguidos = 0
+            return
+        self.seguidos += 1
+        if self.seguidos >= 3:
+            self.intervalo = max(INTERVALO_MINIMO, self.intervalo - self.passo)
+            self.seguidos = 0
+
+    def recusa(self) -> None:
+        self.seguidos = 0
+        self.intervalo = min(INTERVALO_MAXIMO, self.intervalo + self.passo)
+
+
+_ritmos: dict[str, RitmoCertificado] = {}
+_ritmos_trava = threading.Lock()
+
+
+def _ritmo_do_certificado(cnpj: str) -> RitmoCertificado:
+    """O ritmo fica guardado por CNPJ e vale entre execuções do mesmo certificado."""
+    with _ritmos_trava:
+        ritmo = _ritmos.get(cnpj)
+        if ritmo is None:
+            ritmo = RitmoCertificado(
+                _inteiro_env("NFE55_INTERVALO_DOWNLOAD", 55, INTERVALO_MINIMO, INTERVALO_MAXIMO),
+                _inteiro_env("NFE55_PASSO_AJUSTE", 5, 1, 60),
+            )
+            _ritmos[cnpj] = ritmo
+        return ritmo
+
+
+def _descarregar_em_ritmo(
+    cert_path: Path,
+    key_path: Path,
+    chaves: list[str],
+    rotas: list[Any],
+    ritmo: RitmoCertificado,
+    ao_concluir: Any = None,
+    bloqueio: Bloqueio | None = None,
+    avisar: Any = None,
+) -> None:
+    """Um download por vez para o certificado, trocando de IP a cada tentativa.
+
+    Repete a mesma chave até 3 vezes (nota indisponível ou acesso negado não repetem).
+    Bloqueio com horário da SVRS encerra na hora. avisar(texto) devolve True para cancelar.
+    """
+    limitador = _limitador()
+    proxima_rota = 0
+    for posicao, chave in enumerate(chaves, start=1):
+        espera = ritmo.restante()
+        if espera > 0:
+            if avisar and avisar(f"aguardando {int(round(espera))} s (ritmo do certificado {int(ritmo.intervalo)} s)", posicao):
+                return
+            ritmo.dormir(espera)
+        xml, erro = "", ""
+        for tentativa in range(1, TENTATIVAS_POR_CHAVE + 1):
+            gestor = saida_rede.GestorSaida([rotas[proxima_rota % len(rotas)]], enabled=True) if rotas else _transporte()
+            proxima_rota += 1
+            xml, erro = _baixar_na_faixa(cert_path, key_path, chave, gestor, limitador, None, bloqueio)
+            if xml:
+                ritmo.sucesso(primeira=tentativa == 1)
+                break
+            if erro in {"indisponivel", "acesso"} or (bloqueio is not None and bloqueio.ate):
+                break
+            ritmo.recusa()
+            if tentativa < TENTATIVAS_POR_CHAVE:
+                repetir = ritmo.espera_repeticao()
+                if avisar and avisar(
+                    f"recusa ({erro}); repetindo em {int(round(repetir))} s, tentativa {tentativa + 1}/{TENTATIVAS_POR_CHAVE}",
+                    posicao,
+                ):
+                    return
+                ritmo.dormir(repetir)
+        if ao_concluir:
+            ao_concluir(chave, xml, erro)
+        if bloqueio is not None and bloqueio.ate:
+            return
+        if not xml and erro == "limite":
+            # Três recusas seguidas por limite: os IPs estão recusando; o resto fica para a próxima vez.
+            return
+
+
 def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, opcoes: dict[str, Any]) -> None:
     pasta = Path(tempfile.mkdtemp(prefix="nfe55_saida_"))
     aamm, nnf, consultadas = "", 0, 0
@@ -533,6 +657,7 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
             ondas = 0
             downloads_parados = ""
             bloqueio = Bloqueio()
+            ritmo = _ritmo_do_certificado(cfg["CNPJ"])
             limite = min(int(opcoes.get("max_numeracoes") or 300), MAX_NUMEROS)
             parada = max(1, min(int(opcoes.get("stop_217") or 15), 100))
 
@@ -564,8 +689,10 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                     pedaco = fila[:capacidade]
                     del fila[:capacidade]
                     fim = onda_inicio + len(pedaco) - 1
-                    faixa = f"/{capacidade}" if len(pedaco) == capacidade else ""
-                    mensagem = f"{origem} lote {onda_inicio}-{fim}{faixa} · {len(pedaco)} proxy(s) em paralelo"
+                    mensagem = (
+                        f"{origem} lote {onda_inicio}-{fim} · um por vez, ritmo do certificado "
+                        f"{int(ritmo.intervalo)} s · {len(rotas)} IP(s) em rodízio"
+                    )
                     if _callback(run_id, token, "progress", mensagem=mensagem, aamm=aamm, nnf=nnf, consultadas=consultadas, encontradas=len(encontradas)):
                         _callback(run_id, token, "done", mensagem="Busca cancelada.", consultadas=consultadas, encontradas=len(encontradas))
                         return True
@@ -573,12 +700,16 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                     baixados_na_onda = 0
                     sem_xml_na_onda = 0
                     houve_limite = False
-                    if len(pedaco) > 1:
-                        _callback(
+                    cancelado = False
+
+                    def avisar(texto: str, posicao: int) -> bool:
+                        nonlocal cancelado
+                        cancelado = _callback(
                             run_id, token, "progress",
-                            mensagem=f"{origem}: testando o portal com 1 chave antes do lote de {len(pedaco)}",
+                            mensagem=f"{origem} {posicao}/{len(pedaco)} · {salvas} salvas · {sem_xml_na_onda} sem XML · {texto}",
                             aamm=aamm, nnf=nnf, consultadas=consultadas, encontradas=len(encontradas),
                         )
+                        return cancelado
 
                     def ao_concluir(chave: str, xml: str, erro: str) -> None:
                         nonlocal feitos, houve_limite, falhas, baixados_na_onda, sem_xml_na_onda
@@ -598,19 +729,23 @@ def _executar(run_id: str, token: str, semente: bytes, pfx: bytes, senha: str, o
                                 aamm=chave[2:6], nnf=int(chave[25:34]),
                                 erro=motivo,
                             )
-                        _callback(
+                        nonlocal cancelado
+                        cancelado = _callback(
                             run_id, token, "progress",
                             mensagem=(
                                 f"{origem} {feitos}/{len(pedaco)} · {salvas} salvas · {sem_xml_na_onda} sem XML"
-                                f" · {len(pedaco)} proxy(s) em paralelo"
+                                f" · ritmo do certificado {int(ritmo.intervalo)} s"
                             ),
                             aamm=aamm, nnf=nnf, consultadas=consultadas, encontradas=len(encontradas),
-                        )
+                        ) or cancelado
 
-                    _descarregar_lote(
-                        cert_path, key_path, pedaco, rotas, avisar_espera if onda_inicio > 1 else None, ao_concluir,
-                        bloqueio=bloqueio, sondar=True,
+                    _descarregar_em_ritmo(
+                        cert_path, key_path, pedaco, rotas, ritmo, ao_concluir, bloqueio=bloqueio,
+                        avisar=avisar,
                     )
+                    if cancelado:
+                        _callback(run_id, token, "done", mensagem="Busca cancelada.", consultadas=consultadas, encontradas=len(encontradas), salvas=salvas)
+                        return True
                     onda_inicio = fim + 1
                     ondas += 1
                     if houve_limite and bloqueio.ate:

@@ -30,6 +30,12 @@ def pendencia(n: int, com_chave: bool = True) -> dict:
 
 
 class ExecucaoTest(unittest.TestCase):
+    def setUp(self):
+        worker._ritmos.clear()
+
+    def tearDown(self):
+        worker._ritmos.clear()
+
     def executar(self, lacunas=(), baixar=None, consultar=None, opcoes=None):
         eventos: list[tuple[str, dict]] = []
 
@@ -76,7 +82,8 @@ class ExecucaoTest(unittest.TestCase):
             return "", "timeout"
 
         eventos = self.executar([pendencia(n) for n in range(1, 7)], baixar=baixar)
-        self.assertEqual(len(chamadas), 2)
+        # Lote de 2, cada chave repetida até 3 vezes como no código base.
+        self.assertEqual(len(chamadas), 2 * worker.TENTATIVAS_POR_CHAVE)
         falhas = [d for e, d in eventos if e == "download_falhou"]
         self.assertTrue(all("Tempo esgotado" in d["erro"] for d in falhas))
         self.assertIn("não devolveu XML neste lote", [d for e, d in eventos if e == "done"][-1]["mensagem"])
@@ -217,6 +224,86 @@ class PaginaPortalTest(unittest.TestCase):
         self.assertIn("Mozilla/5.0", get[1]["User-Agent"])
         self.assertEqual(post[1]["Origin"], "https://dfe-portal.svrs.rs.gov.br")
         self.assertEqual(post[1]["Referer"], "https://dfe-portal.svrs.rs.gov.br/NFeSSL/DownloadXMLDFe?x=1")
+
+
+class RitmoTest(unittest.TestCase):
+    def relogio(self):
+        estado = {"t": 0.0}
+        return estado, (lambda: estado["t"]), (lambda s: estado.__setitem__("t", estado["t"] + s))
+
+    def test_ritmo_igual_ao_codigo_base(self):
+        estado, clock, sleep = self.relogio()
+        ritmo = worker.RitmoCertificado(55, 5, clock=clock, sleep=sleep)
+        self.assertEqual(ritmo.restante(), 0.0)  # primeiro download não espera
+        ritmo.sucesso(primeira=True)
+        estado["t"] = 20
+        self.assertEqual(ritmo.restante(), 35.0)  # conta desde o último sucesso
+        ritmo.recusa()
+        self.assertEqual(ritmo.intervalo, 60.0)
+        estado["t"] = 50
+        self.assertEqual(ritmo.espera_repeticao(), 10.0)  # recusa não zera o relógio
+        for _ in range(3):
+            ritmo.sucesso(primeira=True)
+        self.assertEqual(ritmo.intervalo, 55.0)
+        for _ in range(40):
+            ritmo.recusa()
+        self.assertEqual(ritmo.intervalo, worker.INTERVALO_MAXIMO)
+
+    def test_sem_sucesso_repete_apos_um_passo(self):
+        _estado, clock, sleep = self.relogio()
+        ritmo = worker.RitmoCertificado(55, 5, clock=clock, sleep=sleep)
+        ritmo.recusa()
+        self.assertEqual(ritmo.espera_repeticao(), 5.0)
+
+    def baixar_em_ritmo(self, respostas, chaves, bloqueio=None):
+        estado, clock, sleep = self.relogio()
+        ritmo = worker.RitmoCertificado(55, 5, clock=clock, sleep=sleep)
+        rotas = [Rota(f"r{i}", f"http://10.0.0.{i}:8080") for i in range(1, 4)]
+        chamadas, concluidas = [], []
+        fila = list(respostas)
+
+        def baixar(cert, key, ch, transporte, limitador, avisar=None, bloqueio=None):
+            chamadas.append((estado["t"], ch, transporte.current().proxy_url))
+            xml, erro, ate = fila.pop(0)
+            if ate and bloqueio is not None:
+                bloqueio.registrar(ate)
+            return xml, erro
+
+        with patch.object(worker, "_baixar_na_faixa", side_effect=baixar):
+            worker._descarregar_em_ritmo(
+                Path("c"), Path("k"), chaves, rotas, ritmo,
+                ao_concluir=lambda c, x, e: concluidas.append((c, bool(x), e)), bloqueio=bloqueio,
+            )
+        return chamadas, concluidas
+
+    def test_um_por_vez_com_intervalo_e_ip_em_rodizio(self):
+        chamadas, concluidas = self.baixar_em_ritmo([("<x/>", "", None)] * 3, ["a" * 44, "b" * 44, "c" * 44])
+        self.assertEqual([t for t, _c, _p in chamadas], [0.0, 55.0, 110.0])
+        self.assertEqual(len({p for _t, _c, p in chamadas}), 3)
+        self.assertEqual([ok for _c, ok, _e in concluidas], [True, True, True])
+
+    def test_repete_a_mesma_chave_em_outro_ip(self):
+        chamadas, concluidas = self.baixar_em_ritmo(
+            [("", "sem_xml", None), ("<x/>", "", None)], ["a" * 44],
+        )
+        self.assertEqual([c for _t, c, _p in chamadas], ["a" * 44, "a" * 44])
+        self.assertNotEqual(chamadas[0][2], chamadas[1][2])
+        self.assertEqual(concluidas, [("a" * 44, True, "")])
+
+    def test_bloqueio_com_horario_para_na_hora(self):
+        fim = datetime.now(timezone.utc) + timedelta(hours=24)
+        chamadas, concluidas = self.baixar_em_ritmo(
+            [("", "limite", fim)], ["a" * 44, "b" * 44], bloqueio=worker.Bloqueio(),
+        )
+        self.assertEqual(len(chamadas), 1)
+        self.assertEqual(concluidas, [("a" * 44, False, "limite")])
+
+    def test_nota_indisponivel_nao_repete(self):
+        chamadas, concluidas = self.baixar_em_ritmo(
+            [("", "indisponivel", None), ("<x/>", "", None)], ["a" * 44, "b" * 44],
+        )
+        self.assertEqual([c for _t, c, _p in chamadas], ["a" * 44, "b" * 44])
+        self.assertEqual([ok for _c, ok, _e in concluidas], [False, True])
 
 
 if __name__ == "__main__":
