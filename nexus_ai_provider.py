@@ -6,6 +6,7 @@ always bypass the model, including general questions without authorized evidence
 """
 
 import json
+import logging
 
 if __package__:
     from .nexus_ai_core import (
@@ -192,6 +193,8 @@ class OpenAIAgentsProvider:
             raise
         except Exception as exc:
             self.failure_info=safe_failure_info(exc)
+            # Só enums fixos (sem mensagem do provedor, corpo, chave ou conteúdo): permite diagnosticar no Render.
+            logging.getLogger("nexus.ai").warning(json.dumps({"event": "ai_provider_failed", **self.failure_info}))
             raise CoreError("provider_failed") from None
         finally:
             self._busy = False
