@@ -97,7 +97,7 @@ EXPORT_KINDS = ('fiscal','nfe','nfce','nfse','obrigacoes','malhas','caixa_postal
                 'debitos_sefaz','antecipacao_st','parcelamentos_sefaz','simples_nacional','cobranca_nfe','debitos_prefeitura')
 
 
-EXPORT_PAGE = 5000
+EXPORT_PAGE = 2000
 
 
 class ExportRequest(BaseModel):
@@ -240,19 +240,19 @@ class Session:
         self.settings, self.client, self.token = settings, client, token
         self.org_id, self.user_id = str(org_id), None
 
-    async def request(self, method, path, *, server=False, payload=None, params=None):
+    async def request(self, method, path, *, server=False, payload=None, params=None, timeout=8, max_bytes=256000):
         key = self.settings.service_key if server else self.settings.publishable_key
         bearer = key if server else self.token
         try:
             async with self.client.stream(
                 method, self.settings.supabase_url + path,
                 headers={"apikey": key, "Authorization": "Bearer " + bearer},
-                json=payload, params=params, timeout=8, follow_redirects=False,
+                json=payload, params=params, timeout=timeout, follow_redirects=False,
             ) as response:
                 content = bytearray()
                 async for chunk in response.aiter_bytes():
                     content.extend(chunk)
-                    if len(content) > 256000:
+                    if len(content) > max_bytes:
                         raise HTTPException(503, "data_limit")
                 if response.status_code >= 300:
                     if response.status_code == 401:
@@ -276,8 +276,8 @@ class Session:
         except (httpx.HTTPError, ValueError):
             raise HTTPException(503, "data_unavailable") from None
 
-    async def rpc(self, name, payload, *, server=False):
-        return await self.request("POST", "/rest/v1/rpc/" + name, payload=payload, server=server)
+    async def rpc(self, name, payload, *, server=False, timeout=8, max_bytes=256000):
+        return await self.request("POST", "/rest/v1/rpc/" + name, payload=payload, server=server, timeout=timeout, max_bytes=max_bytes)
 
     async def authenticate(self, audience):
         user = await self.request("GET", "/auth/v1/user")
@@ -425,7 +425,7 @@ def install_nexus_ai_routes(app: FastAPI, *, settings: Settings | None = None,
             await session.authenticate(payload.audience)
             value=await session.rpc('nexus_ai_export_rows',{'p_user_id':session.user_id,'p_org_id':session.org_id,
                 'p_audience':payload.audience,'p_kind':payload.kind,'p_date_from':payload.date_from.isoformat(),
-                'p_date_to':payload.date_to.isoformat(),'p_limit':EXPORT_PAGE,'p_offset':payload.offset},server=True)
+                'p_date_to':payload.date_to.isoformat(),'p_limit':EXPORT_PAGE,'p_offset':payload.offset},server=True,timeout=25,max_bytes=6_000_000)
             if (type(value) is not dict or value.get('source')!='export' or value.get('kind')!=payload.kind
                     or value.get('org_id')!=session.org_id or type(value.get('total')) is not int
                     or type(value.get('rows')) is not list or len(value['rows'])>EXPORT_PAGE
